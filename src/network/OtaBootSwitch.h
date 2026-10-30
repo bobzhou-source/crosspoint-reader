@@ -40,4 +40,9 @@ uint32_t computeSeqCrc(uint32_t seq);
 // Returns true on success.
 bool switchTo(const esp_partition_t* dest);
 
+// Select the non-running OTA application after checking that it contains an
+// app-image header. Used by the X4 Pro's menu and early Down+Power recovery.
+// Returns false when there is no alternate OTA slot or it has no app image.
+bool switchToOther();
+
 }  // namespace ota_boot

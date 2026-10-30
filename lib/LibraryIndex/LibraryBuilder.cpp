@@ -186,8 +186,9 @@ void clearLibraryIndexDirty() {
 }
 
 bool isBookName(const std::string& name) {
-  return FsHelpers::checkFileExtension(name, ".epub") || FsHelpers::checkFileExtension(name, ".txt") ||
-         FsHelpers::checkFileExtension(name, ".md") || FsHelpers::checkFileExtension(name, ".xtc");
+  return FsHelpers::hasEpubExtension(name) || FsHelpers::hasTxtExtension(name) ||
+         FsHelpers::hasMarkdownExtension(name) || FsHelpers::hasFb2Extension(name) ||
+         FsHelpers::hasHtmlExtension(name) || FsHelpers::hasXtcExtension(name);
 }
 
 // macOS AppleDouble sidecars and hidden entries. The file browser already hides

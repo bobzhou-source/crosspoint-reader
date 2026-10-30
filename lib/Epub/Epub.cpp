@@ -649,7 +649,7 @@ void Epub::setupCacheDir() const {
 
 const std::string& Epub::getCachePath() const { return cachePath; }
 
-const std::string& Epub::getPath() const { return filepath; }
+const std::string& Epub::getPath() const { return sourcePath; }
 
 const std::string& Epub::getTitle() const {
   static std::string blank;

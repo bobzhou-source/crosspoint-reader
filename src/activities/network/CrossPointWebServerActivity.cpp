@@ -14,6 +14,7 @@
 #include "SilentRestart.h"
 #include "WifiSelectionActivity.h"
 #include "activities/network/CalibreConnectActivity.h"
+#include "activities/network/LocalsendActivity.h"
 #include "components/UITheme.h"
 #include "fontIds.h"
 #include "util/QrUtils.h"
@@ -143,9 +144,15 @@ void CrossPointWebServerActivity::onNetworkModeSelected(const NetworkMode mode) 
   networkMode = mode;
   isApMode = (mode == NetworkMode::CREATE_HOTSPOT);
 
-  if (mode == NetworkMode::CONNECT_CALIBRE) {
+  if (mode == NetworkMode::CONNECT_CALIBRE || mode == NetworkMode::LOCALSEND) {
+    std::unique_ptr<Activity> transferActivity;
+    if (mode == NetworkMode::LOCALSEND) {
+      transferActivity = std::make_unique<LocalsendActivity>(renderer, mappedInput);
+    } else {
+      transferActivity = std::make_unique<CalibreConnectActivity>(renderer, mappedInput);
+    }
     startActivityForResult(
-        std::make_unique<CalibreConnectActivity>(renderer, mappedInput), [this](const ActivityResult& result) {
+        std::move(transferActivity), [this](const ActivityResult& result) {
           state = WebServerActivityState::MODE_SELECTION;
 
           startActivityForResult(std::make_unique<NetworkModeSelectionActivity>(renderer, mappedInput),

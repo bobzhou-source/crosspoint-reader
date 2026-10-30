@@ -38,6 +38,7 @@
 #include "components/UIThemeTokens.h"
 #include "components/UiAppHelpers.h"
 #include "fontIds.h"
+#include "network/OtaBootSwitch.h"
 
 namespace fui = freeink::ui;
 
@@ -108,6 +109,9 @@ void SettingsActivity::rebuildSettingsLists() {
   // asset isn't published yet just report no update available.
   systemSettings.push_back(SettingInfo::Action(StrId::STR_CHECK_UPDATES, SettingAction::CheckForUpdates));
   systemSettings.push_back(SettingInfo::Action(StrId::STR_SD_FIRMWARE_UPDATE, SettingAction::SdFirmwareUpdate));
+  if (BoardConfig::isX4Pro()) {
+    systemSettings.push_back(SettingInfo::Action(StrId::STR_BOOT_OTHER_SLOT, SettingAction::BootOtherSlot));
+  }
   systemSettings.push_back(SettingInfo::Action(StrId::STR_KEYBOARD_LAYOUTS, SettingAction::KeyboardLayouts));
   systemSettings.push_back(SettingInfo::Action(StrId::STR_ABOUT, SettingAction::About));
   systemSettings.push_back(SettingInfo::Action(StrId::STR_LANGUAGE, SettingAction::Language));
@@ -403,6 +407,21 @@ void SettingsActivity::toggleCurrentSetting() {
       case SettingAction::SdFirmwareUpdate:
         startActivityForResult(std::make_unique<SdFirmwareUpdateActivity>(renderer, mappedInput), resultHandler);
         break;
+      case SettingAction::BootOtherSlot: {
+        const char* options[] = {tr(STR_CANCEL), tr(STR_CONFIRM)};
+        optionPopup.show(tr(STR_BOOT_OTHER_SLOT), tr(STR_BOOT_OTHER_SLOT_CONFIRM), options, 2, 0, [this](int idx) {
+          if (idx != 1) return;
+          if (ota_boot::switchToOther()) {
+            delay(50);
+            ESP.restart();
+          }
+          const char* ok[] = {tr(STR_CONFIRM)};
+          optionPopup.show(tr(STR_BOOT_OTHER_SLOT), tr(STR_BOOT_OTHER_SLOT_FAILED), ok, 1, 0,
+                           [this](int) { requestUpdate(); });
+        });
+        requestUpdate();
+        return;
+      }
       case SettingAction::DownloadFonts:
         startActivityForResult(std::make_unique<FontDownloadActivity>(renderer, mappedInput),
                                [this](const ActivityResult&) {

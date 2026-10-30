@@ -202,6 +202,14 @@ The CrossPoint plugin will connect to your device, create a folder for the book'
 
 Books cannot be removed from your device through Calibre. Use the web interface instead.
 
+### 3.5.2 LocalSend
+
+1. On the reader, open **File Transfer → LocalSend** and join the same Wi-Fi network as your computer or phone.
+2. Keep the receiver screen open. In the LocalSend app, select **CrossPoint** and send one or more documents.
+3. Received files appear under `/received` in Browse Files. Existing names are preserved by adding a numeric suffix.
+
+The companion `reader-send` tool in `companion/` converts public Substack and other web articles to EPUB and can deliver them through LocalSend. For subscriber-only posts, save the article or export it from your authenticated browser session and convert that local file; the companion does not collect website credentials.
+
 ### 3.6 Settings
 
 The Settings screen allows you to configure the device's behavior. There are a few settings you can adjust:
@@ -624,7 +632,31 @@ When reading an EPUB that contains footnotes, you can navigate to the footnote t
 
 If the device goes to sleep or you close the book while viewing a footnote, the book reopens to your original reading position, not the footnote.
 
-### Dictionary Lookup
+### Annotations
+
+In the EPUB-based reader (including converted Markdown, FB2, and HTML), choose **Highlight / note** to capture the current page context. Choose its explicit **Type**: **Quote**, **Question**, or **Review later**, add a short note if wanted, and select **Save annotation**. The captured text is page context, not an arbitrary selection or an AI answer; the review screen labels it accordingly.
+
+**Offline annotation and question review**
+
+1. Open the book and choose **Reader Menu → Annotations**. Each saved row shows its explicit type; question notes are not inferred from punctuation.
+2. Select a row to review the source title, chapter, full saved context/excerpt and note, original source path, chapter link, and original UTC creation time (or an explicit clock-unset label). Scroll with the usual Up/Down buttons or swipe; long text is split into bounded rows rather than silently truncated.
+3. Choose **Edit annotation** to change its type/note or delete it, or **Open saved source** to leave review and return to its saved reading location. Navigation uses the native bookmark fields: spine and visible-text offset when present, otherwise the existing XPath/progress fallback. Page numbers alone are not treated as stable across font or orientation changes.
+4. **Export annotations** writes the current book's annotations as Markdown under `/annotations`. An empty list is reported as empty, not as a successful export.
+
+**Source-linked study cards (no network or AI)**
+
+1. Select an already saved annotation, then **Create study card**. The firmware reads the persisted annotation and saves a local snapshot; unsaved editor changes are not used.
+2. The new card opens on its **question/front**. For a **Question** annotation with a note, that note is the front. Otherwise the firmware uses a fixed recall question appropriate to Quote, Question, or Review later. It does not invent a factual answer.
+3. Choose **Reveal answer** to show the saved context/excerpt and note; **Hide answer** returns to the question-only side. Source title/chapter/type remain visible on both sides. **Open saved source** returns to the original reading location from either side.
+4. Reopen the book's deck with **Annotations → Study cards**, including after reboot, and select any card to review it again offline. **Delete study card** requires confirmation and does not delete its annotation.
+
+Cards preserve the complete native persisted annotation snapshot: annotation ID, explicit kind, original source path/title, chapter title/href, spine, XPath, cached page/page-count/progress, optional visible-text offset, excerpt, note, page-context flag, and UTC creation time. Editing or deleting the original annotation does not change an existing card; delete and recreate the card to refresh it. Repeated creation makes separate cards.
+
+Limits: 128 annotations and 128 cards per book; 768-byte captured context and 256-byte notes/fronts (UTF-8-safe truncation at capture). Cards live in `/.crosspoint/study/<source-key>/`, separately from `/.crosspoint/annotations/`. Back up both directories along with the original documents. This is a book-local, manually selected review deck, not spaced repetition, grading, a whole-library card index, or companion/cloud card sync. Deck opening reads at most that book's bounded card records once; selection/reveal renders from RAM without rescanning the SD card. Empty decks, unreadable/corrupt records, save failures, and missing source files have explicit messages. A damaged record blocks that deck rather than hiding the damage as an empty or partially successful list. Restore a known-good backup to repair it; the firmware does not silently discard damaged records.
+
+Original files must remain at their saved paths. Renaming/moving a source changes its annotation/deck identity; replacing or substantially editing a source can invalidate saved anchors. Exact-offset navigation targets the saved text position in an unchanged source after repagination; older annotations without offsets use the reader's less precise XPath/progress fallback. This workflow has not been physically verified on an X4 Pro merely by compiling or running host/emulator checks.
+
+### Offline Dictionary
 
 Words on the current page can be looked up in an offline StarDict dictionary stored on the SD card. Copy a dictionary to the `/dictionaries/` folder, select it in **Settings → Reader → Dictionary**, then start a lookup by choosing **Look Up** in the **[Reader Menu](#5-reader-menu)** (or by holding **Confirm**, if the **Long-press Menu** setting in **[Controls Settings](#363-controls)** is set to "Dictionary"). Use **Left/Right** to highlight a word and press **Confirm** to show its definition.
 
@@ -748,3 +780,20 @@ Press **Ctrl-C** or close the graph window to exit.
 If the device is stuck in a bootloop, press and release the Reset button. Then, press and hold on to the configured Back button and the Power Button to boot to the Home Screen.
 
 There can be issues with broken cache or config. In this case, delete the `.crosspoint` directory on your SD card (or consider deleting only `settings.json`, `state.json`, or `epub_*` cache directories in the `.crosspoint/` folder).
+
+## 8. Local reading inbox
+
+Open **Home → Reading inbox** to return to saved annotations across all books. On the cover-grid Home layout, use the **book icon between Library and file transfer** (before OPDS when configured). This is an optional local workflow, not a network service: opening the inbox never connects to robertzhou.dev or enables cloud sync.
+
+- Save a **Quote**, **Question**, or **Review later** annotation in an EPUB-based reader to add an item. The inbox reads the existing native annotations; it does not copy them into another library or invent a separate source identity.
+- Rows show the source title, original filename and chapter, annotation kind, and progress at capture. Select a row to open its original document at the saved chapter/XPath and visible-text offset, rather than resuming the book's most recent page. Converted Markdown, FB2, and HTML use their original paths, not a temporary EPUB filename. Return accuracy assumes the source content has not been changed; pagination can change with font settings.
+- There are still at most **128 annotations per book**. The inbox retains only **32 lightweight previews at a time** (about 10 KiB), with **Previous 32 items** / **Next 32 items** for additional pages. Items follow the SD annotation-directory order and native IDs, not an assumed chronological order. **Refresh inbox** rescans from the first page; entering or explicitly changing pages also scans the store. Ordinary row navigation and rendering do not scan files or parse JSON.
+- An empty inbox says there are no saved items. A missing source stays listed, but opening it reports the missing original path; restoring the file at that path allows return again. A corrupt/unreadable native record reports a load error instead of presenting a silently incomplete inbox.
+
+### Exporting the whole inbox for the Mac companion
+
+Choose **Export all inbox entries** to write `/annotations/reading-inbox.md` on the SD card. This exports **every native annotation across all books**, not just the visible 32-item page. An empty store produces an honest empty export. Copy the file using the existing USB/file-transfer workflow and pass it to the Mac companion's annotation importer. Exporting does not send anything automatically.
+
+The Markdown uses the same per-entry interchange fields as book-local annotation exports: original **Source** path, **Title**, **Type**, chapter title/path, spine index, XPath, optional visible-text offset, capture progress/page context, excerpt, note, and a UTC creation timestamp when the device clock was set. The document header says **Scope: All sources**; each entry carries its own source. Numeric annotation IDs are book-local, so companion return/sync identity is the **original source path plus entry ID**, not the heading number alone. These original paths and location fields are the local annotation-return handoff for a separately connected, opt-in robertzhou.dev transport.
+
+Exports are streamed one record at a time. A failed read/write does not replace the last complete export; success is shown only after the replacement is committed. This is a local snapshot, not a cloud queue, remote bookmark downloader, or two-way cloud-sync implementation. Keep `/.crosspoint/annotations/` and the original documents backed up: clearing all of `/.crosspoint/` also deletes the native inbox entries.

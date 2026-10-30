@@ -8,6 +8,8 @@
 #include "EndOfBookOptions.h"
 #include "activities/Activity.h"
 
+struct AnnotationEntry;
+
 class ReaderActivity : public Activity {
  protected:
   std::string bookPath;
@@ -52,6 +54,10 @@ class ReaderActivity : public Activity {
 
   static std::unique_ptr<ReaderActivity> create(GfxRenderer& renderer, MappedInputManager& mappedInput,
                                                 std::string path, bool allowFastInitialRefresh);
+
+  // Called before onEnter to open a native annotation instead of saved progress.
+  // EPUB-based readers support this; other formats reject it explicitly.
+  virtual bool openAnnotation(const AnnotationEntry&) { return false; }
 
   void onEnter() override;
   void onExit() override;

@@ -172,9 +172,6 @@ bool FontDownloadActivity::fetchAndParseManifest() {
     return false;
   }
 
-  // No downgradeRedirectsToHttp here, unlike the font transfers below: this
-  // response carries the crc32 values that are the only integrity anchor for
-  // those plain-HTTP downloads.
   auto result = HttpDownloader::downloadToFile(FONT_MANIFEST_URL, MANIFEST_TMP, nullptr);
   if (result != HttpDownloader::OK) {
     LOG_ERR("FONT", "Failed to fetch manifest from %s", FONT_MANIFEST_URL);
@@ -590,11 +587,7 @@ void FontDownloadActivity::downloadFamily(ManifestFamily& family) {
           }
           requestUpdate(true);
         },
-        // Bulk font transfers follow GitHub's release-asset redirect over plain
-        // HTTP: the CRC check below (manifest fetched over TLS) covers
-        // integrity, and skipping the second TLS session keeps the C3 heap out
-        // of MEMORY_E territory.
-        &cancelRequested_, "", "", /*downgradeRedirectsToHttp=*/true);
+        &cancelRequested_);
 
     if (result == HttpDownloader::ABORTED) {
       fontInstaller_.deleteFamily(str(family.name));

@@ -16,9 +16,14 @@ Check [our Devices page](https://crosspointreader.com/devices) for the full list
 
 ## What can CrossPoint do?
 
-- **Reader engine**: EPUB 2/3 rendering with embedded-style option, image handling, hyphenation, kerning, adaptive table layouts, native CJK ruby annotations, chapter navigation, footnotes, bookmarks, dictionary lookups ([StarDict](docs/dictionary.md)), go-to-percent, auto page turn, orientation control, focus reading, KOReader progress sync and more.
+- **X4 Pro recovery:** Settings → System → **Boot Other Slot** returns to the preserved alternate firmware; hold **Down + Power for 3 seconds** at boot to do the same before storage or display initialization. A brief **Down + Power** hold retains SD recovery mode.
+- **Reader engine:** EPUB 2/3 rendering with embedded-style option, image handling, hyphenation, kerning, adaptive table layouts, native CJK ruby annotations, chapter navigation, footnotes, bookmarks, dictionary lookups ([StarDict](docs/dictionary.md)), go-to-percent, auto page turn, orientation control, focus reading, KOReader progress sync and more.
 
-- **Various formats**: native handling for `.epub`, `.xtc/.xtch`, `.txt`, and `.bmp`.
+- **Offline study workflow**: Quote, Question, and Review-later annotations; book-local and whole-library reading inboxes; Markdown export; source-linked review; and persistent study cards with question/answer sides. See the [User Guide](USER_GUIDE.md#annotations).
+
+- **Mac companion**: public/authorized-export article and publication ingestion, one-action X thread import, LocalSend delivery, optional private cloud sync, and explicitly configured Explain/Example/Quiz passage assistance. See [companion/README.md](companion/README.md).
+
+- **Various formats**: native handling for `.epub`, `.xtc/.xtch`, `.txt`, and `.bmp`, plus formatted Markdown (`.md`/`.markdown`), FB2, and local HTML documents converted through the EPUB reader engine.
 
 - **Touch reading**: follow EPUB links and look up words in the dictionary on touch-enabled devices.
 
@@ -41,6 +46,7 @@ Check [our Devices page](https://crosspointreader.com/devices) for the full list
   - WebDAV handler
   - AP mode (hotspot) and STA mode (join existing Wi-Fi), both with QR helpers
   - Calibre wireless connect flow
+  - LocalSend v2 receiver; files are saved under `/received`
   - OPDS browser with saved servers (up to 8), search, pagination, and direct download
   - OTA update checks and installs from GitHub releases
 

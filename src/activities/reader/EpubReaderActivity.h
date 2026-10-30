@@ -18,7 +18,9 @@
 #include "ReaderToolbarUi.h"
 #include "components/OptionPopup.h"
 
-class EpubReaderActivity final : public ReaderActivity {
+struct AnnotationEntry;
+
+class EpubReaderActivity : public ReaderActivity {
   std::shared_ptr<Epub> epub;
   std::unique_ptr<Section> section = nullptr;
   int currentSpineIndex = 0;
@@ -30,6 +32,8 @@ class EpubReaderActivity final : public ReaderActivity {
   std::optional<uint32_t> cachedVisibleTextOffset;
   std::optional<uint32_t> currentPageVisibleOffset;
   std::optional<uint32_t> pendingOffsetJump;
+  std::optional<ProgressChangeResult> pendingAnnotation;
+  std::atomic<bool> sourceNavigationFailed{false};
   unsigned long lastPageTurnTime = 0UL;
   unsigned long pageTurnDuration = 0UL;
   int8_t pendingManualTurn = 0;
@@ -134,6 +138,9 @@ class EpubReaderActivity final : public ReaderActivity {
   bool saveProgress(int spineIndex, int currentPage, int pageCount);
   void jumpToPercent(int percent);
   void onReaderMenuConfirm(EpubReaderMenuActivity::MenuAction action);
+  // Caller holds the render lock; also used during initial book loading.
+  bool applyProgressChange(const ProgressChangeResult& progress);
+  void renderSourceNavigationError();
   // Live section position, or the values cached before a child screen
   // released the section.
   ChapterPosition chapterPosition() const;
@@ -174,6 +181,7 @@ class EpubReaderActivity final : public ReaderActivity {
   void navigateToHref(const std::string& href, bool savePosition = false);
   void restoreSavedPosition();
 
+  void addAnnotation();
   void renderContents(std::unique_ptr<Page> page, int orientedMarginTop, int orientedMarginRight,
                       int orientedMarginBottom, int orientedMarginLeft);
   void renderStatusBar() const;
@@ -186,6 +194,9 @@ class EpubReaderActivity final : public ReaderActivity {
   uint8_t appliedOrientation = 0;
 
   bool loadBook() override;
+  // Converted formats override this to return their generated EPUB. An empty
+  // path aborts loading; bookPath remains the user's original document.
+  virtual std::string prepareBookPath() { return bookPath; }
   std::string getBookTitle() const override { return epub ? epub->getTitle() : ""; }
   std::string getBookAuthor() const override { return epub ? epub->getAuthor() : ""; }
   std::string getBookThumbBmpPath() const override { return epub ? epub->getThumbBmpPath() : ""; }
@@ -197,6 +208,8 @@ class EpubReaderActivity final : public ReaderActivity {
                               bool allowFastInitialRefresh)
       : ReaderActivity("EpubReader", renderer, mappedInput, std::move(bookPath), allowFastInitialRefresh) {}
   ~EpubReaderActivity() override;
+  bool openAnnotation(const AnnotationEntry& entry) override;
+  bool navigateToAnnotation(const AnnotationEntry& entry);
 
   void loop() override;
 

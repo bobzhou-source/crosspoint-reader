@@ -1,6 +1,7 @@
 #include "OtaBootSwitch.h"
 
 #include <Logging.h>
+#include <esp_ota_ops.h>
 #include <esp_rom_crc.h>
 #include <spi_flash_mmap.h>
 #include <string.h>
@@ -81,6 +82,26 @@ bool switchTo(const esp_partition_t* dest) {
   LOG_INF("BOOT", "otadata: wrote slot=%d seq=%u crc=0x%08x -> %s", targetSlot, static_cast<unsigned>(newSeq),
           static_cast<unsigned>(next.crc), dest->label);
   return true;
+}
+
+bool switchToOther() {
+  const esp_partition_t* running = esp_ota_get_running_partition();
+  const esp_partition_t* other = running ? esp_ota_get_next_update_partition(running) : nullptr;
+  if (!other) {
+    LOG_ERR("BOOT", "no alternate OTA app partition");
+    return false;
+  }
+
+  // Raw otadata switching intentionally bypasses esp_image_verify for patched
+  // Xteink images, so at least reject an erased/non-app alternate slot here.
+  uint8_t magic = 0;
+  if (esp_partition_read(other, 0, &magic, sizeof(magic)) != ESP_OK || magic != 0xE9) {
+    LOG_ERR("BOOT", "alternate slot %s has no app image", other->label);
+    return false;
+  }
+
+  LOG_INF("BOOT", "switching from %s to %s", running->label, other->label);
+  return switchTo(other);
 }
 
 }  // namespace ota_boot

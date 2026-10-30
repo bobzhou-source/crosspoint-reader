@@ -17,8 +17,10 @@ class Epub {
   std::string tocNcxItem;
   // the nav file (EPUB 3)
   std::string tocNavItem;
-  // where is the EPUBfile?
+  // Where is the EPUB file, and which user document does it represent?
+  // Converted documents keep the original path for recents, progress, and sync.
   std::string filepath;
+  std::string sourcePath;
   // the base path for items in the EPUB file
   std::string contentBasePath;
   // Uniq cache key based on filepath
@@ -40,9 +42,10 @@ class Epub {
   CssParser::ParseResult parseCssFiles(CssParser::CacheStatus existingCacheStatus) const;
 
  public:
-  explicit Epub(std::string filepath, const std::string& cacheDir) : filepath(std::move(filepath)) {
-    // create a cache key based on the filepath
-    cachePath = cacheDir + "/epub_" + std::to_string(std::hash<std::string>{}(this->filepath));
+  explicit Epub(std::string filepath, const std::string& cacheDir, std::string originalSourcePath = {})
+      : filepath(std::move(filepath)), sourcePath(originalSourcePath.empty() ? filepath : std::move(originalSourcePath)) {
+    // Cache converted and native documents by their stable user-facing identity.
+    cachePath = cacheDir + "/epub_" + std::to_string(std::hash<std::string>{}(sourcePath));
   }
   ~Epub() = default;
   std::string& getBasePath() { return contentBasePath; }

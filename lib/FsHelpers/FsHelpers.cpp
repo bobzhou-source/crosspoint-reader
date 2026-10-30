@@ -174,7 +174,15 @@ bool hasXtcExtension(std::string_view fileName) {
 
 bool hasTxtExtension(std::string_view fileName) { return checkFileExtension(fileName, ".txt"); }
 
-bool hasMarkdownExtension(std::string_view fileName) { return checkFileExtension(fileName, ".md"); }
+bool hasMarkdownExtension(std::string_view fileName) {
+  return checkFileExtension(fileName, ".md") || checkFileExtension(fileName, ".markdown");
+}
+
+bool hasFb2Extension(std::string_view fileName) { return checkFileExtension(fileName, ".fb2"); }
+
+bool hasHtmlExtension(std::string_view fileName) {
+  return checkFileExtension(fileName, ".html") || checkFileExtension(fileName, ".htm");
+}
 
 bool hasCssExtension(std::string_view fileName) { return checkFileExtension(fileName, ".css"); }
 

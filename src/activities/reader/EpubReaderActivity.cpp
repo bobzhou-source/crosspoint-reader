@@ -16,10 +16,15 @@
 
 #include <algorithm>
 #include <functional>
+#include <cmath>
 #include <iterator>
 #include <limits>
 
 #include "../../util/BookmarkFile.h"
+#include "../../AnnotationEntry.h"
+#include "AnnotationEditorActivity.h"
+#include "AnnotationListActivity.h"
+#include "AnnotationNavigation.h"
 #include "BookmarkEntry.h"
 #include "CrossPointSettings.h"
 #include "CrossPointState.h"
@@ -44,6 +49,7 @@
 #include "components/UITheme.h"
 #include "fontIds.h"
 #include "util/BookmarkUtil.h"
+#include "util/AnnotationExport.h"
 #include "util/ButtonNavigator.h"
 #include "util/ScreenshotUtil.h"
 
@@ -175,7 +181,12 @@ EpubReaderActivity::~EpubReaderActivity() {
 }
 
 bool EpubReaderActivity::loadBook() {
-  auto loadedEpub = makeUniqueNoThrow<Epub>(bookPath, "/.crosspoint");
+  const std::string preparedPath = prepareBookPath();
+  if (preparedPath.empty()) {
+    LOG_ERR("ERS", "Failed to prepare document for reading");
+    return false;
+  }
+  auto loadedEpub = makeUniqueNoThrow<Epub>(preparedPath, "/.crosspoint", bookPath);
   if (!loadedEpub) {
     LOG_ERR("ERS", "Failed to allocate EPUB object");
     return false;
@@ -235,6 +246,15 @@ bool EpubReaderActivity::loadBook() {
       currentSpineIndex = textSpineIndex;
       cachedVisibleTextOffset.reset();
       LOG_DBG("ERS", "Opened for first time, navigating to text reference at index %d", textSpineIndex);
+    }
+  }
+
+  if (pendingAnnotation) {
+    const bool applied = applyProgressChange(*pendingAnnotation);
+    pendingAnnotation.reset();
+    if (!applied) {
+      sourceNavigationFailed = true;
+      LOG_ERR("ANN", "Saved annotation location is not in this source");
     }
   }
 
@@ -370,6 +390,10 @@ void EpubReaderActivity::openFootnoteSelect(const bool reopenMenuOnCancel) {
 }
 
 void EpubReaderActivity::loop() {
+  if (sourceNavigationFailed) {
+    if (mappedInput.wasReleased(MappedInputManager::Button::Back)) finish();
+    return;
+  }
   if (!epub) {
     finish();
     return;
@@ -748,60 +772,89 @@ void EpubReaderActivity::jumpToPercent(int percent) {
   requestUpdate();
 }
 
+bool EpubReaderActivity::openAnnotation(const AnnotationEntry& entry) { return navigateToAnnotation(entry); }
+
+bool EpubReaderActivity::navigateToAnnotation(const AnnotationEntry& entry) {
+  if (entry.sourcePath != bookPath || entry.location.xpath.empty() ||
+      entry.location.xpath.size() > AnnotationEntry::MAX_PATH_BYTES ||
+      !std::isfinite(entry.location.percentage) || entry.location.percentage < 0 || entry.location.percentage > 1) {
+    LOG_ERR("ANN", "Invalid annotation source or location");
+    return false;
+  }
+  auto progress = annotationProgress(entry);
+  RenderLock lock;
+  if (!epub) {
+    pendingAnnotation = std::move(progress);
+    return true;
+  }
+  if (!applyProgressChange(progress)) return false;
+  requestUpdate();
+  return true;
+}
+
+bool EpubReaderActivity::applyProgressChange(const ProgressChangeResult& progress) {
+  if (!epub || progress.spineIndex < 0 || progress.spineIndex >= epub->getSpineItemsCount()) {
+    LOG_ERR("ERS", "Saved source spine is unavailable");
+    return false;
+  }
+  sourceNavigationFailed = false;
+  pendingAnchor.clear();
+  pendingPageJump.reset();
+  pendingOffsetJump.reset();
+  pendingPercentJump = false;
+  if (progress.hasVisibleTextOffset) {
+    clearDeferredReposition();
+    if (section && currentSpineIndex == progress.spineIndex) {
+      if (const auto page = section->getPageForVisibleTextOffset(progress.visibleTextOffset)) {
+        section->currentPage = *page;
+        return true;
+      }
+    }
+    currentSpineIndex = progress.spineIndex;
+    pendingOffsetJump = progress.visibleTextOffset;
+    nextPageNumber = std::max(0, progress.page);
+    section.reset();
+    return true;
+  }
+
+  int targetSpineIndex = progress.spineIndex;
+  int targetPage = progress.page;
+  const int activeTotalPages = section ? section->estimatedTotalPages() : 0;
+  const bool cachedPageMatchesActiveSection = section && progress.totalPages > 0 &&
+                                              currentSpineIndex == progress.spineIndex && progress.page >= 0 &&
+                                              progress.page < progress.totalPages &&
+                                              activeTotalPages == progress.totalPages;
+  if (!cachedPageMatchesActiveSection && progress.hasSavedProgress) {
+    const int totalPages = section ? section->estimatedTotalPages() : cachedChapterTotalPageCount;
+    const CrossPointPosition fallback = ProgressMapper::toCrossPoint(
+        epub, {progress.xpath, progress.percentage}, renderer, currentSpineIndex, totalPages);
+    targetSpineIndex = fallback.spineIndex;
+    targetPage = fallback.pageNumber;
+  }
+  if (targetSpineIndex < 0 || targetSpineIndex >= epub->getSpineItemsCount()) return false;
+  clearDeferredReposition();
+  if (currentSpineIndex != targetSpineIndex) {
+    currentSpineIndex = targetSpineIndex;
+    nextPageNumber = std::max(0, targetPage);
+    section.reset();
+  } else if (section) {
+    section->currentPage = std::max(0, targetPage);
+  } else {
+    nextPageNumber = std::max(0, targetPage);
+  }
+  return true;
+}
+
 void EpubReaderActivity::onReaderMenuConfirm(EpubReaderMenuActivity::MenuAction action) {
   auto progressChangeResultHandler = [this](const ActivityResult& result) {
     loadCachedBookmarks();
-    if (result.isCancelled) {
+    if (result.isCancelled || !std::holds_alternative<ProgressChangeResult>(result.data)) {
       openReaderMenu();
-    } else {
-      const auto& sync = std::get<ProgressChangeResult>(result.data);
-
-      if (sync.hasVisibleTextOffset && sync.spineIndex >= 0 && sync.spineIndex < epub->getSpineItemsCount()) {
-        RenderLock lock;
-        clearDeferredReposition();
-        if (section && currentSpineIndex == sync.spineIndex) {
-          const auto page = section->getPageForVisibleTextOffset(sync.visibleTextOffset);
-          section->currentPage = page.value_or(std::max(0, sync.page));
-        } else {
-          currentSpineIndex = sync.spineIndex;
-          pendingOffsetJump = sync.visibleTextOffset;
-          nextPageNumber = std::max(0, sync.page);
-          section.reset();
-        }
-        requestUpdate();
-        return;
-      }
-
-      int targetSpineIndex = sync.spineIndex;
-      int targetPage = sync.page;
-      const int activeTotalPages = section ? section->estimatedTotalPages() : 0;
-      const bool cachedPageMatchesActiveSection = section && sync.totalPages > 0 &&
-                                                  currentSpineIndex == sync.spineIndex && sync.page >= 0 &&
-                                                  sync.page < sync.totalPages && activeTotalPages == sync.totalPages;
-
-      if (!cachedPageMatchesActiveSection && sync.hasSavedProgress) {
-        const int totalPages = section ? section->estimatedTotalPages() : cachedChapterTotalPageCount;
-        CrossPointPosition fallback =
-            ProgressMapper::toCrossPoint(epub, {sync.xpath, sync.percentage}, renderer, currentSpineIndex, totalPages);
-        targetSpineIndex = fallback.spineIndex;
-        targetPage = fallback.pageNumber;
-      }
-
-      RenderLock lock;
-      clearDeferredReposition();
-
-      if (currentSpineIndex != targetSpineIndex) {
-        currentSpineIndex = targetSpineIndex;
-        nextPageNumber = targetPage;
-        section.reset();
-      } else if (section && section->currentPage != targetPage) {
-        const int clampedTargetPage = std::max(0, targetPage);
-        section->currentPage = clampedTargetPage;
-      } else if (!section) {
-        nextPageNumber = targetPage;
-      }
-      requestUpdate();
+      return;
     }
+    RenderLock lock;
+    if (!applyProgressChange(std::get<ProgressChangeResult>(result.data))) sourceNavigationFailed = true;
+    requestUpdate();
   };
 
   switch (action) {
@@ -941,6 +994,16 @@ void EpubReaderActivity::onReaderMenuConfirm(EpubReaderMenuActivity::MenuAction 
     }
     case EpubReaderMenuActivity::MenuAction::TOGGLE_BOOKMARK: {
       addBookmark();
+      break;
+    }
+    case EpubReaderMenuActivity::MenuAction::ADD_ANNOTATION: {
+      addAnnotation();
+      break;
+    }
+    case EpubReaderMenuActivity::MenuAction::ANNOTATIONS: {
+      startActivityForResult(
+          makeUniqueNoThrow<AnnotationListActivity>(renderer, mappedInput, bookPath, epub->getTitle()),
+          progressChangeResultHandler);
       break;
     }
   }
@@ -1123,7 +1186,9 @@ bool EpubReaderActivity::skipPages(int amount) {
   return false;
 }
 
-bool EpubReaderActivity::isAtEndOfBook() const { return epub && currentSpineIndex >= epub->getSpineItemsCount(); }
+bool EpubReaderActivity::isAtEndOfBook() const {
+  return !sourceNavigationFailed && epub && currentSpineIndex >= epub->getSpineItemsCount();
+}
 
 void EpubReaderActivity::onReturnFromEndOfBook() {
   if (epub && epub->getSpineItemsCount() > 0) {
@@ -1143,12 +1208,24 @@ bool EpubReaderActivity::skipLoopDelay() {
   return !buildHeapPaused && backgroundBuildWanted();
 }
 
+void EpubReaderActivity::renderSourceNavigationError() {
+  renderer.clearScreen();
+  const auto labels = mappedInput.mapLabels(tr(STR_BACK), "", "", "");
+  GUI.drawButtonHints(renderer, labels.btn1, labels.btn2, labels.btn3, labels.btn4);
+  GUI.drawPopup(renderer, tr(STR_REVIEW_LOCATION_FAILED));
+  automaticPageTurnActive = false;
+}
+
 void EpubReaderActivity::renderBook() {
   currentPageLinks.clear();
   if (!epub) return;
   // Runs under the render task's RenderLock; catches every requestUpdate()
   // exit from the overlay while its deferred chrome refresh is still pending.
   settleOverlayRefresh();
+  if (sourceNavigationFailed) {
+    renderSourceNavigationError();
+    return;
+  }
 
   const auto showPendingSyncSaveError = [this]() {
     if (!pendingSyncSaveError) return;
@@ -1243,7 +1320,8 @@ void EpubReaderActivity::renderBook() {
 
         if (section->isPartial() &&
             (anchorJump ? section->getPageForAnchor(pendingAnchor).has_value()
-                        : target + PARTIAL_REBUILD_START_MARGIN < static_cast<int>(section->pageCount))) {
+             : offsetJump.has_value() ? section->getPageForVisibleTextOffset(*offsetJump).has_value()
+                                      : target + PARTIAL_REBUILD_START_MARGIN < static_cast<int>(section->pageCount))) {
           LOG_DBG("ERS", "Partial covers target %d of %d; deferring extension build", target, section->pageCount);
         } else {
           const size_t spineBytes =
@@ -1323,6 +1401,12 @@ void EpubReaderActivity::renderBook() {
       if (const auto offsetPage = section->getPageForVisibleTextOffset(*offsetJump)) {
         section->currentPage = *offsetPage;
         clearDeferredReposition();
+      } else if (explicitOffsetJump) {
+        sourceNavigationFailed = true;
+        pendingOffsetJump.reset();
+        LOG_ERR("ANN", "Could not resolve saved visible-text offset");
+        renderSourceNavigationError();
+        return;
       }
     }
     if (explicitOffsetJump) {
@@ -2613,6 +2697,50 @@ void EpubReaderActivity::loadCachedBookmarks() {
 
   BookmarkFile::load(epub->getPath(), cachedBookmarks);
   updateBookmarkFlag();
+}
+
+void EpubReaderActivity::addAnnotation() {
+  if (!section || !epub) return;
+  auto entry = makeUniqueNoThrow<AnnotationEntry>();
+  if (!entry) {
+    LOG_ERR("ANN", "OOM: annotation draft");
+    requestUpdate();
+    return;
+  }
+
+  {
+    RenderLock lock;
+    const int currentPage = section->currentPage;
+    const int pageCount = section->estimatedTotalPages();
+    const SavedProgressPosition progress = ProgressMapper::toSavedProgress(epub, getCurrentPosition());
+    BookmarkEntry location;
+    location.percentage = progress.percentage;
+    location.xpath = progress.xpath;
+    location.computedSpineIndex = currentSpineIndex;
+    location.computedChapterPageCount = pageCount;
+    location.computedChapterProgress = currentPage;
+    const std::optional<uint32_t> offset =
+        currentPageVisibleOffset.has_value() ? currentPageVisibleOffset
+        : (currentPage >= 0 && currentPage < section->pageCount)
+            ? section->getVisibleTextOffsetForPage(static_cast<uint16_t>(currentPage))
+            : std::nullopt;
+    if (offset) {
+      location.visibleTextOffset = *offset;
+      location.hasVisibleTextOffset = true;
+    }
+    if (!AnnotationExport::capture(*entry, *epub, bookPath, location, AnnotationExport::pageContext(*section))) {
+      requestUpdate();
+      return;
+    }
+  }
+
+  auto editor = makeUniqueNoThrow<AnnotationEditorActivity>(renderer, mappedInput, std::move(entry));
+  if (!editor) {
+    LOG_ERR("ANN", "OOM: annotation editor");
+    requestUpdate();
+    return;
+  }
+  startActivityForResult(std::move(editor), [this](const ActivityResult&) { openReaderMenu(); });
 }
 
 void EpubReaderActivity::addBookmark() {

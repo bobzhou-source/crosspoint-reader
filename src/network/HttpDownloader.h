@@ -5,9 +5,9 @@
 #include <string>
 
 /**
- * HTTP client utility for fetching content and downloading files. Built on
- * esp_http_client: https is verified against the CA bundle, plain http is
- * used for local servers (transport is chosen from the URL scheme).
+ * HTTP client utility for fetching content and downloading files. HTTPS uses
+ * verified CA chains and hostnames; explicit plain HTTP supports local servers.
+ * HTTPS redirects cannot downgrade to HTTP on either TLS backend.
  */
 class HttpDownloader {
  public:
@@ -47,13 +47,8 @@ class HttpDownloader {
 
   /**
    * Download a file to the SD card with optional credentials.
-   *
-   * downgradeRedirectsToHttp rewrites followed redirect targets from https to
-   * http so the bulk transfer skips a second TLS session (and its ~17KB record
-   * buffer — the OOM site on low-heap C3 boards).
    */
   static DownloadError downloadToFile(const std::string& url, const std::string& destPath,
                                       ProgressCallback progress = nullptr, bool* cancelFlag = nullptr,
-                                      const std::string& username = "", const std::string& password = "",
-                                      bool downgradeRedirectsToHttp = false);
+                                      const std::string& username = "", const std::string& password = "");
 };

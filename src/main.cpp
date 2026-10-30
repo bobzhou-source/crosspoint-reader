@@ -35,6 +35,7 @@
 #include "activities/settings/SdFirmwareUpdateActivity.h"
 #include "components/UITheme.h"
 #include "fontIds.h"
+#include "network/OtaBootSwitch.h"
 #include "platform/UsbSerialJtagHandoff.h"
 #include "util/ButtonNavigator.h"
 #include "util/ScreenshotUtil.h"
@@ -386,12 +387,42 @@ void setup() {
   // only SD state survives to the next boot.
   const bool wakeHoldVerified = wakeupReason != HalGPIO::WakeupReason::PowerButton || gpio.verifyPowerButtonWakeup();
 
+  // Cold power-on skips verifyPowerButtonWakeup(), and HalGPIO::begin() leaves
+  // InputManager's cached state unsampled. Settle X4 Pro buttons explicitly so
+  // a held Down key is visible before either recovery path is classified.
+  if (BoardConfig::isX4Pro()) {
+    gpio.update();
+    delay(10);
+    gpio.update();
+  }
+
   // X4 Pro and X4 Classic both map BTN_UP to GPIO0 — an ESP32-S3 boot strap — so
   // gate recovery on the non-strap Down key (GPIO7) to avoid a stuck-in-recovery loop.
   const auto recoveryButton = (BoardConfig::isX4Pro() || BoardConfig::isX4Classic()) ? MappedInputManager::Button::Down
                                                                                      : MappedInputManager::Button::Up;
-  const bool recoveryFirmwareMode = wakeupReason == HalGPIO::WakeupReason::PowerButton && !BoardConfig::isPaperMono() &&
-                                    mappedInputManager.isPressed(recoveryButton);
+  bool recoveryFirmwareMode = wakeupReason == HalGPIO::WakeupReason::PowerButton && !BoardConfig::isPaperMono() &&
+                              mappedInputManager.isPressed(recoveryButton);
+
+  // A sustained Down + Power hold returns to the preserved stock/alternate
+  // app before SD, display, fonts, or activities initialize. Check Down
+  // directly rather than wake classification so this also works from a cold
+  // battery-power boot. A brief warm-wake hold keeps SD recovery mode below.
+  if (BoardConfig::isX4Pro() && gpio.isPressed(HalGPIO::BTN_DOWN)) {
+    const unsigned long holdStartedAt = millis();
+    while (gpio.isPressed(HalGPIO::BTN_DOWN) && millis() - holdStartedAt < 3000) {
+      delay(25);
+      gpio.update();
+    }
+    if (gpio.isPressed(HalGPIO::BTN_DOWN)) {
+      recoveryFirmwareMode = false;  // failure must continue to Home, not SD recovery
+      LOG_INF("MAIN", "Down + Power held for 3s: selecting alternate firmware slot");
+      if (ota_boot::switchToOther()) {
+        delay(50);
+        ESP.restart();
+      }
+      LOG_ERR("MAIN", "Alternate firmware slot unavailable; continuing normal boot");
+    }
+  }
 
   halTiltSensor.begin();
   halClock.begin();
