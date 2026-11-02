@@ -224,8 +224,22 @@ The LaunchAgent is `~/Library/LaunchAgents/dev.reader-workbench.card-autosync.pl
 X posts reach the reader as **one EPUB per local day** instead of one book per post. The server (`robertzhou.dev`, `server/digest.js`) builds them, so Wi-Fi direct sync and card autosync both receive the same files and the firmware needs no change:
 
 - A post whose `original_url` is an X status URL is held back from the `ready`/`active` listings until its digest exists. An X post shared explicitly through `/reader/links` is still delivered on its own.
-- Management listings (the collector every 15 minutes, card autosync) build at most one digest volume per request. A day (America/New_York, server env `READER_DIGEST_TZ`) is published once it has ended and the local clock has passed 05:00 (`READER_DIGEST_HOUR`). The device's own listing never builds, so it stays within the 4-second timeout.
-- Each volume holds at most 100 posts or 6 MiB of post EPUBs, and the result stays under 8 MiB. Titles: `X — Sun 2 Nov 2026`, then `X — 2 Nov (2)`, `(3)` …. Posts that arrive after a day's volume was delivered go into the next volume number; a built volume is never rewritten.
+- Every listing, management (the collector every 15 minutes, card autosync) or device, does at most one small unit of feed work, so each request stays within a Workers Free CPU budget (10 ms). A unit is one of the following:
+  - describing one uploaded item that is still undescribed;
+  - planning one volume;
+  - rendering one posts file;
+  - writing the front matter (feed.json, OPF, navigation, contents);
+  - sealing the volume.
+
+  Undescribed uploads are always described before any day is planned. A day (America/New_York, server env `READER_DIGEST_TZ`) is published once it has ended and the local clock has passed 05:00 (`READER_DIGEST_HOUR`). Each part is stored in D1 with its CRC-32 and size. The digest is served as a STORED (uncompressed) zip assembled from those parts, with no compression or CRC work per request, and a rebuild produces identical bytes.
+- Server volumes hold at most 100 posts or 512 KiB of post markup. Server digests are text-only: a photo becomes a `[photo]` link to the post. The firmware checks a whole-file SHA-256 before acknowledging, and computing that over images does not fit the per-request budget.
+- Titles: `X — Sun 2 Nov 2026`, then `X — 2 Nov (2)`, `(3)` …. Posts that arrive after a day's volume was delivered go into the next volume number; a built volume is never rewritten.
+- **Layout.** Posts flow like a feed, with no page breaks. Each post is a `<div class="post" id="p-<key>">` block:
+  - name, `@handle` and local time in small bold;
+  - then the text, quoted post or thread replies;
+  - then a thin `<hr/>` rule before the next post.
+
+  Whole author groups share spine documents `OEBPS/posts/NNNN.xhtml` of at most 25 posts and 48 KiB; a bigger group is split. The NCX and nav point at whole posts files, never at post anchors, because the reader starts a new page at every TOC anchor.
 - A re-uploaded copy of a post already in a volume joins that volume rather than being delivered twice.
 - Acknowledging a digest consumes every member post in the same transaction, once; a repeated acknowledgement is a no-op. Deleting an undelivered digest returns its posts to the queue.
 - Articles that have an author (Substack, RSS) stay one EPUB each but are listed under the card name `Author — Title (2 Nov 2026).epub`. The stored `source_path` is unchanged, so the collector's metadata comparison still holds.
@@ -238,14 +252,22 @@ X posts reach the reader as **one EPUB per local day** instead of one book per p
  "generator": "server",
  "items": [{"id": "<cloud item id or null>", "key": "x:<status id>", "source": "x", "author": "Ann A",
             "handle": "ann", "published": "2026-11-02T14:05:00Z", "url": "https://x.com/ann/status/…",
-            "href": "posts/0001.xhtml", "title": "first 140 characters"}]}
+            "href": "posts/0001.xhtml#p-x:<status id>", "title": "first 140 characters"}]}
 ```
 
-- `href` is relative to `OEBPS/`. Each post is its own spine document `OEBPS/posts/NNNN.xhtml` (`<section id="post">`), in contents order: grouped by author, then by time.
-- `OEBPS/contents.xhtml` is the first spine item. `key` is stable across re-uploads and repacks; `id` is null only for digests repacked from card files with no cloud id.
-- `generator` is `"server"` or `"companion"`; both write the same fields.
+- `href` is relative to `OEBPS/`: the posts file plus the post's anchor `p-<key>`. Items are in contents order: grouped by author, then by time. Inside a posts file, the i-th item with that file is the i-th `body/div`.
+- `OEBPS/contents.xhtml` is the first spine item and links every post by its `href`. `key` is stable across re-uploads and repacks. `id` is null only for digests repacked from card files with no cloud id.
+- `generator` is `"server"`, `"companion"` or `"companion-repack"`. All of them write the same fields and layout; only companion builds embed images.
 
-**Annotations in digests.** The firmware still uploads `item_id: null` with `book_path` = the card path and `source_anchor.native.chapterHref` = the spine document. `GET /reader/annotations/feed?after=&limit=` (management key only) resolves each annotation to `{sequence, annotation_id, digest_id, item_id, key, href}`. It matches the card name, including the firmware's `-<sha8>.epub` collision name and `<id>.epub`, and then the chapter `href` from the manifest. The existing `/reader/annotations` records are unchanged.
+**Annotations in digests.** The firmware still uploads `item_id: null` with `book_path` set to the card path. Its `source_anchor.native` holds `chapterHref` (the posts file) and `xpath` (the page start, `/body/DocFragment[n]/body/div[i]…`).
+
+`GET /reader/annotations/feed?after=&limit=` (management key only) resolves each annotation to `{sequence, annotation_id, digest_id, item_id, key, href}` in four steps:
+1. Match the card name, including the firmware's `-<sha8>.epub` collision name and `<id>.epub`.
+2. Pick the manifest items in `chapterHref`'s posts file.
+3. Take the page-start post `div[i]`.
+4. If the annotation has a selection, use the first post from there on whose text contains its first 64 characters (whitespace squashed); otherwise keep the page-start post.
+
+The existing `/reader/annotations` records are unchanged. Repacked digests are named `… (card).epub` and are not known to the server, so their annotations stay unresolved (`digest_id: null`) rather than being matched to a server volume with the same title. Their `feed.json` carries the member ids for the same file + `div[i]` mapping offline.
 
 **Repacking the singles already on the card** (dry run by default; prints one line per file):
 
@@ -254,7 +276,7 @@ reader-send card repack --root "/Volumes/NO NAME"          # plan only: N single
 reader-send card repack --root "/Volumes/NO NAME" --apply  # write digests, move singles away
 ```
 
-- It reads each companion-format X post EPUB in `/books/Inbox` and groups them by local day (`--timezone`, default America/New_York). Digests already on the card continue their volume numbers and skip posts they already contain.
+- It reads each companion-format X post EPUB in `/books/Inbox` and groups them by local day (`--timezone`, default America/New_York) into digests named `X — Sun 2 Nov 2026 (card).epub`, with images kept inline. Digests already on the card, from the server or an earlier repack, continue their volume numbers and skip posts they already contain.
 - `--apply` writes each digest (temporary file, fsync, rename, SHA-256 read-back), then moves the originals to `/books/Inbox/.singles-archive/` without deleting anything. It drops their `recent.json` entries and marks the library dirty.
 - Singles that have highlights or notes stay where they are. Without `--root`, the configured card (`card.json`) is used.
 

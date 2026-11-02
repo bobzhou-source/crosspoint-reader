@@ -385,6 +385,13 @@ def run_cleanup(root: Path, state_file: Path, *, apply: bool = False, now: datet
 
 
 
+def repack_name(volume: feed_digest.Volume) -> str:
+    """Card name of a repacked digest. The suffix keeps it apart from a server volume of the same day
+    and number: the annotation feed resolves digests by card name, and a repacked file is not one of
+    the server's (its annotations stay unresolved rather than mapped to the wrong posts)."""
+    return f"{volume.title} (card).epub"
+
+
 def plan_repack(root: Path, tz_name: str = feed_digest.DEFAULT_TZ, *, max_posts: int = feed_digest.MAX_POSTS,
                 max_bytes: int = feed_digest.MAX_BYTES) -> dict:
     """Plan digests for the single X posts in /books/Inbox; nothing is written."""
@@ -422,12 +429,12 @@ def plan_repack(root: Path, tz_name: str = feed_digest.DEFAULT_TZ, *, max_posts:
                                        max_bytes=max_bytes)
     digests, archive = [], []
     for volume in volumes:
-        name = volume.filename
+        name = repack_name(volume)
         number = volume.number
         while name in taken:  # an unrelated file already has this name: take the next volume number
             number += 1
             volume = feed_digest.Volume(volume.source, volume.day, number, volume.posts)
-            name = volume.filename
+            name = repack_name(volume)
         taken.add(name)
         files = [book for post in volume.posts for book in sources[post.key]]
         digests.append({"file": card_path(root, inbox / name), "volume": volume, "posts": len(volume.posts),

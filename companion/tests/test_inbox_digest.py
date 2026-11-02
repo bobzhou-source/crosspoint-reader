@@ -239,8 +239,8 @@ class RepackTests(CardFixture):
         self.assertEqual(tree(self.root), before)
         self.assertEqual(summary["singles"], 4)
         self.assertEqual([(d["file"], d["posts"], sorted(d["singles"])) for d in summary["digests"]],
-                         [("/books/Inbox/X — Mon 2 Nov 2026.epub", 2, sorted([a, b, dup])),
-                          ("/books/Inbox/X — Tue 3 Nov 2026.epub", 1, [c])])
+                         [("/books/Inbox/X — Mon 2 Nov 2026 (card).epub", 2, sorted([a, b, dup])),
+                          ("/books/Inbox/X — Tue 3 Nov 2026 (card).epub", 1, [c])])
         self.assertEqual(summary["kept"], [{"file": noted, "reason": "has annotations; left as a single"}])
 
     def test_apply_moves_singles_never_deletes_and_is_idempotent(self):
@@ -253,7 +253,7 @@ class RepackTests(CardFixture):
         self.assertEqual(result, {"digests_written": 1, "singles_archived": 2, "recents_removed": 1})
         archive = self.inbox / ".singles-archive"
         self.assertEqual({p.name: p.read_bytes() for p in archive.iterdir()}, originals)
-        digest_file = self.inbox / "X — Mon 2 Nov 2026.epub"
+        digest_file = self.inbox / "X — Mon 2 Nov 2026 (card).epub"
         self.assertEqual([i["key"] for i in fd.read_manifest(digest_file.read_bytes())["items"]], ["x:1", "x:2"])
         self.assertEqual(self.recent_paths(), ["/books/Other.epub"])
         self.assertTrue((self.root / ".crosspoint/library.dirty").exists())
@@ -263,8 +263,13 @@ class RepackTests(CardFixture):
         self.put("late.epub", single("carol", "3", "2026-11-02T20:00:00Z", "late"))
         self.put("again.epub", originals["a.epub"])
         late = inbox_card.plan_repack(self.root)
-        self.assertEqual([d["file"] for d in late["digests"]], ["/books/Inbox/X — 2 Nov (2).epub"])
+        self.assertEqual([d["file"] for d in late["digests"]], ["/books/Inbox/X — 2 Nov (2) (card).epub"])
         self.assertEqual(late["already_in_digest"], ["/books/Inbox/again.epub"])
+        # A server volume already on the card counts too, and a repacked name never equals a server name.
+        server = fd.plan_volumes([post("dan", "4", "2026-11-02T21:00:00Z")], existing={date(2026, 11, 2): 1})[0]
+        self.put(server.filename, fd.build_digest(server, generator="server"))
+        later = inbox_card.plan_repack(self.root)
+        self.assertEqual([d["file"] for d in later["digests"]], ["/books/Inbox/X — 2 Nov (3) (card).epub"])
 
 
 class CleanupTests(CardFixture):
