@@ -1,3 +1,4 @@
+#include <Benchmark.h>
 #include <HalDisplay.h>
 #include <HalGPIO.h>
 
@@ -13,6 +14,18 @@ HalDisplay::~HalDisplay() {}
 HalDisplay::Controller HalDisplay::getController() const { return BoardConfig::ACTIVE.displayController; }
 
 void HalDisplay::begin(bool seamless) {
+  // Recording can be enabled from Settings after display initialization.
+  einkDisplay.setBusyWaitObserver([](uint64_t startUs, uint64_t endUs, const char* tag, uint8_t kind, uint8_t outcome) {
+    if (!benchmark::enabled()) return;
+    benchmark::Event event;
+    event.type = benchmark::EventType::Busy;
+    event.startUs = startUs;
+    event.endUs = endUs;
+    event.data[0] = benchmark::id(tag);
+    event.data[1] = kind;
+    event.data[2] = outcome;
+    benchmark::record(event);
+  });
   // Set X3-specific panel mode before initializing.
   if (gpio.deviceIsX3()) {
     einkDisplay.setDisplayX3();
@@ -60,6 +73,7 @@ EInkDisplay::RefreshMode convertRefreshMode(HalDisplay::RefreshMode mode) {
 }
 
 void HalDisplay::displayBuffer(HalDisplay::RefreshMode mode, bool turnOffScreen) {
+  benchmark::DisplaySpan measurement(benchmark::DisplayCall::Buffer, static_cast<uint32_t>(mode));
   if (gpio.deviceIsX3() && mode == RefreshMode::HALF_REFRESH) {
     einkDisplay.requestResync(1);
   }
@@ -68,6 +82,7 @@ void HalDisplay::displayBuffer(HalDisplay::RefreshMode mode, bool turnOffScreen)
 }
 
 void HalDisplay::displayBufferAsync(HalDisplay::RefreshMode mode) {
+  benchmark::DisplaySpan measurement(benchmark::DisplayCall::AsyncSubmit, static_cast<uint32_t>(mode));
   if (gpio.deviceIsX3() && mode == RefreshMode::HALF_REFRESH) {
     einkDisplay.requestResync(1);
   }
@@ -75,7 +90,10 @@ void HalDisplay::displayBufferAsync(HalDisplay::RefreshMode mode) {
   einkDisplay.displayBufferAsyncNoShadow(convertRefreshMode(mode));
 }
 
-void HalDisplay::waitRefreshComplete() { einkDisplay.waitRefreshComplete(); }
+void HalDisplay::waitRefreshComplete() {
+  benchmark::DisplaySpan measurement(benchmark::DisplayCall::AsyncWait);
+  einkDisplay.waitRefreshComplete();
+}
 
 bool HalDisplay::supportsAsyncRefresh() const { return einkDisplay.supportsAsyncRefresh(); }
 
@@ -83,9 +101,12 @@ HalDisplay::GrayscaleCapabilities HalDisplay::grayscaleCapabilities(GrayscaleMod
   return einkDisplay.grayscaleCapabilities(mode);
 }
 
+HalDisplay::FrameChangeMetrics HalDisplay::measureFrameChange() const { return einkDisplay.measureFrameChange(); }
+
 bool HalDisplay::supportsAsyncGrayscaleBase() const { return grayscaleCapabilities().asyncBase; }
 
 void HalDisplay::refreshDisplay(HalDisplay::RefreshMode mode, bool turnOffScreen) {
+  benchmark::DisplaySpan measurement(benchmark::DisplayCall::Refresh, static_cast<uint32_t>(mode));
   if (gpio.deviceIsX3() && mode == RefreshMode::HALF_REFRESH) {
     einkDisplay.requestResync(1);
   }
@@ -99,7 +120,10 @@ bool HalDisplay::toggleInverted() { return einkDisplay.toggleInverted(); }
 
 bool HalDisplay::isInverted() const { return einkDisplay.isInverted(); }
 
-void HalDisplay::deepSleep() { einkDisplay.deepSleep(); }
+void HalDisplay::deepSleep() {
+  benchmark::DisplaySpan measurement(benchmark::DisplayCall::Sleep);
+  einkDisplay.deepSleep();
+}
 
 uint8_t* HalDisplay::getFrameBuffer() const { return einkDisplay.getFrameBuffer(); }
 
@@ -108,6 +132,8 @@ uint8_t* HalDisplay::lendFrameBufferStorage(uint32_t* sizeOut) { return einkDisp
 void HalDisplay::returnFrameBufferStorage() { einkDisplay.returnBuildStorage(); }
 
 bool HalDisplay::displayGrayscaleBase(GrayscaleMode mode, RefreshMode fallback, bool turnOffScreen) {
+  benchmark::DisplaySpan measurement(benchmark::DisplayCall::ConfiguredGrayBase, static_cast<uint32_t>(mode),
+                                     static_cast<uint32_t>(fallback));
   if (gpio.deviceIsX3() && fallback == HALF_REFRESH) einkDisplay.requestResync();
   return einkDisplay.displayGrayscaleBase(mode, static_cast<EInkDisplay::RefreshMode>(fallback), turnOffScreen);
 }
@@ -117,6 +143,7 @@ void HalDisplay::copyGrayscaleBuffers(const uint8_t* lsbBuffer, const uint8_t* m
 }
 
 void HalDisplay::displayGrayscaleBase(RefreshMode fallback, bool turnOffScreen) {
+  benchmark::DisplaySpan measurement(benchmark::DisplayCall::GrayBase, static_cast<uint32_t>(fallback));
   // X3: a HALF fallback means the caller wants a clean base (e.g. the sleep
   // cover, a full-screen swap from arbitrary prior content). Without this, the
   // X3 grayscale base takes its gentle differential happy path and the prior
@@ -131,9 +158,13 @@ void HalDisplay::displayGrayscaleBase(RefreshMode fallback, bool turnOffScreen) 
   einkDisplay.displayGrayscaleBase(convertRefreshMode(fallback), turnOffScreen);
 }
 
-void HalDisplay::preconditionGrayscale() { einkDisplay.preconditionGrayscale(); }
+void HalDisplay::preconditionGrayscale() {
+  benchmark::DisplaySpan measurement(benchmark::DisplayCall::Precondition);
+  einkDisplay.preconditionGrayscale();
+}
 
 void HalDisplay::preconditionGrayscale(uint16_t x, uint16_t y, uint16_t w, uint16_t h) {
+  benchmark::DisplaySpan measurement(benchmark::DisplayCall::Precondition);
   einkDisplay.preconditionGrayscale(x, y, w, h);
 }
 
@@ -143,7 +174,10 @@ void HalDisplay::copyGrayscaleMsbBuffers(const uint8_t* msbBuffer) { einkDisplay
 
 void HalDisplay::cleanupGrayscaleBuffers(const uint8_t* bwBuffer) { einkDisplay.cleanupGrayscaleBuffers(bwBuffer); }
 
-void HalDisplay::displayGrayBuffer(bool turnOffScreen) { einkDisplay.displayGrayBuffer(turnOffScreen); }
+void HalDisplay::displayGrayBuffer(bool turnOffScreen) {
+  benchmark::DisplaySpan measurement(benchmark::DisplayCall::Gray);
+  einkDisplay.displayGrayBuffer(turnOffScreen);
+}
 
 void HalDisplay::writeGrayscalePlaneStrip(bool lsbPlane, const uint8_t* rows, uint16_t yStart, uint16_t numRows) {
   einkDisplay.writeGrayscalePlaneStrip(lsbPlane ? EInkDisplay::GRAY_PLANE_LSB : EInkDisplay::GRAY_PLANE_MSB, rows,

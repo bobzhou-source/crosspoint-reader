@@ -484,52 +484,6 @@ void KOReaderSyncActivity::buildResultScreen(UiScreen& screen) {
     char localVal[64];
     snprintf(localVal, sizeof(localVal), tr(STR_PAGE_TOTAL_OVERALL_FORMAT), localPosition.pageNumber + 1,
              localPosition.totalPages, localProgress.percentage * 100);
-    char deviceStr[80];
-    deviceStr[0] = '\0';
-    if (!remoteProgress.device.empty()) {
-      snprintf(deviceStr, sizeof(deviceStr), tr(STR_DEVICE_FROM_FORMAT), remoteProgress.device.c_str());
-    }
-
-    // Labeled, multi-line comparison flowing from the top. Indent everything to
-    // the list rows' content-left (the row inset + side padding the list adds
-    // below) so the "Remote"/"Local" labels sit directly above the row icons.
-    auto labelStyle = screen.theme().bodyText;
-    labelStyle.bold = true;
-    auto detailStyle = screen.theme().smallText;
-    const int16_t labelH = screen.target().lineHeight(labelStyle.font);
-    const int16_t detailH = screen.target().lineHeight(detailStyle.font);
-    const int16_t labelIndent = static_cast<int16_t>(screen.theme().listInset + screen.theme().listSidePadding);
-    const int16_t detailIndent = static_cast<int16_t>(labelIndent + screen.theme().spaceMd);
-    const auto textLine = [&](const char* text, const fui::TextStyle& style, int16_t height, int16_t indent,
-                              int16_t gap) {
-      fui::Rect r = screen.takeTop(height, gap);
-      r.x = static_cast<int16_t>(r.x + indent);
-      r.width = static_cast<int16_t>(r.width - indent);
-      screen.target().text(r, text, style);
-    };
-    const auto labelLine = [&](const char* text) {
-      textLine(text, labelStyle, labelH, labelIndent, screen.theme().spaceSm);
-    };
-    const auto detailLine = [&](const char* text) {
-      textLine(text, detailStyle, detailH, detailIndent, screen.theme().spaceXs);
-    };
-
-    labelLine(tr(STR_REMOTE_LABEL));
-    detailLine(remoteChapter.c_str());
-    detailLine(remoteVal);
-    if (deviceStr[0] != '\0') detailLine(deviceStr);
-    screen.spacer(screen.theme().spaceLg);
-    labelLine(tr(STR_LOCAL_LABEL));
-    detailLine(localChapter);
-    detailLine(localVal);
-
-    // Two themed action rows flowing directly below the labels (not anchored to
-    // the bottom). Rendered through the list component so they inherit the
-    // active theme's row radius, insets, and selection style, matching every
-    // other selectable list in the UI. Apply Remote pulls (download), Upload
-    // Local pushes (upload); the selected row highlights for physical-button
-    // users and tap works either way.
-    screen.spacer(screen.theme().spaceMd);
     fui::ListItem actions[2];
     actions[0].label = tr(STR_APPLY_REMOTE);
     actions[0].icon = fui::bitmapFromIcon(icon_download_24);
@@ -538,38 +492,59 @@ void KOReaderSyncActivity::buildResultScreen(UiScreen& screen) {
     actions[1].icon = fui::bitmapFromIcon(icon_upload_24);
     actions[1].actionValue = 1;
     fui::ListProps actionProps;
+    actionProps.rtl = UITheme::isRtl();
+    actionProps.labelText = screen.theme().bodyText;
+    actionProps.labelText.maxLines = 2;
     actionProps.items = actions;
     actionProps.count = 2;
     actionProps.selectedIndex = static_cast<int16_t>(selectedOption);
     actionProps.action = ACTION_ROW;
     actionProps.inputMask = fui::InputTouch;  // physical buttons stay in loop()
     actionProps.scrollIndicator = false;      // never scrolls; no indicator needed
-    // Non-touch hardware (X3/X4) keeps the original, denser row height instead
-    // of FreeInkUI's touch-target-sized default (see
-    // UiListActivity::syncListViewport); actionsBand must use the same value
-    // or the band and the rows it contains fall out of sync.
-    int16_t actionRowHeight = screen.theme().rowHeight;
-    if (!mappedInput.hasTouch()) {
-      actionRowHeight = static_cast<int16_t>(UITheme::getInstance().getMetrics().listRowHeight);
-      actionProps.rowHeight = actionRowHeight;
-    }
-    // Keep the theme's row inset + side padding so the selected-row highlight has
-    // the same padding around its icon/label as every other list in the UI; the
-    // labels above are indented to match this content-left.
+    const int16_t actionRowHeight = std::max<int>(
+        mappedInput.hasTouch() ? 48 : metrics.listRowHeight,
+        2 * screen.target().lineHeight(screen.theme().bodyText.font) + 20);
+    actionProps.rowHeight = actionRowHeight;
     const auto actionsBand =
         static_cast<int16_t>(actionRowHeight * 2 + screen.theme().listRowGap + screen.theme().spaceSm);
-    screen.list(actionProps, actionsBand);
+    screen.list(actionProps, actionsBand, fui::LayoutAnchor::Bottom);
+
+    const auto available = screen.body();
+    Rect remote{available.x + 20, available.y, available.width - 40, available.height - 16};
+    Rect local = remote;
+    if (remote.width > remote.height) {
+      remote.width = (remote.width - 24) / 2;
+      local.width = remote.width;
+      if (UITheme::isRtl()) remote.x += remote.width + 24;
+      else local.x += remote.width + 24;
+    } else {
+      remote.height = (remote.height - 24) / 2;
+      local.y += remote.height + 24;
+      local.height = remote.height;
+    }
+    const auto drawComparison = [&](const Rect panel, const char* label, const char* chapter,
+                                    const char* position, const char* device) {
+      const int labelHeight = std::min(panel.height / 3, 2 * renderer.getLineHeight(UI_12_FONT_ID));
+      UITheme::drawCenteredWrappedText(renderer, Rect{panel.x, panel.y, panel.width, labelHeight},
+                                       UI_12_FONT_ID, label, 2, true, EpdFontFamily::BOLD);
+      const int slots = device && device[0] ? 3 : 2;
+      const int slotHeight = std::max(0, (panel.height - labelHeight - 8) / slots);
+      const int y = panel.y + labelHeight + 8;
+      UITheme::drawCenteredWrappedText(renderer, Rect{panel.x, y, panel.width, slotHeight},
+                                       SMALL_FONT_ID, chapter, 4);
+      UITheme::drawCenteredWrappedText(renderer, Rect{panel.x, y + slotHeight, panel.width, slotHeight},
+                                       SMALL_FONT_ID, position, 4);
+      if (slots == 3) {
+        UITheme::drawCenteredWrappedText(renderer, Rect{panel.x, y + 2 * slotHeight, panel.width, slotHeight},
+                                         SMALL_FONT_ID, device, 3);
+      }
+    };
+    drawComparison(remote, tr(STR_REMOTE_LABEL), remoteChapter.c_str(), remoteVal, remoteProgress.device.c_str());
+    drawComparison(local, tr(STR_LOCAL_LABEL), localChapter, localVal, nullptr);
     return;
   }
 
   if (state == NO_REMOTE_PROGRESS) {
-    auto centered = screen.theme().bodyText;
-    centered.align = fui::TextAlign::Center;
-    auto centeredBold = centered;
-    centeredBold.bold = true;
-    const int16_t lineH = screen.target().lineHeight(centered.font);
-    screen.target().text(screen.takeTop(lineH, screen.theme().spaceSm), tr(STR_NO_REMOTE_MSG), centeredBold);
-    screen.target().text(screen.takeTop(lineH, screen.theme().spaceMd), tr(STR_UPLOAD_PROMPT), centered);
 
     // Single themed action row anchored to the bottom, matching the lists used
     // everywhere else (inherits the theme's row radius + selection style).
@@ -577,21 +552,29 @@ void KOReaderSyncActivity::buildResultScreen(UiScreen& screen) {
     action.label = tr(STR_UPLOAD_LOCAL);
     action.actionValue = 0;
     fui::ListProps actionProps;
+    actionProps.rtl = UITheme::isRtl();
+    actionProps.labelText = screen.theme().bodyText;
+    actionProps.labelText.maxLines = 2;
     actionProps.items = &action;
     actionProps.count = 1;
     actionProps.selectedIndex = 0;
     actionProps.action = ACTION_ROW;
     actionProps.inputMask = fui::InputTouch;
     actionProps.scrollIndicator = false;
-    // See the equivalent override above; keeps actionsBand in sync with the
-    // row height actually used on non-touch hardware (X3/X4).
-    int16_t actionRowHeight = screen.theme().rowHeight;
-    if (!mappedInput.hasTouch()) {
-      actionRowHeight = static_cast<int16_t>(UITheme::getInstance().getMetrics().listRowHeight);
-      actionProps.rowHeight = actionRowHeight;
-    }
+    const int16_t actionRowHeight = std::max<int>(
+        mappedInput.hasTouch() ? 48 : metrics.listRowHeight,
+        2 * screen.target().lineHeight(screen.theme().bodyText.font) + 20);
+    actionProps.rowHeight = actionRowHeight;
     const auto actionsBand = static_cast<int16_t>(actionRowHeight + screen.theme().spaceMd);
     screen.list(actionProps, actionsBand, fui::LayoutAnchor::Bottom);
+    const auto remaining = screen.body();
+    const Rect body{remaining.x + 20, remaining.y, remaining.width - 40, remaining.height - 16};
+    UITheme::drawCenteredWrappedText(renderer, Rect{body.x, body.y, body.width, body.height / 2 - 8},
+                                     UI_12_FONT_ID, tr(STR_NO_REMOTE_MSG), 4, true, EpdFontFamily::BOLD,
+                                     UITheme::TextVerticalAlignment::BOTTOM);
+    UITheme::drawCenteredWrappedText(renderer,
+        Rect{body.x, body.y + body.height / 2 + 8, body.width, body.height / 2 - 8},
+        UI_12_FONT_ID, tr(STR_UPLOAD_PROMPT), 4, true, EpdFontFamily::REGULAR, UITheme::TextVerticalAlignment::TOP);
   }
 }
 
@@ -604,12 +587,14 @@ void KOReaderSyncActivity::render(RenderLock&&) {
   GUI.drawHeader(renderer, Rect{screen.x, screen.y + metrics.topPadding, screen.width, metrics.headerHeight},
                  state == SHOWING_RESULT ? tr(STR_PROGRESS_FOUND) : tr(STR_KOREADER_SYNC));
 
-  int top = screen.y + screen.height / 2 - 40;
+  const Rect body = UITheme::getContentBounds(renderer);
+  const Rect title{body.x, body.y, body.width, body.height / 2 - 8};
+  const Rect detail{body.x, body.y + body.height / 2 + 8, body.width, body.height / 2 - 8};
   if (state == NO_CREDENTIALS) {
-    UITheme::drawCenteredText(renderer, screen, UI_10_FONT_ID, top, tr(STR_NO_CREDENTIALS_MSG), true,
-                              EpdFontFamily::BOLD);
-    UITheme::drawCenteredText(renderer, screen, UI_10_FONT_ID, top + 40, tr(STR_KOREADER_SETUP_HINT), true,
-                              EpdFontFamily::BOLD);
+    UITheme::drawCenteredWrappedText(renderer, title, UI_12_FONT_ID, tr(STR_NO_CREDENTIALS_MSG), 4, true,
+                                     EpdFontFamily::BOLD, UITheme::TextVerticalAlignment::BOTTOM);
+    UITheme::drawCenteredWrappedText(renderer, detail, UI_10_FONT_ID, tr(STR_KOREADER_SETUP_HINT), 8, true,
+                                     EpdFontFamily::REGULAR, UITheme::TextVerticalAlignment::TOP);
 
     const auto labels = mappedInput.mapLabels(tr(STR_BACK), "", "", "");
     GUI.drawButtonHints(renderer, labels.btn1, labels.btn2, labels.btn3, labels.btn4);
@@ -618,7 +603,8 @@ void KOReaderSyncActivity::render(RenderLock&&) {
   }
 
   if (state == SYNCING || state == UPLOADING) {
-    UITheme::drawCenteredText(renderer, screen, UI_10_FONT_ID, top, statusMessage.c_str(), true, EpdFontFamily::BOLD);
+    UITheme::drawCenteredWrappedText(renderer, body, UI_10_FONT_ID, statusMessage.c_str(), 8, true,
+                                     EpdFontFamily::BOLD);
     renderer.displayBuffer();
     return;
   }
@@ -645,9 +631,9 @@ void KOReaderSyncActivity::render(RenderLock&&) {
   }
 
   if (state == UPLOAD_COMPLETE || state == SYNC_COMPLETE) {
-    UITheme::drawCenteredText(renderer, screen, UI_10_FONT_ID, top,
-                              state == UPLOAD_COMPLETE ? tr(STR_UPLOAD_SUCCESS) : tr(STR_ALREADY_SYNCED), true,
-                              EpdFontFamily::BOLD);
+    UITheme::drawCenteredWrappedText(renderer, body, UI_12_FONT_ID,
+                                     state == UPLOAD_COMPLETE ? tr(STR_UPLOAD_SUCCESS) : tr(STR_ALREADY_SYNCED),
+                                     8, true, EpdFontFamily::BOLD);
 
     const auto labels = mappedInput.mapLabels(tr(STR_BACK), tr(STR_DONE), "", "");
     GUI.drawButtonHints(renderer, labels.btn1, labels.btn2, labels.btn3, labels.btn4);
@@ -656,8 +642,10 @@ void KOReaderSyncActivity::render(RenderLock&&) {
   }
 
   if (state == SYNC_FAILED) {
-    UITheme::drawCenteredText(renderer, screen, UI_10_FONT_ID, top, tr(STR_SYNC_FAILED_MSG), true, EpdFontFamily::BOLD);
-    UITheme::drawCenteredText(renderer, screen, UI_10_FONT_ID, top + 40, statusMessage.c_str());
+    UITheme::drawCenteredWrappedText(renderer, title, UI_12_FONT_ID, tr(STR_SYNC_FAILED_MSG), 4, true,
+                                     EpdFontFamily::BOLD, UITheme::TextVerticalAlignment::BOTTOM);
+    UITheme::drawCenteredWrappedText(renderer, detail, UI_10_FONT_ID, statusMessage.c_str(), 8, true,
+                                     EpdFontFamily::REGULAR, UITheme::TextVerticalAlignment::TOP);
 
     const auto labels = mappedInput.mapLabels(tr(STR_BACK), "", "", "");
     GUI.drawButtonHints(renderer, labels.btn1, labels.btn2, labels.btn3, labels.btn4);

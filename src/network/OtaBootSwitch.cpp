@@ -6,6 +6,14 @@
 #include <spi_flash_mmap.h>
 #include <string.h>
 
+#ifdef CONFIG_APP_ROLLBACK_ENABLE
+// Arduino's weak C hook runs before setup(). Defer acceptance until the
+// application has mounted storage and completed a normal UI render, so a
+// failure in gpio/power/display/SD setup still leaves the image PENDING_VERIFY
+// (crash, reboot, or OTADATA abort) for the bootloader to roll back.
+extern "C" bool verifyRollbackLater() { return true; }
+#endif
+
 namespace ota_boot {
 
 uint32_t computeSeqCrc(uint32_t seq) {
@@ -102,6 +110,31 @@ bool switchToOther() {
 
   LOG_INF("BOOT", "switching from %s to %s", running->label, other->label);
   return switchTo(other);
+}
+
+void acceptPendingUpdate() {
+#ifdef CONFIG_APP_ROLLBACK_ENABLE
+  // Ordinary RAM latch, not RTC: it only collapses repeated render calls in
+  // this boot into a single otadata write. Every new boot must prove health
+  // again before the image is accepted.
+  static bool attempted = false;
+  if (attempted) return;
+  attempted = true;
+
+  const esp_partition_t* running = esp_ota_get_running_partition();
+  esp_ota_img_states_t state = ESP_OTA_IMG_UNDEFINED;
+  if (!running || esp_ota_get_state_partition(running, &state) != ESP_OK ||
+      state != ESP_OTA_IMG_PENDING_VERIFY) {
+    return;
+  }
+
+  const esp_err_t result = esp_ota_mark_app_valid_cancel_rollback();
+  if (result == ESP_OK) {
+    LOG_INF("BOOT", "OTA app accepted after healthy UI render (%s)", running->label);
+  } else {
+    LOG_ERR("BOOT", "OTA app acceptance failed: %d", static_cast<int>(result));
+  }
+#endif
 }
 
 }  // namespace ota_boot

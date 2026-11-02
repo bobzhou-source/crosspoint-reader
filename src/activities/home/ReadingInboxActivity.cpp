@@ -4,6 +4,7 @@
 #include <I18n.h>
 #include <Memory.h>
 
+#include <algorithm>
 #include <cstdio>
 #include <cstring>
 
@@ -89,7 +90,7 @@ void ReadingInboxActivity::provideRow(void* context, const uint16_t index, fui::
   item.actionValue = static_cast<int16_t>(index);
   if (index == 0) {
     item.label = tr(STR_READING_INBOX_REFRESH);
-    item.subtitle = self.loaded ? self.pageLabel : tr(STR_ANNOTATION_LOAD_FAILED);
+    item.subtitle = self.loaded ? self.pageLabel : nullptr;
     return;
   }
   if (index == 1) {
@@ -113,15 +114,18 @@ void ReadingInboxActivity::provideRow(void* context, const uint16_t index, fui::
 
 void ReadingInboxActivity::buildScreen(UiScreen& screen) {
   const auto& metrics = UITheme::getInstance().getMetrics();
-  const Rect safe = UITheme::getInstance().getScreenSafeArea(renderer, true, false);
+  // Hints follow the physical buttons; the header stays below the bezel.
+  const Rect hints = UITheme::getInstance().getScreenSafeArea(renderer, true, false);
+  const int top = std::max<int>(screen.frame().device().safeArea.top, hints.y) + metrics.topPadding +
+                  metrics.headerHeight;
   screen.setContentMarginFromScreen(
-      fui::Insets{static_cast<int16_t>(safe.y + metrics.topPadding + metrics.headerHeight),
-                  static_cast<int16_t>(renderer.getScreenWidth() - (safe.x + safe.width)),
-                  static_cast<int16_t>(renderer.getScreenHeight() - (safe.y + safe.height) + metrics.buttonHintsHeight),
-                  static_cast<int16_t>(safe.x)});
+      fui::Insets{static_cast<int16_t>(top), static_cast<int16_t>(renderer.getScreenWidth() - (hints.x + hints.width)),
+                  static_cast<int16_t>(renderer.getScreenHeight() - (hints.y + hints.height)),
+                  static_cast<int16_t>(hints.x)});
   screen.spacer(static_cast<int16_t>(metrics.verticalSpacing));
   if (!loaded || total == 0) {
-    screen.centeredText(loaded ? tr(STR_READING_INBOX_EMPTY) : tr(STR_ANNOTATION_LOAD_FAILED), screen.theme().bodyText);
+    const char* message = loaded ? tr(STR_READING_INBOX_EMPTY) : tr(STR_ANNOTATION_LOAD_FAILED);
+    buildListMessage(screen, message);
     screen.spacer(static_cast<int16_t>(metrics.verticalSpacing));
   }
   fui::ListProps props;
@@ -130,6 +134,14 @@ void ReadingInboxActivity::buildScreen(UiScreen& screen) {
   props.count = static_cast<uint16_t>(listCount());
   props.action = ACTION_ROW;
   props.inputMask = fui::InputTouch;
+  props.labelText = screen.theme().bodyText;
+  props.labelText.maxLines = 2;
+  props.subtitleText = screen.theme().smallText;
+  props.valueText = screen.theme().smallText;
+  props.valueText.maxLines = 2;
+  // Annotation kind and progress belong below source metadata, not beside
+  // the title where they would squeeze a long book name into a narrow lane.
+  props.valueMaxWidthPercent = 1;
   syncListViewport(screen, props);
   screen.list(props);
 }

@@ -1,5 +1,6 @@
 #include "RoundedRaffTheme.h"
 
+#include <FreeInkUIGfxRenderer.h>
 #include <GfxRenderer.h>
 #include <HalGPIO.h>
 #include <HalStorage.h>
@@ -11,7 +12,6 @@
 
 #include "RecentBooksStore.h"
 #include "components/UITheme.h"
-#include "components/icons/cover.h"
 #include "fontIds.h"
 
 namespace {
@@ -20,28 +20,8 @@ constexpr int kMenuRadius = 30;
 constexpr int kBottomRadius = 15;
 constexpr int kRowRadius = 20;
 constexpr int kInteractiveInsetX = 20;
-constexpr int kSelectableRowGap = 6;
 constexpr int kTitleFontId = UI_12_FONT_ID;  // Requested main title size: 12px
 constexpr int kGuideFontId = SMALL_FONT_ID;  // Closest available to requested 6px
-
-void drawScrollBar(const GfxRenderer& renderer, Rect rect, int itemCount, int pageStartIndex, int pageItems) {
-  if (itemCount <= 0 || pageItems <= 0 || itemCount <= pageItems) {
-    return;
-  }
-
-  const int barW = RoundedRaffMetrics::values.scrollBarWidth;
-  const int barX = rect.x + rect.width - RoundedRaffMetrics::values.scrollBarRightOffset - barW;
-  const int barY = rect.y;
-  const int barH = rect.height;
-
-  const int thumbH = std::max(10, (barH * pageItems) / itemCount);
-  const int maxStart = std::max(1, itemCount - pageItems);
-  const int maxTravel = std::max(1, barH - thumbH);
-  const int clampedStart = std::clamp(pageStartIndex, 0, maxStart);
-  const int thumbY = barY + (clampedStart * maxTravel) / maxStart;
-
-  renderer.fillRect(barX, thumbY, barW, thumbH);
-}
 
 }  // namespace
 int coverWidth = 0;
@@ -62,20 +42,20 @@ void RoundedRaffTheme::drawRecentBookCover(GfxRenderer& renderer, Rect rect, con
   const int tileHeight = rect.height;
   const int tileY = rect.y;
   const bool hasContinueReading = !recentBooks.empty();
-  if (coverWidth == 0) {
-    coverWidth = RoundedRaffMetrics::values.homeCoverHeight * 0.6;
+  if (!coverRendered) {
+    coverWidth = std::min(RoundedRaffMetrics::values.homeCoverHeight * 3 / 5, tileWidth - 16);
   }
   const int imgY = tileY + (tileHeight - RoundedRaffMetrics::values.homeCoverHeight) / 2;
-  const int tileX = RoundedRaffMetrics::values.contentSidePadding;
+  const int tileX = rect.x + RoundedRaffMetrics::values.contentSidePadding;
 
   // Draw book card regardless, fill with message based on `hasContinueReading`
   // Draw cover image as background if available (inside the box)
   // Only load from SD on first render, then use stored buffer
   if (hasContinueReading) {
-    RecentBook book = recentBooks[0];
+    const RecentBook& book = recentBooks[0];
     if (!coverRendered) {
-      std::string coverPath = book.coverBmpPath;
-      bool hasCover = true;
+      const std::string& coverPath = book.coverBmpPath;
+      bool hasCover = false;
       if (coverPath.empty()) {
         hasCover = false;
       } else {
@@ -87,7 +67,8 @@ void RoundedRaffTheme::drawRecentBookCover(GfxRenderer& renderer, Rect rect, con
         if (Storage.openFileForRead("HOME", coverBmpPath, file)) {
           Bitmap bitmap(file);
           if (bitmap.parseHeaders() == BmpReaderError::Ok) {
-            coverWidth = bitmap.getWidth();
+            hasCover = true;
+            coverWidth = std::min(bitmap.getWidth(), tileWidth - 16);
             // Narrow covers come out taller than the slot; fill 1:1 and crop
             // vertically instead of rescaling the dither.
             drawCoverThumbFill(renderer, bitmap,
@@ -108,13 +89,8 @@ void RoundedRaffTheme::drawRecentBookCover(GfxRenderer& renderer, Rect rect, con
                                RoundedRaffMetrics::values.homeCoverHeight, 1, kCoverRadius, true);
 
       if (!hasCover) {
-        // Render empty cover
-        renderer.fillRect(tileX + (tileWidth - coverWidth) / 2, imgY + (RoundedRaffMetrics::values.homeCoverHeight / 3),
-                          coverWidth, 2 * RoundedRaffMetrics::values.homeCoverHeight / 3, true);
-        renderer.drawIcon(CoverIcon, tileX + (tileWidth - coverWidth) / 2 + 24, imgY + 24, 32);
-        renderer.maskRoundedRectOutsideCorners(tileX + (tileWidth - coverWidth) / 2, imgY, coverWidth,
-                                               RoundedRaffMetrics::values.homeCoverHeight, kCoverRadius,
-                                               Color::LightGray);
+        drawCoverPlaceholder(renderer, Rect{tileX + (tileWidth - coverWidth) / 2, imgY, coverWidth,
+                                            RoundedRaffMetrics::values.homeCoverHeight});
       }
 
       coverBufferStored = storeCoverBuffer();
@@ -131,14 +107,28 @@ void RoundedRaffTheme::drawRecentBookCover(GfxRenderer& renderer, Rect rect, con
                              tileHeight - (imgY - tileY + RoundedRaffMetrics::values.homeCoverHeight), kRowRadius,
                              false, false, true, true, Color::LightGray);
   } else {
-    renderer.fillRoundedRect(tileX, tileY, tileWidth, tileHeight, kRowRadius, Color::LightGray);
-    renderer.drawCenteredText(kTitleFontId, rect.y + rect.height / 2 - renderer.getLineHeight(kTitleFontId) / 2,
-                              tr(STR_NO_OPEN_BOOK));
+    freeink::ui::GfxRendererTarget target(renderer);
+    target.setFont(0, kTitleFontId);
+    target.setFont(1, UI_10_FONT_ID);
+    freeink::ui::TextStyle title;
+    title.bold = true;
+    title.maxLines = 2;
+    freeink::ui::TextStyle message;
+    message.font = 1;
+    message.maxLines = 2;
+    const int width = tileWidth - 32;
+    const int titleHeight = freeink::ui::measureWrappedText(target, tr(STR_NO_OPEN_BOOK), title, width).height;
+    const int messageHeight = freeink::ui::measureWrappedText(target, tr(STR_START_READING), message, width).height;
+    const int y = tileY + std::max(0, (tileHeight - titleHeight - messageHeight - 8) / 2);
+    target.text({static_cast<int16_t>(tileX + 16), static_cast<int16_t>(y), static_cast<int16_t>(width),
+                 static_cast<int16_t>(titleHeight)}, tr(STR_NO_OPEN_BOOK), title);
+    target.text({static_cast<int16_t>(tileX + 16), static_cast<int16_t>(y + titleHeight + 8),
+                 static_cast<int16_t>(width), static_cast<int16_t>(messageHeight)}, tr(STR_START_READING), message);
   }
 }
 
 int RoundedRaffTheme::getMenuRowHeight(const GfxRenderer& renderer) const {
-  return renderer.getLineHeight(kTitleFontId) + 20;  // 10px top + 10px bottom
+  return std::max(48, 2 * renderer.getLineHeight(kTitleFontId) + 8);
 }
 
 void RoundedRaffTheme::drawButtonMenu(GfxRenderer& renderer, Rect rect, int buttonCount, int selectedIndex,
@@ -146,38 +136,25 @@ void RoundedRaffTheme::drawButtonMenu(GfxRenderer& renderer, Rect rect, int butt
                                       const std::function<UIIcon(int index)>& rowIcon) const {
   (void)rowIcon;
   const int sidePadding = RoundedRaffMetrics::values.contentSidePadding;
-  const int rowX = rect.x + sidePadding;
-  const int rowHeight = getMenuRowHeight(renderer);  // shared with HomeActivity's touch grid
-  const int rowGap = kSelectableRowGap;
-  const int rowStep = rowHeight + rowGap;
-  const int pageItems = std::max(1, rect.height / rowStep);
-  const int safeSelectedIndex = std::max(0, selectedIndex);
-  const int pageStartIndex = (safeSelectedIndex / pageItems) * pageItems;
-  const int menuTop = rect.y;
-  const int textLineHeight = renderer.getLineHeight(kTitleFontId);
-  const int menuMaxWidth = std::max(0, rect.width - sidePadding * 2);
-
-  for (int i = pageStartIndex; i < buttonCount && i < pageStartIndex + pageItems; ++i) {
+  const int rowHeight = getMenuRowHeight(renderer);
+  freeink::ui::GfxRendererTarget target(renderer);
+  target.setFont(0, kTitleFontId);
+  freeink::ui::TextStyle text;
+  text.bold = true;
+  text.maxLines = 2;
+  for (int i = 0; i < buttonCount; ++i) {
+    const int rowY = rect.y + i * (rowHeight + RoundedRaffMetrics::values.menuSpacing);
+    if (rowY + rowHeight > rect.y + rect.height) break;
+    const int rowX = rect.x + sidePadding;
+    const int rowWidth = rect.width - 2 * sidePadding;
+    const bool selected = selectedIndex == i;
+    renderer.fillRoundedRect(rowX, rowY, rowWidth, rowHeight, kMenuRadius, selected ? Color::Black : Color::White);
+    text.color = selected ? freeink::ui::Color::White : freeink::ui::Color::Black;
     const std::string label = buttonLabel(i);
-    const int rowY = menuTop + (i - pageStartIndex) * rowStep;
-    constexpr int kRowPaddingX = 40;  // 20px L/R
-    const int maxLabelWidth = std::max(0, menuMaxWidth - kRowPaddingX);
-    const std::string truncatedLabel =
-        renderer.truncatedText(kTitleFontId, label.c_str(), maxLabelWidth, EpdFontFamily::BOLD);
-    const int rowWidth = std::min(
-        menuMaxWidth, renderer.getTextWidth(kTitleFontId, truncatedLabel.c_str(), EpdFontFamily::BOLD) + kRowPaddingX);
-    const bool isSelected = selectedIndex == i;
-    renderer.fillRoundedRect(rowX, rowY, rowWidth, rowHeight, kMenuRadius, isSelected ? Color::Black : Color::White);
-    const int textY = rowY + (rowHeight - textLineHeight) / 2;
-    const int textX = rowX + kInteractiveInsetX;
-    if (selectedIndex == i) {
-      renderer.drawText(kTitleFontId, textX, textY, truncatedLabel.c_str(), false, EpdFontFamily::BOLD);
-    } else {
-      renderer.drawText(kTitleFontId, textX, textY, truncatedLabel.c_str(), true, EpdFontFamily::BOLD);
-    }
+    target.text({static_cast<int16_t>(rowX + kInteractiveInsetX), static_cast<int16_t>(rowY + 4),
+                 static_cast<int16_t>(rowWidth - 2 * kInteractiveInsetX), static_cast<int16_t>(rowHeight - 8)},
+                label.c_str(), text);
   }
-
-  drawScrollBar(renderer, rect, buttonCount, pageStartIndex, pageItems);
 }
 
 void RoundedRaffTheme::drawTextField(const GfxRenderer& renderer, Rect rect, const int textWidth, bool cursorMode,

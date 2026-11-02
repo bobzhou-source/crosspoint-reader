@@ -36,6 +36,8 @@ class HalStorage {
   void endUsbDrive();
   UsbDriveState usbDriveState() const;
   bool usbDriveHostSuspended() const;
+  // Cached advisory capacity, serialized with all other filesystem operations.
+  uint64_t freeBytes();
   std::vector<String> listFiles(const char* path = "/", int maxFiles = 200);
   // Read the entire file at `path` into a String. Returns empty string on failure.
   String readFile(const char* path);
@@ -94,7 +96,13 @@ class HalFile : public Print {
   HalFile& operator=(const HalFile&) = delete;
 
   void flush();
+  // Unlike flush(), reports a buffered write/card-full failure to diagnostic callers.
+  bool sync();
   size_t getName(char* name, size_t len);
+  // Identity of this handle's directory entry within its parent. SdFat reports
+  // the short-entry index, which is the same value for a path opened through
+  // an 8.3 alias and for the entry yielded by enumerating that parent.
+  uint32_t dirIndex() const;
   size_t size();
   size_t fileSize();
   uint64_t fileSize64();

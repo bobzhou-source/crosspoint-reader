@@ -135,3 +135,17 @@ TEST(ContentOpfParserCover, ReadingParserStillOpensManifestCache) {
   EXPECT_EQ(Storage.writeOpens, 1);
   EXPECT_EQ(Storage.readOpens, 1);
 }
+
+TEST(ContentOpfParserMemory, IndexAllocationFailureAbortsParsingCleanly) {
+  const std::string xml = R"(<package><manifest><item id="a" href="a.xhtml"/></manifest><spine/></package>)";
+  const std::string cachePath = "/reading-cache";
+  const std::string basePath = "OPS/";
+  BookMetadataCache cache;
+  HalMemory::present = true;
+  HalMemory::fail = true;
+  ContentOpfParser parser(cachePath, basePath, xml.size(), &cache);
+  ASSERT_TRUE(parser.setup());
+  EXPECT_EQ(parser.write(reinterpret_cast<const uint8_t*>(xml.data()), xml.size()), 0u);
+  EXPECT_EQ(parser.write(reinterpret_cast<const uint8_t*>(xml.data()), xml.size()), 0u);
+  HalMemory::fail = false;
+}

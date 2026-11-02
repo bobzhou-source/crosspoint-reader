@@ -201,9 +201,8 @@ void IntervalSelectionActivity::buildIntervalScreen(UiScreen& screen) {
 }
 
 void IntervalSelectionActivity::render(RenderLock&&) {
-  // No clearScreen: the dialog is a popup — it dims the frame it opened over
-  // and draws the card on top. Everything renders through the app so the
-  // interactive elements register touch hit rects.
+  // Overlay-only: the dialog uses solid paper, with all paint and touch
+  // geometry registered by the same screen build.
   renderUi();
 
   const auto labels = mappedInput.mapLabels(tr(STR_BACK), tr(STR_SELECT), "-", "+");

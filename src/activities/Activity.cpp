@@ -1,8 +1,20 @@
 #include "Activity.h"
 
-#include "ActivityManager.h"
+#include <Benchmark.h>
 
-void Activity::onEnter() { LOG_DBG("ACT", "Entering activity: %s", name.c_str()); }
+#include "ActivityManager.h"
+#include "CrossPointSettings.h"
+
+void Activity::onEnter() {
+  LOG_DBG("ACT", "Entering activity: %s", name.c_str());
+  if (benchmark::enabled()) {
+    benchmark::settings(SETTINGS.fontFamily, SETTINGS.fontPointSize, SETTINGS.lineSpacing, SETTINGS.orientation,
+                        SETTINGS.textAntiAliasing, SETTINGS.screenInverted, SETTINGS.screenMargin, SETTINGS.sleepScreen,
+                        benchmark::id(SETTINGS.sdFontFamilyName));
+    benchmark::point(benchmark::EventType::Activity, benchmark::id(name.c_str()), isReaderActivity());
+    benchmark::memory();
+  }
+}
 
 void Activity::onExit() { LOG_DBG("ACT", "Exiting activity: %s", name.c_str()); }
 

@@ -6,8 +6,6 @@
 #include <Utf8.h>
 #include <ZipFile.h>
 
-#include <deque>
-
 #include "FsHelpers.h"
 
 namespace {
@@ -110,7 +108,12 @@ bool BookMetadataCache::beginTocPass() {
 
   if (spineCount >= LARGE_SPINE_THRESHOLD) {
     spineHrefIndex.clear();
-    spineHrefIndex.resize(spineCount);
+    if (!spineHrefIndex.resize(spineCount)) {
+      LOG_ERR("BMC", "Out of memory building spine href index");
+      spineFile.close();
+      tocFile.close();
+      return false;
+    }
     spineFile.seek(0);
     for (int i = 0; i < spineCount; i++) {
       auto entry = readSpineEntry(spineFile);
@@ -147,7 +150,6 @@ bool BookMetadataCache::endTocPass() {
   spineFile.close();
 
   spineHrefIndex.clear();
-  spineHrefIndex.shrink_to_fit();
   useSpineHrefIndex = false;
 
   return flushed;
@@ -165,6 +167,14 @@ bool BookMetadataCache::endWrite() {
 }
 
 bool BookMetadataCache::buildBookBin(const std::string& epubPath, const BookMetadata& metadata) {
+  CheckedTable<int16_t> spineToTocIndex;
+  CheckedTable<uint32_t> spineSizes;
+  CheckedTable<ZipFile::SizeTarget> targets;
+  if (!spineToTocIndex.resize(spineCount, -1) ||
+      (spineCount >= LARGE_SPINE_THRESHOLD && (!spineSizes.resize(spineCount) || !targets.resize(spineCount)))) {
+    LOG_ERR("BMC", "Out of memory building book tables");
+    return false;
+  }
   // Open all three files, writing to meta, reading from spine and toc
   if (!Storage.openFileForWrite("BMC", cachePath + bookBinFile, bookFile)) {
     return false;
@@ -234,7 +244,6 @@ bool BookMetadataCache::buildBookBin(const std::string& epubPath, const BookMeta
   // Loop through spines from spine file matching up TOC indexes, calculating cumulative size and writing to book.bin
 
   // Build spineIndex->tocIndex mapping in one pass (O(n) instead of O(n*m))
-  std::deque<int16_t> spineToTocIndex(spineCount, -1);
   tocIn.seek(0);
   for (int j = 0; j < tocCount; j++) {
     auto tocEntry = readTocEntryFrom(tocIn);
@@ -263,14 +272,10 @@ bool BookMetadataCache::buildBookBin(const std::string& epubPath, const BookMeta
   // This is O(n*log(m)) instead of O(n*m) while avoiding memory exhaustion.
   // See: https://github.com/crosspoint-reader/crosspoint-reader/issues/134
 
-  std::deque<uint32_t> spineSizes;
   bool useBatchSizes = false;
 
   if (spineCount >= LARGE_SPINE_THRESHOLD) {
     LOG_DBG("BMC", "Using batch size lookup for %d spine items", spineCount);
-
-    std::deque<ZipFile::SizeTarget> targets;
-    targets.resize(spineCount);
 
     spineIn.seek(0);
     for (int i = 0; i < spineCount; i++) {
@@ -288,12 +293,10 @@ bool BookMetadataCache::buildBookBin(const std::string& epubPath, const BookMeta
       return a.hash < b.hash || (a.hash == b.hash && a.len < b.len);
     });
 
-    spineSizes.resize(spineCount, 0);
     int matched = zip.fillUncompressedSizes(targets, spineSizes);
     LOG_DBG("BMC", "Batch lookup matched %d/%d spine items", matched, spineCount);
 
     targets.clear();
-    targets.shrink_to_fit();
 
     useBatchSizes = true;
   }

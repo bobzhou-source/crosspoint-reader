@@ -211,7 +211,6 @@ void SdFirmwareUpdateActivity::loop() {
 void SdFirmwareUpdateActivity::render(RenderLock&&) {
   const auto& metrics = UITheme::getInstance().getMetrics();
   const auto pageWidth = renderer.getScreenWidth();
-  const auto pageHeight = renderer.getScreenHeight();
 
   renderer.clearScreen();
 
@@ -219,10 +218,12 @@ void SdFirmwareUpdateActivity::render(RenderLock&&) {
   GUI.drawHeader(renderer, Rect{0, metrics.topPadding, pageWidth, metrics.headerHeight}, headerText);
 
   const auto lineHeight = renderer.getLineHeight(UI_10_FONT_ID);
-  const auto top = (pageHeight - lineHeight) / 2;
+  const Rect body = UITheme::getContentBounds(renderer);
+  const Rect title{body.x, body.y, body.width, body.height / 2 - 8};
+  const Rect detail{body.x, body.y + body.height / 2 + 8, body.width, body.height / 2 - 8};
 
   if (state == State::VALIDATING) {
-    renderer.drawCenteredText(UI_10_FONT_ID, top, tr(STR_VALIDATING_FIRMWARE));
+    UITheme::drawCenteredWrappedText(renderer, body, UI_12_FONT_ID, tr(STR_VALIDATING_FIRMWARE), 8);
   } else if (state == State::UPDATING) {
     // Throttle redraws to once per percent.
     const unsigned int pct = firmwareSize > 0 ? static_cast<unsigned int>((writtenBytes * 100) / firmwareSize) : 0;
@@ -231,9 +232,10 @@ void SdFirmwareUpdateActivity::render(RenderLock&&) {
     }
     lastRenderedPercent = pct;
 
-    renderer.drawCenteredText(UI_10_FONT_ID, top, tr(STR_UPDATING), true, EpdFontFamily::BOLD);
+    UITheme::drawCenteredWrappedText(renderer, title, UI_12_FONT_ID, tr(STR_UPDATING), 4, true,
+                                     EpdFontFamily::BOLD, UITheme::TextVerticalAlignment::BOTTOM);
 
-    int y = top + lineHeight + metrics.verticalSpacing;
+    int y = detail.y;
     GUI.drawProgressBar(
         renderer,
         Rect{metrics.contentSidePadding, y, pageWidth - metrics.contentSidePadding * 2, metrics.progressBarHeight},
@@ -242,25 +244,27 @@ void SdFirmwareUpdateActivity::render(RenderLock&&) {
     // Percent label is drawn by BaseTheme::drawProgressBar; this slot is left intentionally empty
     // so the do-not-power-off line below stays at the same Y as before.
     y += lineHeight + metrics.verticalSpacing;
-    renderer.drawCenteredText(UI_10_FONT_ID, y, tr(STR_FIRMWARE_UPDATE_DO_NOT_POWER_OFF));
+    UITheme::drawCenteredWrappedText(renderer, Rect{body.x, y, body.width, body.y + body.height - y},
+                                     UI_10_FONT_ID, tr(STR_FIRMWARE_UPDATE_DO_NOT_POWER_OFF), 8, true,
+                                     EpdFontFamily::REGULAR, UITheme::TextVerticalAlignment::TOP);
   } else if (state == State::SUCCESS) {
-    renderer.drawCenteredText(UI_10_FONT_ID, top, tr(STR_UPDATE_COMPLETE), true, EpdFontFamily::BOLD);
-    const int hintY = top + lineHeight + metrics.verticalSpacing;
-    const Rect hintBounds{metrics.contentSidePadding, hintY, pageWidth - metrics.contentSidePadding * 2,
-                          pageHeight - hintY};
-    UITheme::drawCenteredWrappedText(renderer, hintBounds, UI_10_FONT_ID, tr(STR_RESTARTING_HINT), 3, true,
+    UITheme::drawCenteredWrappedText(renderer, title, UI_12_FONT_ID, tr(STR_UPDATE_COMPLETE), 4, true,
+                                     EpdFontFamily::BOLD, UITheme::TextVerticalAlignment::BOTTOM);
+    UITheme::drawCenteredWrappedText(renderer, detail, UI_10_FONT_ID, tr(STR_RESTARTING_HINT), 8, true,
                                      EpdFontFamily::REGULAR, UITheme::TextVerticalAlignment::TOP);
   } else if (state == State::FAILED) {
-    renderer.drawCenteredText(UI_10_FONT_ID, top, tr(STR_UPDATE_FAILED), true, EpdFontFamily::BOLD);
+    UITheme::drawCenteredWrappedText(renderer, title, UI_12_FONT_ID, tr(STR_UPDATE_FAILED), 4, true,
+                                     EpdFontFamily::BOLD, UITheme::TextVerticalAlignment::BOTTOM);
     if (!errorMessage.empty()) {
-      renderer.drawCenteredText(UI_10_FONT_ID, top + lineHeight + metrics.verticalSpacing, errorMessage.c_str());
+      UITheme::drawCenteredWrappedText(renderer, detail, UI_10_FONT_ID, errorMessage.c_str(), 8, true,
+                                       EpdFontFamily::REGULAR, UITheme::TextVerticalAlignment::TOP);
     }
     const auto labels = mappedInput.mapLabels(tr(STR_BACK), "", "", "");
     GUI.drawButtonHints(renderer, labels.btn1, labels.btn2, labels.btn3, labels.btn4);
   } else {
     // PICKING / CONFIRMING: a sub-activity is on top, nothing to draw.
     if (recoveryMode) {
-      renderer.drawCenteredText(UI_10_FONT_ID, top, tr(STR_RECOVERY_MODE_HINT));
+      UITheme::drawCenteredWrappedText(renderer, body, UI_10_FONT_ID, tr(STR_RECOVERY_MODE_HINT), 8);
     }
   }
 

@@ -23,8 +23,6 @@ class LocalsendActivity final : public Activity {
   std::unique_ptr<LocalsendServer> server;
   LocalsendServer::Status displayStatus;
   char connectedSSID[33] = {};
-  char instructions[2][192] = {};
-  size_t instructionCount = 0;
   char connectedIP[48] = {};
   uint32_t lastProgressRender = 0;
   bool wifiStarted = false;

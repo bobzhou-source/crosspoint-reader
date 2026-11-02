@@ -76,10 +76,28 @@ def map_annotation(value, *, device_id=None, item_id=None, now=None) -> dict:
     return record
 
 
+APPLEDOUBLE_MAGIC = b"\x00\x05\x16\x07"
+
+
+def _is_appledouble_sidecar(file: Path) -> bool:
+    """macOS leaves a `._name` AppleDouble shadow beside files it writes or copies on a FAT card.
+
+    Only a regular, non-symlink `._*` file that really starts with the AppleDouble magic is skipped.
+    A `._x.json` that is not AppleDouble, or any other malformed `.json`, is still parsed and rejected.
+    """
+    if not file.name.startswith("._") or file.is_symlink() or not file.is_file():
+        return False
+    try:
+        with file.open("rb") as stream:
+            return stream.read(len(APPLEDOUBLE_MAGIC)) == APPLEDOUBLE_MAGIC
+    except OSError:
+        return False
+
+
 def load_annotations(path: Path) -> list[dict]:
     path = path.expanduser()
     if path.is_dir():
-        files = sorted(path.rglob("*.json"))
+        files = sorted(file for file in path.rglob("*.json") if not _is_appledouble_sidecar(file))
         if not files or len(files) > 4096:
             raise ReaderError("Native annotation directory must contain 1–4096 JSON records; use the annotations store, not Markdown exports")
     else:

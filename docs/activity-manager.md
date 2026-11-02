@@ -436,6 +436,38 @@ Child calls: setResult(MyResult{...}); finish();
   └── requestUpdate()   // automatic re-render for parent
 ```
 
+### OTA startup acceptance
+
+`src/network/OtaBootSwitch.cpp` overrides Arduino's weak C-linkage
+`verifyRollbackLater()` hook so the framework cannot accept an OTA image before
+`setup()`. After an activity's blocking `render()` returns, the render task calls
+`ota_boot::acceptPendingUpdate()` only when storage is ready and either Home was
+rendered or `hasCompletedHealthyRender()` reports successful reader content.
+
+The base activity readiness method defaults to false. Reader activities expose
+their existing completed-page latch; an end-of-book allocation failure does not
+set it. Do not downcast based on `isReaderActivity()`: some reader-related dialogs
+return true without inheriting `ReaderActivity`. Splash, recovery, crash, and
+SD-error screens cannot certify a healthy startup.
+
+Acceptance is attempted once per boot, only for `ESP_OTA_IMG_PENDING_VERIFY`.
+Errors are logged without aborting or retrying, leaving the image unaccepted.
+The latch lives in ordinary RAM, not RTC memory. The call changes OTA selection
+metadata, not either application image.
+
+With a rollback-enabled bootloader, a reset before acceptance allows fallback to
+the remaining bootable slot. Once accepted, later runtime failures do not trigger
+this startup rollback; use the explicit alternate-slot recovery controls. A
+completed display call is not a physical panel-health test, particularly where
+the display driver permits a BUSY timeout.
+
+The final image was exercised with a stock 7.4.4 bootloader in QEMU: both app
+addresses booted, early recovery switched slots, and acceptance followed Home's
+completed refresh. A pre-Home interruption left the new image pending. QEMU
+stalled while programming cold-start bootloader OTA-state changes, so the full
+cold-start rollback write remains unverified; emulator checks are not physical
+reader verification.
+
 ### Common Pitfalls
 
 **Calling `finish()` and continuing to access `this`**: `finish()` sets `pendingAction = Pop` but does not immediately destroy the activity. The activity is destroyed on the next `ActivityManager::loop()` iteration. It's safe to access member variables after `finish()` within the same function, but don't rely on the activity surviving past the current `loop()` call.

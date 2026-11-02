@@ -13,6 +13,7 @@
 #include "ReaderActivity.h"
 #include "ReaderUtils.h"
 #include "XtcReaderChapterSelectionActivity.h"
+#include "XtcReaderMenuActivity.h"
 #include "components/UITheme.h"
 #include "fontIds.h"
 
@@ -49,10 +50,15 @@ bool XtcReaderActivity::handleFormatInput() {
     return false;
   }
 
-  // Enter chapter selection activity on Confirm release or touch menu gesture
+  // The reader menu keeps statistics available even for chapterless books.
   if (mappedInput.wasReleased(MappedInputManager::Button::Confirm) ||
       ReaderUtils::isTouchMenuGesture(renderer, mappedInput)) {
-    openChapterSelection();
+    if (auto menu = makeUniqueNoThrow<XtcReaderMenuActivity>(renderer, mappedInput)) {
+      startActivityForResult(std::move(menu), [this](const ActivityResult& result) {
+        if (!result.isCancelled) openChapterSelection();
+      });
+    } else
+      LOG_ERR("XTR", "OOM: reader menu");
     return true;
   }
   return false;
@@ -156,7 +162,7 @@ void XtcReaderActivity::renderPage() {
   if (!pageBuffer) {
     LOG_ERR("XTR", "Failed to allocate page buffer (%lu bytes)", pageBufferSize);
     renderer.clearScreen();
-    renderer.drawCenteredText(UI_12_FONT_ID, 300, tr(STR_MEMORY_ERROR), true, EpdFontFamily::BOLD);
+    ReaderUtils::drawState(renderer, mappedInput, getBookTitle().c_str(), tr(STR_MEMORY_ERROR));
     renderer.displayBuffer();
     return;
   }
@@ -167,7 +173,7 @@ void XtcReaderActivity::renderPage() {
             bitDepth, xtc::errorToString(xtc->getLastError()));
     free(pageBuffer);
     renderer.clearScreen();
-    renderer.drawCenteredText(UI_12_FONT_ID, 300, tr(STR_PAGE_LOAD_ERROR), true, EpdFontFamily::BOLD);
+    ReaderUtils::drawState(renderer, mappedInput, getBookTitle().c_str(), tr(STR_PAGE_LOAD_ERROR));
     renderer.displayBuffer();
     return;
   }
@@ -200,62 +206,73 @@ void XtcReaderActivity::renderPage() {
       }
     }
 
-    if (pagesUntilFullRefresh <= 1) {
-      // Periodic ghost cleanup: scrub via the normal path, then run the
-      // settle flavor of the grayscale base pass (DTM planes are equal after
-      // the display sync, so only the gentle reinforcement cells fire).
-      // Combined-base panels (Paper Mono) instead defer the base so the gray
-      // planes below join it in one waveform.
-      if (renderer.grayscaleCapabilities().base == HalDisplay::GrayscaleBase::Combined) {
-        renderer.displayGrayscaleBase(HalDisplay::HALF_REFRESH);
-      } else {
-        renderer.displayBuffer(HalDisplay::HALF_REFRESH);
-        renderer.preconditionGrayscale();
-      }
-      pagesUntilFullRefresh = SETTINGS.getRefreshFrequency();
+    // Inverted (night) output and B/W-only panels report no grayscale
+    // capability: show the B/W base and skip the discarded gray passes.
+    const bool grayscale = renderer.grayscaleCapabilities().supported();
+    const auto refresh = ReaderUtils::decideRefresh(renderer, refreshPolicy, /*hasImage=*/false, grayscale);
+    if (!grayscale) {
+      renderer.displayBuffer(ReaderUtils::refreshModeFor(refresh));
+      refreshPolicy.commit(refresh);
     } else {
-      renderer.displayGrayscaleBase(HalDisplay::FAST_REFRESH);
-      pagesUntilFullRefresh--;
-    }
+      if (refresh == AdaptiveRefreshPolicy::Refresh::Clear) {
+        // Ghost cleanup: scrub via the normal path, then run the settle flavor
+        // of the grayscale base pass (DTM planes are equal after the display
+        // sync, so only the gentle reinforcement cells fire). Combined-base
+        // panels (Paper Mono) instead defer the base so the gray planes below
+        // join it in one waveform.
+        if (renderer.grayscaleCapabilities().base == HalDisplay::GrayscaleBase::Combined) {
+          renderer.displayGrayscaleBase(HalDisplay::HALF_REFRESH);
+        } else {
+          renderer.displayBuffer(HalDisplay::HALF_REFRESH);
+          renderer.preconditionGrayscale();
+        }
+      } else {
+        renderer.displayGrayscaleBase(HalDisplay::FAST_REFRESH);
+      }
+      refreshPolicy.commit(refresh);
 
-    renderer.clearScreen(0x00);
-    for (uint16_t y = 0; y < pageHeight; y++) {
-      for (uint16_t x = 0; x < pageWidth; x++) {
-        if (getPixelValue(x, y) == 1) {
-          renderer.drawPixel(x, y, false);
+      renderer.clearScreen(0x00);
+      for (uint16_t y = 0; y < pageHeight; y++) {
+        for (uint16_t x = 0; x < pageWidth; x++) {
+          if (getPixelValue(x, y) == 1) {
+            renderer.drawPixel(x, y, false);
+          }
         }
       }
-    }
-    renderer.copyGrayscaleLsbBuffers();
+      renderer.copyGrayscaleLsbBuffers();
 
-    renderer.clearScreen(0x00);
-    for (uint16_t y = 0; y < pageHeight; y++) {
-      for (uint16_t x = 0; x < pageWidth; x++) {
-        const uint8_t pv = getPixelValue(x, y);
-        if (pv == 1 || pv == 2) {
-          renderer.drawPixel(x, y, false);
+      renderer.clearScreen(0x00);
+      for (uint16_t y = 0; y < pageHeight; y++) {
+        for (uint16_t x = 0; x < pageWidth; x++) {
+          const uint8_t pv = getPixelValue(x, y);
+          if (pv == 1 || pv == 2) {
+            renderer.drawPixel(x, y, false);
+          }
         }
       }
-    }
-    renderer.copyGrayscaleMsbBuffers();
+      renderer.copyGrayscaleMsbBuffers();
 
-    renderer.displayGrayBuffer();
+      renderer.displayGrayBuffer();
 
-    renderer.clearScreen();
-    for (uint16_t y = 0; y < pageHeight; y++) {
-      for (uint16_t x = 0; x < pageWidth; x++) {
-        if (getPixelValue(x, y) >= 1) {
-          renderer.drawPixel(x, y, true);
+      renderer.clearScreen();
+      for (uint16_t y = 0; y < pageHeight; y++) {
+        for (uint16_t x = 0; x < pageWidth; x++) {
+          if (getPixelValue(x, y) >= 1) {
+            renderer.drawPixel(x, y, true);
+          }
         }
       }
-    }
 
-    renderer.cleanupGrayscaleWithFrameBuffer();
+      renderer.cleanupGrayscaleWithFrameBuffer();
+    }
 
     free(pageBuffer);
 
     LOG_DBG("XTR", "Rendered page %lu/%lu (2-bit grayscale)", currentPage + 1, xtc->getPageCount());
-    markPageRendered();
+    markPageRendered(0, currentPage,
+                     xtc->getPageCount()
+                         ? static_cast<uint32_t>(static_cast<uint64_t>(currentPage) * 10000 / xtc->getPageCount())
+                         : 0);
     return;
   } else {
     const size_t srcRowBytes = (pageWidth + 7) / 8;
@@ -283,10 +300,13 @@ void XtcReaderActivity::renderPage() {
     renderStatusBarOverlay(renderer, StatusBarOverlayPosition::Bottom);
   }
 
-  ReaderUtils::displayWithRefreshCycle(renderer, pagesUntilFullRefresh);
+  ReaderUtils::displayAdaptive(renderer, refreshPolicy);
 
   LOG_DBG("XTR", "Rendered page %lu/%lu (%u-bit)", currentPage + 1, xtc->getPageCount(), bitDepth);
-  markPageRendered();
+  markPageRendered(0, currentPage,
+                   xtc->getPageCount()
+                       ? static_cast<uint32_t>(static_cast<uint64_t>(currentPage) * 10000 / xtc->getPageCount())
+                       : 0);
 }
 
 bool XtcReaderActivity::pageTurn(bool isForward) {

@@ -241,6 +241,7 @@ void OpdsBookBrowserActivity::screenHeader(UiScreen& screen, const bool withSear
   const auto& theme = screen.theme();
   fui::HeaderProps header;
   header.title = server.name.empty() ? tr(STR_OPDS_BROWSER) : server.name.c_str();
+  uiTarget.setFont(fui::GfxRendererTarget::FONT_TITLE, GUI.titleFontId(renderer, header.title));
   header.borderEdges = fui::EdgeBottom;
   // Same battery/clock band as every GUI.drawHeader screen; the header
   // heights are unified across themes, so the buttons derive from the band.
@@ -260,28 +261,34 @@ void OpdsBookBrowserActivity::screenHeader(UiScreen& screen, const bool withSear
   header.titleText = theme.titleText;
   header.titleText.align = theme.headerTitleAlign;
   header.styles = theme.popup;
+  header.styles.normal.radius = 0;
   if (header.styles.normal.border.kind == fui::PaintKind::None && theme.headerUnderline > 0) {
     header.styles.normal.border = fui::Paint::solid(fui::Color::Black);
     header.styles.normal.borderWidth = theme.headerUnderline;
   }
-  header.trailingStyles = fui::plainStyles(fui::Paint::solid(fui::Color::Black));
+  header.leadingStyles = fui::plainStyles(fui::Paint::solid(fui::Color::Black));
+  header.trailingStyles = header.leadingStyles;
+  header.leadingRadius = 0;
+  header.trailingRadius = 0;
   header.sidePadding = theme.headerSidePadding;
   header.minTouchSize = theme.minTouchSize;
-  const auto frameRect = screen.frame().screen();
+  const auto safe = screen.frame().safeRect();
   fui::header(screen.frame(),
-              fui::Rect{frameRect.x, static_cast<int16_t>(metrics.topPadding), frameRect.width,
+              fui::Rect{safe.x, static_cast<int16_t>(safe.y + metrics.topPadding), safe.width,
                         static_cast<int16_t>(metrics.headerHeight)},
               header);
-  screen.setContentMarginFromScreen(
-      fui::Insets{static_cast<int16_t>(metrics.topPadding + metrics.headerHeight + metrics.verticalSpacing), 0,
-                  static_cast<int16_t>(metrics.buttonHintsHeight), 0});
+  screen.setContentMargin(
+      fui::Insets{static_cast<int16_t>(metrics.topPadding + metrics.headerHeight + metrics.verticalSpacing), 20,
+                  static_cast<int16_t>(metrics.buttonHintsHeight + 16), 20});
 }
 
 void OpdsBookBrowserActivity::buildBrowsingScreen(UiScreen& screen) {
   screenHeader(screen, true);
 
   if (entries.empty()) {
-    screen.centeredText(tr(STR_NO_ENTRIES), screen.theme().bodyText);
+    const auto body = screen.body();
+    UITheme::drawCenteredWrappedText(renderer, Rect{body.x, body.y, body.width, body.height},
+                                     UI_12_FONT_ID, tr(STR_NO_ENTRIES), 8);
     return;
   }
 
@@ -291,6 +298,7 @@ void OpdsBookBrowserActivity::buildBrowsingScreen(UiScreen& screen) {
   // from fetchFeed()/releaseEntries()) and reused here on every repaint.
   fui::ListProps props;
   props.items = rowItems.data();
+  props.rtl = UITheme::isRtl();
   props.count = static_cast<uint16_t>(rowItems.size());
   props.action = ACTION_ROW;
   props.inputMask = fui::InputTouch;  // physical buttons stay in loop()
@@ -308,16 +316,25 @@ void OpdsBookBrowserActivity::buildDownloadScreen(UiScreen& screen) {
   const auto& theme = screen.theme();
   fui::TextStyle centered = theme.bodyText;
   centered.align = fui::TextAlign::Center;
-  const int16_t lh = screen.target().lineHeight(centered.font);
+  centered.maxLines = 4;
   const int16_t gap = theme.spaceMd;
   const int16_t barH = 16;
-  const int16_t btnH = theme.rowHeight;
-  const int16_t blockH = static_cast<int16_t>(lh * 2 + barH + btnH + gap * 3);
+  const int16_t btnH = std::max<int16_t>(48, 2 * screen.target().lineHeight(theme.bodyText.font) + 8);
   const fui::Rect body = screen.body();
+  const int textBudget = std::max(0, body.height - barH - btnH - gap * 3);
+  const int16_t headingHeight = std::min<int>(
+      textBudget / 2, fui::measureWrappedText(screen.target(), tr(STR_DOWNLOADING), centered, body.width).height);
+  const int16_t statusHeight = std::min<int>(
+      textBudget - headingHeight, fui::measureWrappedText(screen.target(), statusMessage.c_str(), centered, body.width).height);
+  const int16_t blockH = static_cast<int16_t>(headingHeight + statusHeight + barH + btnH + gap * 3);
   if (body.height > blockH) screen.spacer(static_cast<int16_t>((body.height - blockH) / 2));
 
-  screen.target().text(screen.takeTop(lh, gap), tr(STR_DOWNLOADING), centered);
-  screen.target().text(screen.takeTop(lh, gap), statusMessage.c_str(), centered);
+  const auto heading = screen.takeTop(headingHeight, gap);
+  const auto status = screen.takeTop(statusHeight, gap);
+  UITheme::drawCenteredWrappedText(renderer, Rect{heading.x, heading.y, heading.width, heading.height},
+                                   UI_12_FONT_ID, tr(STR_DOWNLOADING), 4);
+  UITheme::drawCenteredWrappedText(renderer, Rect{status.x, status.y, status.width, status.height},
+                                   UI_12_FONT_ID, statusMessage.c_str(), 4);
 
   const fui::Rect bar = screen.takeTop(barH, gap).inset(fui::Insets{0, 50, 0, 50});
   if (downloadTotal > 0) {
@@ -330,32 +347,37 @@ void OpdsBookBrowserActivity::buildDownloadScreen(UiScreen& screen) {
   }
 
   const fui::Rect btnArea = screen.takeTop(btnH);
-  const int16_t btnW = static_cast<int16_t>(btnArea.width / 3);
+  const int16_t btnW = static_cast<int16_t>(btnArea.width / 2);
   fui::ButtonProps cancel;
   cancel.label = tr(STR_CANCEL);
   cancel.action = ACTION_CANCEL;
+  cancel.text = theme.bodyText;
+  cancel.text.align = fui::TextAlign::Center;
+  cancel.text.maxLines = 2;
   screen.button(cancel, fui::Rect{static_cast<int16_t>(btnArea.x + (btnArea.width - btnW) / 2), btnArea.y, btnW, btnH});
 }
 
 void OpdsBookBrowserActivity::buildStatusScreen(UiScreen& screen) {
   screenHeader(screen, false);
 
-  fui::TextStyle centered = screen.theme().bodyText;
-  centered.align = fui::TextAlign::Center;
+  const auto body = screen.body();
+  Rect bounds{body.x, body.y, body.width, body.height};
   if (state == BrowserState::ERROR) {
-    const int16_t lh = screen.target().lineHeight(centered.font);
-    const int16_t gap = screen.theme().spaceMd;
-    const bool showTapHint = mappedInput.hasTouch();
-    const int16_t blockH = static_cast<int16_t>(lh * (showTapHint ? 3 : 2) + gap * (showTapHint ? 2 : 1));
-    const fui::Rect body = screen.body();
-    if (body.height > blockH) screen.spacer(static_cast<int16_t>((body.height - blockH) / 2));
-    screen.target().text(screen.takeTop(lh, gap), tr(STR_ERROR_MSG), centered);
-    screen.target().text(screen.takeTop(lh, gap), errorMessage.c_str(), centered);
-    if (showTapHint) screen.target().text(screen.takeTop(lh), tr(STR_TAP_TO_RETRY), centered);
+    if (mappedInput.hasTouch()) {
+      const int footerHeight = renderer.getLineHeight(UI_10_FONT_ID) * 2;
+      const Rect footer{bounds.x, bounds.y + bounds.height - footerHeight, bounds.width, footerHeight};
+      UITheme::drawCenteredWrappedText(renderer, footer, UI_10_FONT_ID, tr(STR_TAP_TO_RETRY), 2);
+      bounds.height -= footerHeight + 16;
+    }
+    UITheme::drawCenteredWrappedText(renderer, Rect{bounds.x, bounds.y, bounds.width, bounds.height / 2 - 8},
+                                     UI_12_FONT_ID, tr(STR_ERROR_MSG), 4, true, EpdFontFamily::BOLD,
+                                     UITheme::TextVerticalAlignment::BOTTOM);
+    UITheme::drawCenteredWrappedText(
+        renderer, Rect{bounds.x, bounds.y + bounds.height / 2 + 8, bounds.width, bounds.height / 2 - 8},
+        UI_10_FONT_ID, errorMessage.c_str(), 8, true, EpdFontFamily::REGULAR, UITheme::TextVerticalAlignment::TOP);
     return;
   }
-  // CHECK_WIFI / LOADING (and the brief child-activity handoff states).
-  screen.centeredText(statusMessage.c_str(), centered);
+  UITheme::drawCenteredWrappedText(renderer, bounds, UI_12_FONT_ID, statusMessage.c_str(), 8);
 }
 
 void OpdsBookBrowserActivity::render(RenderLock&&) {

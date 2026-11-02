@@ -2,6 +2,7 @@
 
 #include <LibraryIndexFile.h>
 
+#include <atomic>
 #include <cstdint>
 #include <memory>
 #include <string>
@@ -10,6 +11,8 @@
 #include "RecentBooksStore.h"
 #include "activities/UiTabListActivity.h"
 #include "components/OptionPopup.h"
+
+struct LibraryBuildJob;
 
 // One Library screen: every indexed book on the card shown by recency, title,
 // or author. The Recent shelf orders by file modification time (when a book
@@ -29,12 +32,20 @@
 // ListItems for at most one page). The ordinary shelf therefore keeps one page
 // of strings; an active search additionally uses one fallible uint16_t slot per
 // indexed book so an allocation failure remains recoverable on the C3.
+//
+// The index is refreshed by a low-priority background task (LibraryBuildJob),
+// never on the UI task: the screen paints from the existing index first, keeps
+// it browsable while the walk runs, and swaps in the rebuilt file from loop()
+// once the task has finished. Every action that needs the card or the heap to
+// itself (open, search, dialogs, delete) cancels and joins the task first.
 class LibraryListActivity final : public UiTabListActivity {
  public:
   LibraryListActivity(GfxRenderer& renderer, MappedInputManager& mappedInput);
+  ~LibraryListActivity() override;
 
   void onEnter() override;
   void onExit() override;
+  void loop() override;
 
  protected:
   // --- UiListActivity / UiTabListActivity contract ---------------------------
@@ -64,17 +75,45 @@ class LibraryListActivity final : public UiTabListActivity {
   static constexpr freeink::ui::ActionId ACTION_REBUILD = ACTION_SEARCH + 1;
   static constexpr freeink::ui::ActionId ACTION_BACK = ACTION_REBUILD + 1;
 
-  // Walk the card and write a fresh index. Blocking, with a popup: at ~70 books
-  // it is well under a second, and it only runs when the index is missing or the
-  // user asks.
-  bool rebuildIndex();
+  // --- background index refresh ---------------------------------------------
+  // Threading contract (everything below runs on the main loop task unless
+  // noted):
+  //   * `index`, `filtered`, the row state and every RenderLock section belong
+  //     to the UI side. The worker never touches them; it opens its own handles
+  //     inside library::buildLibraryIndex and only writes LibraryBuildJob.
+  //   * SdFat is serialised per operation by HalStorage and no HalFile is ever
+  //     shared between tasks, so the UI's open index handle and the worker's
+  //     handles can be live together.
+  //   * `build` owns the job. The worker sets job->done as its last access to
+  //     the job, so once done is observed the job may be freed. stopBuild()
+  //     sets job->cancel, which the builder polls between work units, and then
+  //     waits for done: no SdFat call of the worker is in flight on return.
+  //   * The render task never reads `build`; it only reads the atomics below,
+  //     which pollBuild() copies out of the job.
+  // Queue a refresh; it starts after the first paint.
+  void queueRebuild();
+  void startBuild();
+  // Cancel the running task (if any) and block until it has exited. The
+  // refresh stays queued so it restarts when the screen resumes.
+  void stopBuild();
+  // stopBuild() plus a hold so loop() does not restart the task while a
+  // dialog, the keyboard or the reader owns the card. Released by the dialog's
+  // result handler.
+  void holdBuild();
+  // Ask the task to stop without waiting; onExit() joins it.
+  void cancelBuildAsync();
+  // loop(): start the queued task, repaint progress, install a finished build.
+  void pollBuild();
+  void completeBuild();
+  void syncRebuildFlag();
+  // "Reading your books... 120 (87)" while a refresh is queued or running.
+  bool rebuildStatusText(char* out, size_t size) const;
 
   // Input
   void openSelectedBook();
   void openSearch();
   // Shared tail of row activation and the options menu's Open entry.
   void openBookByPath(const std::string& path);
-  void promptRebuildIndex();
   void resetAfterRebuild();
   // Recent-row long-press menu: open / remove from recents / delete / rebuild.
   void showRecentBookOptions(int entry);
@@ -145,6 +184,20 @@ class LibraryListActivity final : public UiTabListActivity {
   // Set when the walk finished but the sort did not, so the screen can say the
   // order is discovery order rather than silently showing a wrong one.
   bool degraded = false;
+
+  // Background refresh state (see the threading contract above).
+  std::unique_ptr<LibraryBuildJob> build;
+  bool buildPending = false;  // a refresh is wanted and not yet started
+  bool buildFailed = false;   // last refresh failed; no automatic retry
+  bool buildHeld = false;     // a dialog owns the card; do not restart yet
+  uint8_t buildRounds = 0;    // automatic follow-up refreshes this visit
+  uint32_t enteredMs = 0;
+  uint32_t lastStatusPaintMs = 0;
+  uint32_t paintedScanned = 0;
+  std::atomic<bool> firstPainted{false};
+  std::atomic<bool> rebuildActive{false};  // queued or running (status line)
+  std::atomic<uint32_t> progressScanned{0};
+  std::atomic<uint32_t> progressDone{0};
 
   // Rows surviving the current query, as positions in the active sort order.
   // Empty query means no filtering and this owns no allocation, so the ordinary

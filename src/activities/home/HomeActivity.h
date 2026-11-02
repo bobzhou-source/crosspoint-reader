@@ -6,6 +6,7 @@
 #include "RecentBooksStore.h"
 #include "activities/Activity.h"
 #include "components/CoverGridHomeUi.h"
+#include "components/UITheme.h"
 #include "util/ButtonNavigator.h"
 
 struct Rect;
@@ -13,6 +14,7 @@ struct Rect;
 class HomeActivity final : public Activity {
   std::unique_ptr<CoverGridHomeUi> coverGridUi;
   ButtonNavigator buttonNavigator;
+  int firstMenuRow = 0;
   int selectorIndex = 0;
   bool recentsLoading = false;
   bool recentsLoaded = false;
@@ -35,13 +37,13 @@ class HomeActivity final : public Activity {
   const bool cleanInitialRefresh;
 
   // Convert HomeMenuItem to menu index (used in onEnter)
-  static int menuItemToIndex(HomeMenuItem item, bool hasOpdsUrl) {
+  int menuItemToIndex(HomeMenuItem item, bool hasOpdsUrl) const {
     int i = 0;
-    if (item == HomeMenuItem::FILE_BROWSER) return i;
+    if (item == (coverGridUi ? HomeMenuItem::FILE_BROWSER : HomeMenuItem::LIBRARY)) return i;
     ++i;
-    if (item == HomeMenuItem::LIBRARY) return i;
+    if (item == (coverGridUi ? HomeMenuItem::LIBRARY : HomeMenuItem::READING_INBOX)) return i;
     ++i;
-    if (item == HomeMenuItem::READING_INBOX) return i;
+    if (item == (coverGridUi ? HomeMenuItem::READING_INBOX : HomeMenuItem::FILE_BROWSER)) return i;
     ++i;
     if (item == HomeMenuItem::OPDS_BROWSER) return hasOpdsUrl ? i : 0;
     if (hasOpdsUrl) ++i;
@@ -52,11 +54,11 @@ class HomeActivity final : public Activity {
   }
 
   // Convert menu index to HomeMenuItem (used in loop)
-  static HomeMenuItem indexToMenuItem(int idx, bool hasOpdsUrl) {
+  HomeMenuItem indexToMenuItem(int idx, bool hasOpdsUrl) const {
     int i = 0;
-    if (idx == i++) return HomeMenuItem::FILE_BROWSER;
-    if (idx == i++) return HomeMenuItem::LIBRARY;
-    if (idx == i++) return HomeMenuItem::READING_INBOX;
+    if (idx == i++) return coverGridUi ? HomeMenuItem::FILE_BROWSER : HomeMenuItem::LIBRARY;
+    if (idx == i++) return coverGridUi ? HomeMenuItem::LIBRARY : HomeMenuItem::READING_INBOX;
+    if (idx == i++) return coverGridUi ? HomeMenuItem::READING_INBOX : HomeMenuItem::FILE_BROWSER;
     if (hasOpdsUrl && idx == i++) return HomeMenuItem::OPDS_BROWSER;
     if (idx == i++) return HomeMenuItem::FILE_TRANSFER;
     if (idx == i) return HomeMenuItem::SETTINGS_MENU;
@@ -71,6 +73,16 @@ class HomeActivity final : public Activity {
   void onOpdsBrowserOpen();
 
   int getMenuItemCount() const;
+  struct HomeLayout {
+    Rect header;
+    Rect cover;
+    Rect menu;
+    int menuBase;
+    int firstRow;
+    int visibleRows;
+    int rowHeight;
+  };
+  HomeLayout homeLayout();
   bool storeCoverBuffer();    // Store frame buffer for cover image
   bool restoreCoverBuffer();  // Restore frame buffer from stored cover
   void freeCoverBuffer();     // Free the stored cover buffer

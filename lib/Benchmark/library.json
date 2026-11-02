@@ -1,0 +1,15 @@
+{
+  "name": "Benchmark",
+  "version": "1.0.0",
+  "description": "Optional bounded SD benchmark recording through CrossPoint HAL storage",
+  "license": "MIT",
+  "frameworks": ["arduino"],
+  "platforms": ["espressif32"],
+  "dependencies": {
+    "greiman/SdFat": "^2.3.1"
+  },
+  "build": {
+    "srcDir": ".",
+    "includeDir": "."
+  }
+}

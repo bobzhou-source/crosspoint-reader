@@ -303,7 +303,11 @@ class SdCardFont {
   // Per-style advance table. Sorted by codepoint for binary lookup.
   // Bounded to ADVANCE_CACHE_LIMIT entries; persists across layout passes
   // (across calls to clearCache()) so repeated indexing of the same font
-  // amortizes SD reads. Cleared only on font unload or clearPersistentCache().
+  // amortizes SD reads: a build whose codepoints are all cached reads nothing
+  // and allocates nothing. Cleared only on font unload, clearPersistentCache()
+  // or releaseResidentCaches(). Once a style's table is full it stops growing and
+  // later builds skip that style: codepoints past the limit are never cached, so
+  // getAdvance() returns 0 for them and the renderer takes its slower path.
   static constexpr uint32_t ADVANCE_CACHE_LIMIT = 768;
   AdvanceEntry* advanceTable_[MAX_STYLES] = {};
   uint32_t advanceTableSize_[MAX_STYLES] = {};
@@ -311,6 +315,12 @@ class SdCardFont {
   // Merge sortedNew (sorted by codepoint, no overlap with existing) into the
   // advance table for styleIdx, preserving sort order; cap-truncates the tail.
   void mergeIntoAdvanceTable(uint8_t styleIdx, const AdvanceEntry* sortedNew, uint32_t newCount);
+  // True when every codepoint of the packed words (plus the optional space,
+  // hyphen and extraText) already has an advance in every requested style whose
+  // table is not full — i.e. buildAdvanceTablePacked() has nothing to fetch.
+  // Allocation-free and never touches the card.
+  bool advancesResident(const char* const* segments, const size_t* segmentLens, size_t segmentCount, bool includeSpace,
+                        bool includeHyphen, uint8_t styleMask, const char* extraText) const;
 
   Stats stats_;
   uint32_t contentHash_ = 0;

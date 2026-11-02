@@ -5,6 +5,7 @@
 #include <HalClock.h>
 #include <HalFrontlight.h>
 #include <HalTiltSensor.h>
+#include <I18n.h>
 #include <esp_mac.h>
 
 #include <cstdio>
@@ -33,8 +34,8 @@ enum MenuItem {
 // these screenshots across every device language, so the labels must be
 // identical on every unit.
 const char* const menuNames[AboutActivity::ITEM_COUNT] = {
-    "Device", "Firmware",          "Chip",        "Flash", "Display Controller", "Resolution", "Touch", "Frontlight",
-    "RTC",    "Tilt Sensor (IMU)", "MAC Address",
+    "Device", "Firmware",          "Chip",        "Flash", "Display controller", "Resolution", "Touch", "Frontlight",
+    "RTC",    "Tilt sensor (IMU)", "MAC address",
 };
 
 // Chip part numbers, not user prose — deliberately untranslated.
@@ -82,7 +83,7 @@ const char* touchControllerName(const BoardConfig::TouchController c) {
 AboutActivity::AboutActivity(GfxRenderer& renderer, MappedInputManager& mappedInput)
     : UiListActivity("About", renderer, mappedInput) {}
 
-const char* AboutActivity::headerTitle() const { return "About"; }
+const char* AboutActivity::headerTitle() const { return tr(STR_ABOUT); }
 
 void AboutActivity::onEnter() {
   UiListActivity::onEnter();
@@ -133,8 +134,10 @@ void AboutActivity::buildScreen(UiScreen& screen) {
   props.action = ACTION_ROW;
   props.inputMask = fui::InputTouch;  // physical buttons stay in loop()
   props.valueInset = 8;
-  props.labelText = screen.theme().smallText;
-  props.labelText.maxLines = 1;
+  props.valueMaxWidthPercent = 40;
+  props.labelMinWidthPercent = 55;
+  props.labelText = screen.theme().bodyText;
+  props.labelText.maxLines = 2;
   syncListViewport(screen, props);
   screen.list(props);
 }

@@ -11,36 +11,36 @@ constexpr ThemeMetrics values = {.batteryWidth = 16,
                                  // Shared anchor for every header band, including the cover-grid
                                  // home's status band; roomy enough that the strip clears the edge.
                                  .topPadding = 10,
-                                 .batteryBarHeight = 20,
+                                 .batteryBarHeight = 24,
                                  .headerHeight = 84,
                                  .verticalSpacing = 16,
                                  .previewPadding = 12,
                                  .previewHeightPercent = 30,
                                  .contentSidePadding = 20,
-                                 .listRowHeight = 40,
-                                 .listWithSubtitleRowHeight = 60,
+                                 .listRowHeight = 56,
+                                 .listWithSubtitleRowHeight = 76,
                                  .listRowGap = 0,
-                                 .listRowRadius = 6,
-                                 .listInset = 20,
+                                 .listRowRadius = 0,
+                                 .listInset = 12,
                                  .listSidePadding = 8,
-                                 .listSelectionStyle = 1,  // light pill
-                                 .listScrollWidth = 4,
+                                 .listSelectionStyle = 2,  // underline
+                                 .listScrollWidth = 2,
                                  .listScrollSide = 0,
                                  .listTitleBold = false,
-                                 .headerSidePadding = 18,
-                                 .headerUnderlineSize = 3,
+                                 .headerSidePadding = 20,
+                                 .headerUnderlineSize = 1,
                                  .headerTitleAlign = 0,  // left
                                  .headerBatterySide = 0,
                                  .headerClockCentered = false,
-                                 .menuRowHeight = 64,
-                                 .menuSpacing = 8,
+                                 .menuRowHeight = 56,
+                                 .menuSpacing = 0,
                                  .tabSpacing = 8,
                                  .tabBarHeight = 48,
-                                 .scrollBarWidth = 4,
+                                 .scrollBarWidth = 2,
                                  .scrollBarRightOffset = 5,
-                                 .homeTopPadding = 56,
-                                 .homeCoverHeight = 226,
-                                 .homeCoverTileHeight = 242,
+                                 .homeTopPadding = 110,
+                                 .homeCoverHeight = 180,
+                                 .homeCoverTileHeight = 212,
                                  .homeRecentBooksCount = 1,
                                  .homeContinueReadingInMenu = false,
                                  .homeMenuTopOffset = 16,
@@ -60,15 +60,15 @@ constexpr ThemeMetrics values = {.batteryWidth = 16,
                                  .popupMarginX = 16,
                                  .popupMarginY = 12,
                                  .popupFrameThickness = 2,
-                                 .popupCornerRadius = 6,
+                                 .popupCornerRadius = 0,
                                  .popupTextBold = false,
-                                 .popupTextInverted = false,
+                                 .popupTextInverted = true,
                                  .popupTextBaselineOffsetY = -2,
                                  .popupProgressBarHeight = 4,
                                  .popupProgressDrawOutline = false,
-                                 .popupProgressClampPercent = false,
-                                 .popupProgressFillInverted = false,
-                                 .popupProgressOutlineInverted = false,
+                                 .popupProgressClampPercent = true,
+                                 .popupProgressFillInverted = true,
+                                 .popupProgressOutlineInverted = true,
                                  .optionPopupItemSpacing = 8,
                                  .optionPopupInnerPadding = 20,
                                  .optionPopupSelectionVPadding = 12,
@@ -77,9 +77,9 @@ constexpr ThemeMetrics values = {.batteryWidth = 16,
                                  .textFieldNormalThickness = 1,
                                  .textFieldCursorThickness = 3,
                                  .textFieldLineEndOffset = 0,
-                                 .controlRadius = 6,
-                                 .sheetRadius = 6,
-                                 .capsuleRadius = 6};
+                                 .controlRadius = 0,
+                                 .sheetRadius = 0,
+                                 .capsuleRadius = 0};
 }  // namespace LyraMetrics
 
 class LyraTheme : public BaseTheme {
@@ -91,6 +91,7 @@ class LyraTheme : public BaseTheme {
   void drawButtonHints(GfxRenderer& renderer, const char* btn1, const char* btn2, const char* btn3,
                        const char* btn4) const override;
   void drawSideButtonHints(const GfxRenderer& renderer, const char* topBtn, const char* bottomBtn) const override;
+  int getMenuRowHeight(const GfxRenderer& renderer) const override;
   void drawButtonMenu(GfxRenderer& renderer, Rect rect, int buttonCount, int selectedIndex,
                       const std::function<std::string(int index)>& buttonLabel,
                       const std::function<UIIcon(int index)>& rowIcon) const override;
@@ -99,4 +100,5 @@ class LyraTheme : public BaseTheme {
                            std::function<bool()> storeCoverBuffer) const override;
   void drawEmptyRecents(const GfxRenderer& renderer, const Rect rect) const;
   bool showsFileIcons() const override { return true; }
+  int homeCoverThumbHeight(const GfxRenderer&, int recentBookCount) const override;
 };

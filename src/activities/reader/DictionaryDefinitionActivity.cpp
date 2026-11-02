@@ -20,9 +20,6 @@ namespace {
 // (far below this); only pathological unbreakable tokens are split at this cap.
 constexpr size_t MAX_LINE_BYTES = 191;
 
-// Body text left/right inset, matching the reader's default feel.
-constexpr int SIDE_PADDING = 20;
-
 // Styled-path ceiling: the laid-out Pages keep the whole definition resident
 // (TextBlock arenas ≈ text + ~7 bytes/word plus per-line objects), roughly
 // doubling the string's footprint while this activity is stacked over the
@@ -34,6 +31,16 @@ constexpr size_t MAX_STYLED_HTML_BYTES = 16 * 1024;
 
 void DictionaryDefinitionActivity::onEnter() {
   Activity::onEnter();
+  layoutDefinition();
+  requestUpdate();
+}
+
+void DictionaryDefinitionActivity::layoutDefinition() {
+  pages.clear();
+  lines.clear();
+  currentPage = 0;
+  totalPages = 1;
+  if (dictionary) definition.insert(0, headword + "\n\n");
   // Normalize StarDict multi-type separators so the wrap loop and the
   // C-string font APIs below both see the whole definition.
   std::replace(definition.begin(), definition.end(), '\0', '\n');
@@ -41,7 +48,36 @@ void DictionaryDefinitionActivity::onEnter() {
     definition = htmlToPlainText(definition);
     wrapText();
   }
-  requestUpdate();
+}
+
+void DictionaryDefinitionActivity::changeMatch(const int direction) {
+  RenderLock lock;
+  uint8_t ends[CjkDictionary::MAX_CHARACTERS];
+  const int count = CjkDictionary::prefixes(cjkRun, ends);
+  int current = 0;
+  while (current < count && ends[current] != headword.size()) ++current;
+  for (int next = current + direction; next >= 0 && next < count; next += direction) {
+    if (!(matchMask & (1u << next))) continue;
+    char candidate[CjkDictionary::RUN_BYTES];
+    memcpy(candidate, cjkRun, ends[next]);
+    candidate[ends[next]] = '\0';
+    std::string text;
+    std::string matched;
+    Dictionary::LookupResult result;
+    if (dictionary->lookup(candidate, text, matched, &result)) {
+      headword = std::move(matched);
+      definition = std::move(text);
+      lookupFailed = false;
+      layoutDefinition();
+    } else {
+      lookupFailed = true;
+      lookupError = result == Dictionary::LookupResult::LowMemory    ? StrId::STR_DICT_LOW_MEMORY
+                    : result == Dictionary::LookupResult::Decompress ? StrId::STR_DICT_DECOMPRESS_ERROR
+                                                                     : StrId::STR_DICT_READ_FAILED;
+    }
+    requestUpdate();
+    return;
+  }
 }
 
 void DictionaryDefinitionActivity::onExit() {
@@ -52,16 +88,8 @@ void DictionaryDefinitionActivity::onExit() {
 }
 
 DictionaryDefinitionActivity::BodyArea DictionaryDefinitionActivity::bodyArea() const {
-  const auto& metrics = UITheme::getInstance().getMetrics();
-  const auto orientation = renderer.getOrientation();
-  const bool isLandscape = orientation == GfxRenderer::Orientation::LandscapeClockwise ||
-                           orientation == GfxRenderer::Orientation::LandscapeCounterClockwise;
-  const bool isInverted = orientation == GfxRenderer::Orientation::PortraitInverted;
-  const int hintGutterWidth = isLandscape ? metrics.sideButtonHintsWidth : 0;
-  const int topArea = (isInverted ? metrics.buttonHintsHeight : 0) + metrics.topPadding + metrics.headerHeight;
-  const int bottomArea = metrics.buttonHintsHeight + metrics.verticalSpacing;
-  return {renderer.getScreenWidth() - hintGutterWidth - 2 * SIDE_PADDING,
-          renderer.getScreenHeight() - topArea - bottomArea};
+  const Rect body = UITheme::getContentBounds(renderer);
+  return {body.width, body.height - (dictionary ? 44 : 0)};
 }
 
 // Styled path: lay the HTML definition out through the EPUB chapter parser
@@ -202,12 +230,24 @@ void DictionaryDefinitionActivity::loop() {
     finish();
     return;
   }
+  if (dictionary && mappedInput.wasPressed(MappedInputManager::Button::Up)) {
+    changeMatch(-1);
+    return;
+  }
+  if (dictionary && mappedInput.wasPressed(MappedInputManager::Button::Down)) {
+    changeMatch(1);
+    return;
+  }
 
   // Same tap zones as the reader page turns: left third = previous page,
   // the rest = next. Back is the usual left-edge swipe.
   int tx = 0;
   int ty = 0;
   if (mappedInput.wasScreenTapped(tx, ty)) {
+    if (dictionary && ty < UITheme::getContentBounds(renderer).y + 44) {
+      changeMatch(tx < renderer.getScreenWidth() / 2 ? -1 : 1);
+      return;
+    }
     if (tx < renderer.getScreenWidth() / 3) {
       if (currentPage > 0) {
         currentPage--;
@@ -261,35 +301,29 @@ void DictionaryDefinitionActivity::render(RenderLock&&) {
   renderer.clearScreen();
 
   const auto& metrics = UITheme::getInstance().getMetrics();
-  const auto orientation = renderer.getOrientation();
-  const bool isLandscapeCw = orientation == GfxRenderer::Orientation::LandscapeClockwise;
-  const bool isLandscapeCcw = orientation == GfxRenderer::Orientation::LandscapeCounterClockwise;
-  const bool isInverted = orientation == GfxRenderer::Orientation::PortraitInverted;
-  const int hintGutterWidth = (isLandscapeCw || isLandscapeCcw) ? metrics.sideButtonHintsWidth : 0;
-  const int contentX = isLandscapeCw ? hintGutterWidth : 0;
-  const int contentWidth = renderer.getScreenWidth() - hintGutterWidth;
-  const int contentY = isInverted ? metrics.buttonHintsHeight : 0;
-
-  // Header: matched headword left, page counter right.
-  const int headerY = contentY + metrics.topPadding + 10;
-  renderer.drawText(UI_12_FONT_ID, contentX + SIDE_PADDING, headerY, headword.c_str(), true, EpdFontFamily::BOLD);
-  if (totalPages > 1) {
-    char counter[16];
-    snprintf(counter, sizeof(counter), "%d/%d", currentPage + 1, totalPages);
-    const int counterWidth = renderer.getTextWidth(UI_10_FONT_ID, counter);
-    renderer.drawText(UI_10_FONT_ID, contentX + contentWidth - SIDE_PADDING - counterWidth, headerY, counter);
+  Rect body = UITheme::getContentBounds(renderer);
+  char counter[16] = {};
+  if (totalPages > 1) snprintf(counter, sizeof(counter), "%d/%d", currentPage + 1, totalPages);
+  GUI.drawHeader(renderer, Rect{0, metrics.topPadding, renderer.getScreenWidth(), metrics.headerHeight},
+                 lookupFailed ? I18N.get(lookupError) : (dictionary ? tr(STR_LOOKUP) : headword.c_str()),
+                 counter[0] ? counter : nullptr);
+  if (dictionary) {
+    const int half = body.width / 2;
+    UITheme::drawCenteredText(renderer, Rect{body.x, body.y, half, 44}, SMALL_FONT_ID, body.y, tr(STR_DICT_SHORTER));
+    UITheme::drawCenteredText(renderer, Rect{body.x + half, body.y, body.width - half, 44}, SMALL_FONT_ID, body.y,
+                              tr(STR_DICT_LONGER));
+    body.y += 44;
   }
 
   // Body: two-pass draw inside a prewarm scope (same pattern as the reader's
   // renderContents) so SD-card font glyphs load from SD in one batch instead
   // of one on-demand overflow read per character on every page turn.
   const int fontId = SETTINGS.getReaderFontId();
-  const int bodyStartY = contentY + metrics.topPadding + metrics.headerHeight;
   auto* fcm = renderer.getFontCacheManager();
   auto scope = fcm->createPrewarmScope();
-  drawBody(fontId, contentX + SIDE_PADDING, bodyStartY);  // scan pass: records codepoints only
+  drawBody(fontId, body.x, body.y);  // scan pass: records codepoints only
   scope.endScanAndPrewarm();
-  drawBody(fontId, contentX + SIDE_PADDING, bodyStartY);
+  drawBody(fontId, body.x, body.y);
 
   const auto labels =
       mappedInput.mapLabels(tr(STR_BACK), "", (currentPage > 0 ? "<" : ""), (currentPage + 1 < totalPages ? ">" : ""));

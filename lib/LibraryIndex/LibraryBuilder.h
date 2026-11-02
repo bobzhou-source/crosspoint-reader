@@ -43,6 +43,7 @@ struct BuildStats {
   uint16_t duplicatesDropped = 0;
   uint16_t unreadableSkipped = 0;
   uint32_t walkMs = 0;
+  uint32_t metadataMs = 0;  // source OPF parsing plus durable checkpoint writes
   // Reconciliation against the previous index. Their sum over a rebuild with no
   // card changes should be: unchanged == books, everything else zero.
   uint16_t unchanged = 0;  // same full path: keeps its place in "Recently added"
@@ -52,26 +53,38 @@ struct BuildStats {
   uint16_t enriched = 0;   // took its title or author from the book rather than the filename
   uint16_t parsed = 0;     // EPUB metadata reads performed by this build
   uint16_t metadataReused = 0;
+  uint16_t metadataResumed = 0;
+  bool indexPrepared = false;
   bool indexReplaced = false;
   bool ranksDegraded = false;
   bool dedupDegraded = false;
+};
+
+// Called from the builder task, never while holding a render lock. Returning
+// false cancels without replacing the live index; completed metadata survives.
+struct BuildControl {
+  void* context = nullptr;
+  bool (*service)(void*, uint16_t scanned, uint16_t parsed, uint16_t reused) = nullptr;
+  bool deferInstall = false;
 };
 
 // Walk `rootPath`, write `/.crosspoint/library.idx`, and report what happened.
 // The previous index, including its monotonic "recently added" counter, is read
 // internally so callers cannot accidentally split one rebuild state across two
 // file opens.
-// `readMetadata` makes the walk prefer the title and author held inside each
-// book over its filename. It reads an existing cache when available; otherwise
-// it stops the normal EPUB parser at the end of <metadata>, before the manifest,
-// without building the reader's spine, TOC, CSS, or section caches.
-bool buildLibraryIndex(const char* rootPath, BuildStats& stats, bool readMetadata = false);
+// `readMetadata` prefers source title and author over the filename. Unchanged
+// entries reuse index metadata; changed entries parse the source OPF only up to
+// </metadata>, without spine, TOC, CSS, cover, or section caches.
+bool buildLibraryIndex(const char* rootPath, BuildStats& stats, bool readMetadata = false,
+                       const BuildControl* control = nullptr);
+// Caller closes all live index readers before publishing a deferred build.
+bool installPreparedLibraryIndex();
 
 // Live index path, shared by the builder and activity.
 const char* libraryIndexPath();
 
-// A successful book transfer marks the retained index stale. The next Library
-// entry rebuilds it through the normal reconciliation path.
+// A successful book transfer marks the retained index stale. Library keeps the
+// old index visible while preparing an incremental replacement.
 bool markLibraryIndexDirty();
 bool isLibraryIndexDirty();
 

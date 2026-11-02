@@ -18,7 +18,8 @@ from .network import PublicHTTP, decode_html
 from .sources import load_sources
 from . import subscriptions as publications
 from .x_adapter import api_thread, load_export, thread_item
-from . import assist, cloud_cli
+from .x_browser import DEFAULT_CDP_ENDPOINT, capture_x_url
+from . import assist, card, card_autosync, cloud_cli, novels, x_following, collect
 
 
 def seconds(value: str) -> float:
@@ -83,18 +84,36 @@ def parser() -> argparse.ArgumentParser:
     cache_option(sender)
     sender.add_argument("input", help="EPUB path or full cached article ID")
     delivery_options(sender)
-    x = commands.add_parser("x", help="Convert one X post/thread from an authorized JSON export or official API")
+    x = commands.add_parser("x", help="Convert one X post/thread from your signed-in Chrome, an export, or the official API")
     cache_option(x)
     delivery_options(x)
     x.add_argument("input", help="X/Twitter post URL")
     access = x.add_mutually_exclusive_group(required=True)
     access.add_argument("--export", type=Path, help="official API v2 data/includes JSON export")
     access.add_argument("--api", action="store_true", help="explicitly use X_BEARER_TOKEN and your authorized API quota")
+    access.add_argument("--browser", action="store_true",
+                        help="read the post from the Chrome window already signed in to X (no API key or export)")
+    x.add_argument("--browser-endpoint", default=DEFAULT_CDP_ENDPOINT,
+                   help="loopback Chrome DevTools endpoint used by --browser (default 127.0.0.1:9333)")
     x.add_argument("--output", "-o", type=Path)
     x.add_argument("--force", action="store_true")
     x.add_argument("--send", action="store_true")
     x.add_argument("--no-images", action="store_true")
     x.add_argument("--remote-images", action="store_true", help="fetch images from a JSON export (otherwise offline)")
+    following = commands.add_parser("x-following", help="Collect the newest posts from your X Following timeline")
+    cache_option(following)
+    following_operations = following.add_subparsers(dest="following_operation", required=True)
+    following_sync = following_operations.add_parser("sync", help="Read the Following tab once and store new posts")
+    cache_option(following_sync)
+    delivery_options(following_sync)
+    following_sync.add_argument("--since-hours", type=int, default=24,
+                                help="only posts newer than this many hours (1–168; default 24)")
+    following_sync.add_argument("--limit", type=int, default=50,
+                                help="maximum posts stored per pass (1–200; default 50)")
+    following_sync.add_argument("--send", action="store_true")
+    following_sync.add_argument("--no-images", action="store_true")
+    following_sync.add_argument("--browser-endpoint", default=DEFAULT_CDP_ENDPOINT,
+                                help="loopback Chrome DevTools endpoint (default 127.0.0.1:9333)")
     publication = commands.add_parser("subscriptions", help="Manage automatic RSS and Mac-local export collection")
     cache_option(publication)
     operations = publication.add_subparsers(dest="operation", required=True)
@@ -103,6 +122,8 @@ def parser() -> argparse.ArgumentParser:
     add.add_argument("name")
     add.add_argument("--feed", default="", help="public RSS/Atom URL; Substack publications usually use /feed")
     add.add_argument("--export-dir", default="", help="folder of your authorized saved HTML/exports")
+    add.add_argument("--browser-url", default="",
+                     help="publication archive URL read through an already signed-in Chrome (read-only)")
     listing = operations.add_parser("list")
     cache_option(listing)
     remove = operations.add_parser("remove")
@@ -112,12 +133,83 @@ def parser() -> argparse.ArgumentParser:
     cache_option(sync)
     sync.add_argument("--name", default="")
     sync.add_argument("--limit", type=int, default=10, help="maximum new public posts per publication/pass (1–100)")
-    sync.add_argument("--timeout", type=seconds, default=30)
-    sync.add_argument("--retries", type=retries, default=2)
+    sync.add_argument("--timeout", type=seconds, default=30, help="per-page browser or HTTP request timeout in seconds")
+    sync.add_argument("--retries", type=retries, default=2, help="HTTP retries; browser pages are never retried")
+    sync.add_argument("--browser-endpoint", default=DEFAULT_CDP_ENDPOINT,
+                      help=f"loopback Chrome DevTools endpoint for browser sources (default {DEFAULT_CDP_ENDPOINT})")
     sync.add_argument("--watch", action="store_true", help="keep collecting until interrupted; run only on your Mac")
     sync.add_argument("--interval", type=int, default=900, help="seconds between passes, at least 60 (default 900)")
     sync.add_argument("--dry-run", action="store_true")
     sync.add_argument("--no-images", action="store_true")
+    sync.add_argument("--since-days", type=int, default=None,
+                      help="only import posts published within this many days (1–365); default off")
+    schedule = operations.add_parser("schedule", help="Install the macOS launchd timer for the unified subscriptions + X + site sync collector")
+    cache_option(schedule)
+    schedule_operations = schedule.add_subparsers(dest="schedule_operation", required=True)
+    schedule_install = schedule_operations.add_parser("install", help="Install/reload the 15-minute user LaunchAgent")
+    cache_option(schedule_install)
+    schedule_install.add_argument("--config", type=Path,
+                                  help="card configuration read once at install time to pin the annotation output (default: ~/Library/Application Support/reader-send/card.json)")
+    cards = commands.add_parser("card", help="Deliver cached books and reviewed firmware to the configured Mac SD card")
+    cache_option(cards)
+    card_actions = cards.add_subparsers(dest="card_operation", required=True)
+    def config_option(command):
+        command.add_argument("--config", type=Path, help="card configuration path (default: ~/Library/Application Support/reader-send/card.json)")
+    card_setup = card_actions.add_parser("setup", help="Bind one removable volume UUID, annotation output, reviewed firmware and launchers")
+    cache_option(card_setup)
+    config_option(card_setup)
+    card_setup.add_argument("--volume-uuid", required=True, help="the card's exact VolumeUUID from diskutil info")
+    card_setup.add_argument("--annotations-dir", type=Path, required=True, help="Mac folder for annotation Markdown")
+    card_setup.add_argument("--firmware", type=Path, required=True, help="reviewed local firmware image")
+    card_setup.add_argument("--sha256", required=True, help="expected SHA-256 of that image")
+    card_setup.add_argument("--launchers-dir", type=Path, required=True, help="Finder folder for generated .command launchers")
+    card_sync = card_actions.add_parser("sync", help="Copy verified cached EPUBs and import annotations; no firmware action")
+    cache_option(card_sync)
+    config_option(card_sync)
+    card_sync.add_argument("--novels", type=Path, metavar="OUT_DIR",
+                           help="also copy the EPUBs converted by `novels convert` into /books/Novels on the card")
+    card_status = card_actions.add_parser("status", help="Report whether the exact configured card is mounted; read-only")
+    cache_option(card_status)
+    config_option(card_status)
+    card_autosync_parser = card_actions.add_parser(
+        "autosync",
+        help="On card plug-in: pull ready cloud books, copy them to /books/Inbox, verify by SHA-256, then acknowledge them")
+    cache_option(card_autosync_parser)
+    config_option(card_autosync_parser)
+    card_autosync_parser.add_argument("--batch", type=int, default=card_autosync.DEFAULT_BATCH,
+                                      help=f"downloads per pass (1–{card_autosync.MAX_BATCH}; default {card_autosync.DEFAULT_BATCH}); each pass is also limited to the per-minute request budget")
+    card_autosync_parser.add_argument("--passes", type=int, default=card_autosync.DEFAULT_PASSES,
+                                      help=f"maximum passes, 60 seconds apart (1–10; default {card_autosync.DEFAULT_PASSES})")
+    card_autosync_parser.add_argument("--log", type=Path, default=card_autosync.default_log_path(),
+                                      help="append a short run log here (default ~/Library/Logs/reader-card-autosync.log)")
+    card_autosync_parser.add_argument("--no-notify", action="store_true", help="do not post a macOS notification")
+    card_update = card_actions.add_parser("update", help="Stage one reviewed firmware image on the card; never flashes")
+    cache_option(card_update)
+    config_option(card_update)
+    card_update.add_argument("--image", type=Path, help="one explicit replacement image")
+    card_update.add_argument("--expected-sha256", help="required with --image")
+    card_provision = card_actions.add_parser("provision", help="Write the optional firmware direct-sync config; never stages firmware")
+    cache_option(card_provision)
+    config_option(card_provision)
+    card_provision.add_argument("--force", action="store_true", help="replace an invalid existing direct-sync config")
+    card_provision.add_argument("--rotate-key", action="store_true", help="explicitly replace the preserved device key from Keychain")
+    direct_sync = card_provision.add_mutually_exclusive_group()
+    direct_sync.add_argument("--enabled", dest="enabled", action="store_true", default=None, help="enable firmware direct sync")
+    direct_sync.add_argument("--disabled", dest="enabled", action="store_false", help="disable firmware direct sync without changing the key")
+    novels_parser = commands.add_parser("novels", help="Convert plain-text Chinese novels into chaptered EPUBs for the reader")
+    novels_actions = novels_parser.add_subparsers(dest="novels_operation", required=True)
+    novels_convert = novels_actions.add_parser(
+        "convert", help="Convert every .txt below SRC_DIR into a mirrored .epub below OUT_DIR; SRC_DIR is only read")
+    novels_convert.add_argument("src", type=Path, metavar="SRC_DIR", help="folder of .txt novels (searched recursively, never written)")
+    novels_convert.add_argument("out", type=Path, metavar="OUT_DIR", help="folder for the EPUBs, manifest and report (must be outside SRC_DIR)")
+    novels_convert.add_argument("--jobs", type=int, choices=range(1, 33), metavar="N", default=novels.default_jobs(),
+                                help="parallel conversion processes (default: one fewer than the CPU count, at most 6)")
+    novels_convert.add_argument("--force", action="store_true", help="reconvert every book even when its source hash is unchanged")
+    novels_convert.add_argument("--json", action="store_true", help="print the full per-book report instead of the summary")
+    scheduled = commands.add_parser("collect", help="Run recent subscriptions and X Following, then push/pull the private reader site")
+    cache_option(scheduled)
+    scheduled.add_argument("--annotations-out", type=Path,
+                           help="explicit cloud annotation NDJSON path (default: <cache-dir>/annotations/cloud-annotations.ndjson)")
     inbox = commands.add_parser("inbox", help="Update source-stable local read/progress state")
     cache_option(inbox)
     inbox.add_argument("id", help="cached article ID")
@@ -232,8 +324,16 @@ def convert_command(args, cache: Cache) -> int:
 def x_command(args, cache: Cache) -> int:
     if args.reader and not args.send:
         raise ReaderError("--reader requires --send on the x command")
-    payload = load_export(bounded_read(args.export.expanduser(), 8 * 1024 * 1024)) if args.export else api_thread(args.input, args.timeout)
+    if args.export:
+        payload = load_export(bounded_read(args.export.expanduser(), 8 * 1024 * 1024))
+    elif args.browser:
+        payload = capture_x_url(args.input, endpoint=args.browser_endpoint, timeout=args.timeout)
+    else:
+        payload = api_thread(args.input, args.timeout)
     item = thread_item(args.input, payload)
+    if args.browser:
+        item.warnings.extend(payload.get("_warnings", []))
+        item.provenance["capture"] = "chrome-cdp"
     article_id = cache.key(item.source_id, {"no_images": args.no_images})
     name = filename(item.title, article_id)
     destination = output_path(args, name, False)
@@ -243,7 +343,7 @@ def x_command(args, cache: Cache) -> int:
         return 0
     if destination and destination.exists() and not args.force:
         raise ReaderError(f"Output exists: {destination}; use --force to replace it")
-    data = build_epub(item, article_id, PublicHTTP(args.timeout), remote_images=args.api or args.remote_images,
+    data = build_epub(item, article_id, PublicHTTP(args.timeout), remote_images=args.api or args.remote_images or args.browser,
                       no_images=args.no_images)
     record = cache.store(article_id, item, data)
     path = Path(record["path"])
@@ -259,12 +359,37 @@ def x_command(args, cache: Cache) -> int:
     return 0
 
 
+def x_following_command(args, cache: Cache) -> int:
+    if args.reader and not args.send:
+        raise ReaderError("--reader requires --send on the x-following command")
+    if args.send and not args.dry_run:
+        device = select_reader(args)
+
+        def deliver(path):
+            return send(path, device, timeout=args.timeout)
+    else:
+        deliver = None
+    result = x_following.sync(cache, PublicHTTP(args.timeout), since_hours=args.since_hours,
+                              limit=args.limit, dry_run=args.dry_run, no_images=args.no_images,
+                              endpoint=args.browser_endpoint, timeout=args.timeout, deliver=deliver)
+    for warning in result["warnings"]:
+        print(f"reader-send: warning: {warning}", file=sys.stderr)
+    for error in result["errors"]:
+        print(f"reader-send: error: {error.get('stage', 'x-following')}: {error.get('error', '')}", file=sys.stderr)
+    emit(result)
+    return 2 if result["errors"] else 0
+
+
 def subscription_command(args, cache: Cache) -> int:
     if args.operation == "add":
-        emit(publications.add(cache, args.name, args.feed, args.export_dir))
+        emit(publications.add(cache, args.name, args.feed, args.export_dir,
+                              browser_url=args.browser_url))
+        return 0
+    if args.operation == "schedule":
+        emit(collect.install_launchd(cache, card_config=args.config))
         return 0
     if args.operation == "list":
-        emit(publications.subscriptions(cache))
+        emit(publications.subscriptions(cache, include_disabled=True))
         return 0
     if args.operation == "remove":
         publications.remove(cache, args.name)
@@ -275,18 +400,79 @@ def subscription_command(args, cache: Cache) -> int:
     if args.watch and args.dry_run:
         raise ReaderError("Use a single --dry-run before starting --watch")
     while True:
+        managed_refresh = None
+        if not args.dry_run and args.since_days is not None:
+            try:
+                managed_refresh = publications.refresh_managed_subscriptions(
+                    cache, endpoint=args.browser_endpoint, timeout=args.timeout)
+            except (ReaderError, OSError) as exc:
+                managed_refresh = {"status": "error", "source": "substack-account", "error": str(exc)}
         client = PublicHTTP(args.timeout, args.retries)
         if args.dry_run:
             result = publications.sync(cache, client, name=args.name, limit=args.limit,
-                                       dry_run=True, no_images=args.no_images)
+                                       dry_run=True, no_images=args.no_images,
+                                       browser_endpoint=args.browser_endpoint, timeout=args.timeout,
+                                       since_days=args.since_days)
         else:
             with publications.inbox_lock(cache):
                 result = publications.sync(cache, client, name=args.name, limit=args.limit,
-                                           no_images=args.no_images)
+                                           no_images=args.no_images,
+                                           browser_endpoint=args.browser_endpoint, timeout=args.timeout,
+                                           since_days=args.since_days)
+        if managed_refresh is not None:
+            result["managed_refresh"] = managed_refresh
+            if managed_refresh.get("status") == "error":
+                result["errors"].append({"stage": "managed-refresh", "error": managed_refresh["error"]})
         emit(result)
         if not args.watch:
             return 2 if result["errors"] else 0
         time.sleep(args.interval)
+
+
+def card_command(args, cache: Cache) -> int:
+    config_path = args.config or card.default_config_path()
+    if args.card_operation == "setup":
+        emit(card.setup(cache, config_path, volume_uuid=args.volume_uuid,
+                        annotations_dir=args.annotations_dir, firmware_path=args.firmware,
+                        firmware_sha256=args.sha256, launchers_dir=args.launchers_dir))
+        return 0
+    config = card.load_config(config_path)
+    if args.card_operation == "status":
+        result, mounted = card.card_status(config)
+        emit(result)
+        return 0 if mounted else 1
+    if args.card_operation == "sync":
+        result = card.sync_card(cache, config, novels_dir=args.novels)
+        emit(result)
+        return 2 if result.get("novels", {}).get("errors") else 0
+    if args.card_operation == "autosync":
+        result = card_autosync.autosync(
+            cache, config, batch=args.batch, passes=args.passes, log=card_autosync.RunLog(args.log),
+            notify=None if args.no_notify else card_autosync.macos_notification)
+        emit(result)
+        return 2 if result["status"] in {"error", "rate_limited"} else 0
+    if args.card_operation == "provision":
+        emit(card.provision_reader_sync(config, force=args.force, rotate_key=args.rotate_key,
+                                        enabled=args.enabled))
+        return 0
+    emit(card.stage_firmware(config, image=args.image, expected_sha256=args.expected_sha256))
+    return 0
+
+
+def novels_command(args) -> int:
+    def progress(done: int, total: int, record: dict) -> None:
+        if record["status"] == "failed":
+            detail = record["error"]
+        elif record["status"] == "skipped":
+            detail = "unchanged"
+        else:
+            detail = f"{record.get('mode')}, {record.get('chapters', 0)} chapters, {record.get('files', 0)} files"
+        print(f"[{done}/{total}] {record['status']}: {record['source']} ({detail})", file=sys.stderr, flush=True)
+
+    report = novels.convert_tree(args.src, args.out, force=args.force, jobs=args.jobs, progress=progress)
+    failures = [{"source": b["source"], "error": b["error"]} for b in report["books"] if b["status"] == "failed"]
+    emit(report if args.json else {"summary": report["summary"], "failures": failures})
+    return 2 if failures else 0
 
 
 def run(args) -> int:
@@ -296,7 +482,15 @@ def run(args) -> int:
     if args.command == "discover":
         emit([d.metadata() for d in discover(args.discovery_timeout, args.interface)])
         return 0
+    if args.command == "novels":
+        return novels_command(args)
     cache = Cache(args.cache_dir)
+    if args.command == "card":
+        return card_command(args, cache)
+    if args.command == "collect":
+        result = collect.collect(cache, annotations_out=args.annotations_out)
+        emit(result)
+        return 0 if result.get("ok") else 2
     if args.command == "cloud":
         emit(cloud_cli.run(args, cache))
         return 0
@@ -304,6 +498,8 @@ def run(args) -> int:
         return convert_command(args, cache)
     if args.command == "x":
         return x_command(args, cache)
+    if args.command == "x-following":
+        return x_following_command(args, cache)
     if args.command == "subscriptions":
         return subscription_command(args, cache)
     if args.command == "inbox":

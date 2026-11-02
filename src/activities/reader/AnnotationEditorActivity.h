@@ -1,9 +1,9 @@
 #pragma once
 
-#include <array>
 #include <memory>
 
 #include "AnnotationEntry.h"
+#include "ReaderTextSlices.h"
 #include "activities/UiListActivity.h"
 #include "components/OptionPopup.h"
 
@@ -18,11 +18,13 @@ class AnnotationEditorActivity final : public UiListActivity {
   void render(RenderLock&& lock) override;
 
  private:
-  static constexpr size_t CONTEXT_ROW_BYTES = 96;
-  static constexpr size_t MAX_CONTEXT_ROWS = 9;
   std::unique_ptr<AnnotationEntry> entry;
-  std::array<std::array<char, CONTEXT_ROW_BYTES + 1>, MAX_CONTEXT_ROWS> contextRows{};
+  char contextText[AnnotationEntry::MAX_EXCERPT_BYTES + 1] = {};
   size_t contextRowCount = 0;
+  int16_t contextWidth = 0;
+  freeink::ui::TextStyle contextStyle{};
+  const freeink::ui::DrawTarget* contextTarget = nullptr;
+  ReaderTextSlices::Cursor contextCursor;
   OptionPopup popup;
   std::string initialNote;
   AnnotationKind initialKind = AnnotationKind::Quote;

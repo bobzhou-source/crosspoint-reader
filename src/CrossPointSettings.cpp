@@ -7,7 +7,6 @@
 #include <algorithm>
 #include <cstring>
 #include <iterator>
-#include <limits>
 #include <string>
 
 #include "I18nKeys.h"
@@ -200,6 +199,8 @@ bool CrossPointSettings::fromJson(JsonVariantConst doc) {
     sleepTimeoutMinutes = sleepTimeoutEnumToMinutes(legacyValue);
     needsResave = true;
   }
+  // Page clearing is content-driven; drop the retired fixed page-count key.
+  if (!doc["refreshFrequency"].isNull()) needsResave = true;
   // Front button remap — managed by RemapFrontButtons sub-activity, not in SettingsList.
   frontButtonBack = clamp(doc["frontButtonBack"] | (uint8_t)FRONT_HW_BACK, FRONT_BUTTON_HARDWARE_COUNT, FRONT_HW_BACK);
   frontButtonConfirm =
@@ -357,26 +358,6 @@ unsigned long CrossPointSettings::getSleepTimeoutMs() const {
   const uint8_t minutes =
       std::clamp(sleepTimeoutMinutes, MIN_SLEEP_TIMEOUT_MINUTES, static_cast<uint8_t>(SLEEP_TIMEOUT_NEVER_MINUTES - 1));
   return static_cast<unsigned long>(minutes) * 60UL * 1000UL;
-}
-
-int CrossPointSettings::getRefreshFrequency() const {
-  switch (refreshFrequency) {
-    case REFRESH_1:
-      return 1;
-    case REFRESH_5:
-      return 5;
-    case REFRESH_10:
-      return 10;
-    case REFRESH_15:
-    default:
-      return 15;
-    case REFRESH_30:
-      return 30;
-    case REFRESH_NEVER:
-      // Effectively disables the periodic full refresh; the page counter
-      // counts down from here and never reaches the threshold in practice.
-      return std::numeric_limits<int>::max();
-  }
 }
 
 void CrossPointSettings::clearSdFontFamily() {

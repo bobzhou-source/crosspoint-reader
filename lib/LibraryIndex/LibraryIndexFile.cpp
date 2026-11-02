@@ -40,12 +40,16 @@ bool LibraryIndexFile::openImpl(const char* path, const bool acceptStaleFold) {
     return false;
   }
   opened = true;
+  if (head.bookCount > 0) blobCache = makeUniqueNoThrow<uint8_t[]>(512);
   return true;
 }
 
 void LibraryIndexFile::close() {
   if (file.isOpen()) file.close();
   opened = false;
+  blobCache.reset();
+  blobCacheOffset = UINT32_MAX;
+  blobCacheSize = 0;
 }
 
 bool LibraryIndexFile::readAt(const uint32_t offset, void* dst, const size_t len) {
@@ -58,6 +62,27 @@ bool LibraryIndexFile::readAt(const uint32_t offset, void* dst, const size_t len
     return false;
   }
   return true;
+}
+
+bool LibraryIndexFile::readBlobAt(const ClixRecord& record, uint32_t relative, void* dst, size_t len) {
+  if (!opened || record.nameOff > head.nameLen || relative > head.nameLen - record.nameOff ||
+      len > head.nameLen - record.nameOff - relative)
+    return false;
+  if (blobCache && relative + len <= 512) {
+    if (blobCacheOffset != record.nameOff) {
+      // A short read may overwrite part of the old window. Never leave its
+      // previous identity attached to those bytes after an IO failure.
+      blobCacheOffset = UINT32_MAX;
+      blobCacheSize = std::min<uint32_t>(512, head.nameLen - record.nameOff);
+      if (!readAt(head.nameStart + record.nameOff, blobCache.get(), blobCacheSize)) return false;
+      blobCacheOffset = record.nameOff;
+    }
+    if (relative + len <= blobCacheSize) {
+      memcpy(dst, blobCache.get() + relative, len);
+      return true;
+    }
+  }
+  return readAt(head.nameStart + record.nameOff + relative, dst, len);
 }
 
 uint16_t LibraryIndexFile::ordinalForRow(const SortOrder order, const uint16_t row) {
@@ -181,7 +206,7 @@ bool LibraryIndexFile::readName(const ClixRecord& record, std::string& out) {
       record.nameLen > head.nameLen - record.nameOff - sizeof(uint64_t))
     return false;
   out.resize(record.nameLen);
-  return readAt(head.nameStart + record.nameOff + sizeof(uint64_t), out.data(), record.nameLen);
+  return readBlobAt(record, sizeof(uint64_t), out.data(), record.nameLen);
 }
 
 bool LibraryIndexFile::readPathHash(const ClixRecord& record, uint64_t& out) {
@@ -191,7 +216,7 @@ bool LibraryIndexFile::readPathHash(const ClixRecord& record, uint64_t& out) {
     readFailed = true;
     return false;
   }
-  return readAt(head.nameStart + record.nameOff, &out, sizeof(out));
+  return readBlobAt(record, 0, &out, sizeof(out));
 }
 
 bool LibraryIndexFile::readBlobField(const ClixRecord& record, const uint8_t field, std::string& out) {
@@ -205,12 +230,12 @@ bool LibraryIndexFile::readBlobField(const ClixRecord& record, const uint8_t fie
   for (uint8_t i = 0; i <= field; i++) {
     if (at >= head.nameLen) return false;
     uint8_t len = 0;
-    if (!readAt(head.nameStart + at, &len, sizeof(len))) return false;
+    if (!readBlobAt(record, at - record.nameOff, &len, sizeof(len))) return false;
     ++at;
     if (len > head.nameLen - at) return false;
     if (i == field) {
       out.resize(len);
-      return len == 0 || readAt(head.nameStart + at, out.data(), len);
+      return len == 0 || readBlobAt(record, at - record.nameOff, out.data(), len);
     }
     at += len;
   }

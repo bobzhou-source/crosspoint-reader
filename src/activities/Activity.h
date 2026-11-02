@@ -33,6 +33,8 @@ class Activity {
   virtual void loop() {}
 
   virtual void render(RenderLock&&) {}
+  // Called under RenderLock before another activity covers this one.
+  virtual void onCovered() {}
 
   // If immediate is true, the update will be triggered immediately.
   // Otherwise, it will be deferred until the end of the current loop iteration.
@@ -47,9 +49,14 @@ class Activity {
   // transitions so no filesystem code races a raw SD-card owner.
   virtual bool requiresExclusiveStorageLoop() const { return false; }
   virtual bool isReaderActivity() const { return false; }
+  // Private automated workloads must not enable background sync or user controls.
+  virtual bool isBenchmarkActivity() const { return false; }
   // Returns true when the activity schedules its own forced refresh.
   virtual bool handleForcedRefresh() { return false; }
   virtual bool isHomeActivity() const { return false; }
+  // True only after this activity completed a normal first-screen display update.
+  // Error, placeholder and recovery screens must never certify a healthy boot.
+  virtual bool hasCompletedHealthyRender() const { return false; }
   virtual bool handleHomeGesture() { return false; }
   virtual ScreenshotInfo getScreenshotInfo() const { return {}; }
 

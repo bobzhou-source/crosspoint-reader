@@ -1214,7 +1214,7 @@ void XMLCALL ChapterHtmlSlimParser::startElement(void* userData, const XML_Char*
                 if (self->currentTextBlock && self->currentTextBlock->isEmpty()) {
                   BlockStyle resetStyle;
                   resetStyle.alignment = (self->paragraphAlignment == static_cast<uint8_t>(CssTextAlign::None))
-                                             ? CssTextAlign::Justify
+                                             ? CssTextAlign::Left
                                              : static_cast<CssTextAlign>(self->paragraphAlignment);
                   self->currentTextBlock->setBlockStyle(resetStyle);
                 }
@@ -2046,7 +2046,7 @@ bool ChapterHtmlSlimParser::beginParse() {
   // text-align inherit it correctly through getCombinedBlockStyle.
   BlockStyle rootBlockStyle;
   rootBlockStyle.alignment = (this->paragraphAlignment == static_cast<uint8_t>(CssTextAlign::None))
-                                 ? CssTextAlign::Justify
+                                 ? CssTextAlign::Left
                                  : static_cast<CssTextAlign>(this->paragraphAlignment);
   blockStyleStack.clear();
   blockStyleStack.reserve(8);

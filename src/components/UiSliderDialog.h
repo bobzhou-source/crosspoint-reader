@@ -8,14 +8,13 @@
 #include "components/UITheme.h"
 #include "components/UiAppHelpers.h"
 #include "components/UiAppHost.h"
-#include "fontIds.h"
 
 // Shared slider-dialog popup, drawn over the current screen (no clear) via
-// fui::optionDialog with the same chrome OptionPopup uses: title caption, a
-// large value readout as the headline, a full-width capsule slider with the
-// range endpoints above it, and a [-] [+] [Confirm] option-button row on
-// touch boards or two step-hint lines on button boards. Cancel is Back or a
-// tap outside the dialog. Used by the interval and percent selection
+// fui::optionDialog with the same flat chrome OptionPopup uses: title caption,
+// a prominent value readout, a full-width slider with its range endpoints,
+// and a [-] [+] [Confirm] row on touch boards or two step-hint lines on
+// button boards. Cancel is Back or a tap outside the dialog.
+// Used by the interval and percent selection
 // dialogs, which differ only in how they format the readout, endpoints, and
 // hints and what the actions do.
 struct UiSliderDialogSpec {
@@ -43,25 +42,14 @@ inline void buildSliderDialogScreen(UiAppHost::UiScreen& screen, freeink::ui::Gf
   const auto& metrics = UITheme::getInstance().getMetrics();
   const auto& theme = screen.theme();
 
-  // The readout is the dialog's hero: remap the title slot to the large sans
-  // so it reads at a glance.
-  uiTarget.setFont(fui::GfxRendererTarget::FONT_TITLE, NOTOSANS_18_FONT_ID);
-
   const bool touch = mappedInput.hasTouch();
-  // Touch boards get the finger-sized pill (same as the frontlight rows); on
-  // button boards the capsule is a read-only gauge driven by the keys, so a
-  // slim band is enough.
-  const int16_t bandHeight = touch ? 56 : 24;
-  const int16_t capLh = screen.target().lineHeight(theme.smallText.font);
+  const int16_t bandHeight = touch ? 48 : 24;
+  const int16_t capLh = uiTarget.lineHeight(theme.smallText.font);
   const int16_t sliderH = static_cast<int16_t>(capLh + theme.spaceMd + bandHeight);
   const int16_t hintsH = touch ? 0 : static_cast<int16_t>(capLh * 2 + theme.spaceSm + theme.spaceMd);
 
-  // Dialog chrome and slots, styled exactly like OptionPopup: bordered popup
-  // panel per theme frame metrics, body-font caption, [-] [+] [Confirm] as
-  // one bottom row of dialog buttons ("-"/"+" fire stepAction with -/+1, so
-  // the slider itself stays a bare capsule). Static because the props embed
-  // StyleSets, well past the 256-byte local stack budget; every field is
-  // reassigned each build.
+  // Reuse the theme's popup and button styles. Props contain two StyleSets,
+  // so keep them off the constrained render-task stack.
   fui::DialogOption options[3];
   options[0].label = "-";
   options[0].action = spec.stepAction;
@@ -71,6 +59,7 @@ inline void buildSliderDialogScreen(UiAppHost::UiScreen& screen, freeink::ui::Gf
   options[1].value = +1;
   options[2].label = tr(STR_CONFIRM);
   options[2].action = spec.okAction;
+  options[2].state = fui::StateSelected;
 
   static fui::OptionDialogProps props;
   props.title = spec.title;
@@ -79,17 +68,20 @@ inline void buildSliderDialogScreen(UiAppHost::UiScreen& screen, freeink::ui::Gf
   props.optionCount = touch ? 3 : 0;
   props.inputMask = fui::InputTouch;
   props.titleText = theme.smallText;
-  props.titleText.bold = true;
-  props.titleText.align = fui::TextAlign::Center;
+  props.titleText.bold = false;
+  props.titleText.align = UITheme::isRtl() ? fui::TextAlign::Right : fui::TextAlign::Left;
+  props.titleText.maxLines = 2;
   props.headlineText = theme.titleText;
-  props.headlineText.bold = true;
-  props.headlineText.align = fui::TextAlign::Center;
+  props.headlineText.bold = false;
+  props.headlineText.align = props.titleText.align;
+  props.headlineText.maxLines = 2;
   props.buttonText = theme.bodyText;
+  props.buttonText.maxLines = 2;
+  props.buttonStyles = theme.button;
   const int16_t innerPadding = static_cast<int16_t>(metrics.optionPopupInnerPadding);
   props.padding = fui::Insets{innerPadding, innerPadding, innerPadding, innerPadding};
   props.gap = static_cast<int16_t>(metrics.optionPopupItemSpacing);
-  // defaultPopupStyles() has no border, so opt in using the per-theme frame metrics.
-  props.styles = fui::defaultPopupStyles();
+  props.styles = theme.popup;
   props.styles.normal.border = fui::Paint::solid(fui::Color::Black);
   props.styles.normal.borderWidth = static_cast<uint8_t>(metrics.popupFrameThickness);
   props.styles.normal.radius = static_cast<uint8_t>(metrics.popupCornerRadius);
@@ -97,24 +89,45 @@ inline void buildSliderDialogScreen(UiAppHost::UiScreen& screen, freeink::ui::Gf
   props.styles.focused = props.styles.normal;
   props.styles.active = props.styles.normal;
   props.styles.disabled = props.styles.normal;
-  props.buttonHeight =
-      fui::clampI16(screen.target().lineHeight(theme.bodyText.font) + metrics.optionPopupSelectionVPadding * 2);
-  // Square -/+ buttons; Confirm flexes into the remaining row width so its
-  // label never truncates on large-font themes.
-  options[0].width = props.buttonHeight;
-  options[1].width = props.buttonHeight;
+  props.buttonHeight = fui::clampI16(std::max<int>(
+      48, screen.target().lineHeight(theme.bodyText.font) + metrics.optionPopupSelectionVPadding * 2));
+  options[0].width = 48;
+  options[1].width = 48;
 
-  // Reserve the slider band (and hint lines) as the dialog's content band;
-  // optionDialog returns its rect. Same width rule as OptionPopup.
   props.contentHeight = static_cast<int16_t>(sliderH + hintsH);
-  const fui::Rect screenRect = screen.frame().screen();
-  const int16_t width = fui::clampI16(
-      std::min<int>(screenRect.width * 3 / 4, screenRect.width - metrics.optionPopupDialogSideMargin * 2));
-  // Measured height minus one spaceMd: texts anchor to the top and the band/
-  // buttons to the bottom, so the trim comes out of the air between the
-  // readout and the slider band (which already carries its endpoints line).
-  const int16_t height =
-      fui::clampI16(fui::optionDialogHeight(screen.target(), props, width) - theme.spaceMd, 0, screenRect.height);
+  // Bezel-safe area intersected with the front-button hint strip, which
+  // follows the physical buttons: bottom in portrait, top inverted, logical
+  // left landscape CW, right CCW. Touch boards report no strip.
+  const Rect hints = UITheme::getInstance().getScreenSafeArea(mappedInput.getRenderer(), true, false);
+  const fui::Rect bezel = screen.frame().safeRect();
+  const int16_t usableLeft = static_cast<int16_t>(std::max<int>(bezel.x, hints.x));
+  const int16_t usableTop = static_cast<int16_t>(std::max<int>(bezel.y, hints.y));
+  const int16_t usableRight = static_cast<int16_t>(std::min<int>(bezel.right(), hints.x + hints.width));
+  const int16_t usableBottom = static_cast<int16_t>(std::min<int>(bezel.bottom(), hints.y + hints.height));
+  const fui::Rect screenRect = fui::Rect{usableLeft, usableTop, static_cast<int16_t>(usableRight - usableLeft),
+                                         static_cast<int16_t>(usableBottom - usableTop)}
+                                   .inset(fui::Insets{theme.spaceLg, 0, theme.spaceLg, 0});
+  const int16_t width = fui::clampI16(screenRect.width - 2 * std::max<int>(
+      theme.headerSidePadding, metrics.optionPopupDialogSideMargin));
+  const int16_t confirmWidth = static_cast<int16_t>(
+      width - 2 * innerPadding - options[0].width - options[1].width - 2 * props.gap - 8);
+  if (touch) {
+    props.buttonHeight = std::max<int16_t>(props.buttonHeight,
+        fui::measureWrappedText(screen.target(), options[2].label, props.buttonText, confirmWidth).height + 8);
+  }
+  int16_t height = fui::optionDialogHeight(screen.target(), props, width);
+  // Long translated captions yield lines before they can crowd a control.
+  while (height > screenRect.height) {
+    if (props.headlineText.maxLines > 1) {
+      --props.headlineText.maxLines;
+    } else if (props.titleText.maxLines > 1) {
+      --props.titleText.maxLines;
+    } else {
+      break;
+    }
+    height = fui::optionDialogHeight(screen.target(), props, width);
+  }
+  height = fui::clampI16(height, 0, screenRect.height);
   const fui::Rect dialog = fui::centeredRect(screenRect, fui::Size{width, height});
   // Chrome guard first, controls after: routing scans newest-first, so the
   // buttons and slider win inside the dialog and the guard absorbs the rest —
@@ -136,15 +149,14 @@ inline void buildSliderDialogScreen(UiAppHost::UiScreen& screen, freeink::ui::Gf
     }
   }
 
-  // The slider at the top of the content band: the range endpoints on a small
-  // caption line, then a full-width capsule (no step buttons of its own — the
-  // dialog's [-]/[+] cover exact values). Drag/tap sends dragPermille.
-  const fui::Rect caption{band.x, band.y, band.width, capLh};
+  // Endpoints occupy separate lanes above the full-height drag target.
+  const fui::Rect caption{band.x, band.y, static_cast<int16_t>((band.width - theme.spaceMd) / 2), capLh};
   fui::TextStyle endpoint = theme.smallText;
   if (spec.minLabel) screen.target().text(caption, spec.minLabel, endpoint);
   if (spec.maxLabel) {
     endpoint.align = fui::TextAlign::Right;
-    screen.target().text(caption, spec.maxLabel, endpoint);
+    screen.target().text(fui::Rect{static_cast<int16_t>(band.right() - caption.width), caption.y,
+                                   caption.width, caption.height}, spec.maxLabel, endpoint);
   }
 
   fui::CapsuleSliderProps capsule;
@@ -152,6 +164,7 @@ inline void buildSliderDialogScreen(UiAppHost::UiScreen& screen, freeink::ui::Gf
   capsule.max = spec.max;
   capsule.action = spec.sliderAction;
   capsule.radius = theme.capsuleRadius;
+  capsule.stroke = 1;
   fui::capsuleSlider(screen.frame(),
                      fui::Rect{band.x, static_cast<int16_t>(band.y + capLh + theme.spaceMd), band.width, bandHeight},
                      capsule);

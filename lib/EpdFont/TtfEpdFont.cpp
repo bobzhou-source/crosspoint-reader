@@ -246,6 +246,7 @@ void TtfEpdFont::flushFace(Face& f) {
   f.kernKeys.clear();
   f.kernVals.clear();
   f.used = 0;
+  f.degraded = false;
 }
 
 void TtfEpdFont::clearCache() {
@@ -297,14 +298,17 @@ const EpdGlyph* TtfEpdFont::faultGlyph(Face& f, const uint32_t cp) {
   if (gid == 0 && cp >= 0xFB00u && cp <= 0xFB04u) gid = f.ligGid[cp - 0xFB00u];
   if (gid == 0) return nullptr;
 
-  // Glyph-ID render at the exact fractional ppem. The metrics pass costs a
-  // second glyph load per MISS only (hits come from the cache) and yields the
-  // 26.6 advance, which the 12.4 EpdGlyph.advanceX preserves for the
-  // renderer's differential rounding — GlyphBitmap.advance is whole pixels.
+  // Glyph-ID render at the exact fractional ppem: ONE glyph load per MISS (hits
+  // come from the cache). The same load reports the unhinted 26.6 advance, which
+  // the 12.4 EpdGlyph.advanceX preserves for the renderer's differential
+  // rounding — GlyphBitmap.advance is whole pixels. The advance is reported even
+  // when the render step fails after a successful load, so layout survives a
+  // glyph whose bitmap is lost.
   const uint32_t size26_6 = f.owner->size26_6_;
-  freeink::font::FtFont::GlyphMetrics gm;
-  const bool haveMetrics = f.ft.metricsGlyph26_6(gid, size26_6, gm);
-  const freeink::font::GlyphBitmap* g = f.ft.rasterizeGlyph26_6(gid, size26_6);
+  constexpr int32_t kNoAdvance = INT32_MIN;
+  int32_t linearAdvance26_6 = kNoAdvance;
+  const freeink::font::GlyphBitmap* g = f.ft.rasterizeGlyph26_6(gid, size26_6, &linearAdvance26_6);
+  const bool haveAdvance = linearAdvance26_6 != kNoAdvance;
   uint32_t px = (g && g->pixels) ? static_cast<uint32_t>(g->width) * g->height : 0;
   size_t bytes = px ? (f.twoBit ? (px + 3) / 4 : (px + 7) / 8) : 0;
   if (bytes > f.cap) {
@@ -334,16 +338,21 @@ const EpdGlyph* TtfEpdFont::faultGlyph(Face& f, const uint32_t cp) {
     evictOthers();
     if (!growTables()) return nullptr;
   }
+  // A bitmap lost to a failure (glyph load/render above, arena grow here) leaves
+  // an advance-only entry a retry may fix; the face is marked so the next prewarm
+  // retries it. A glyph that can never fit (bytes > cap above) is not a failure.
+  bool lostBitmap = g == nullptr;
   if (px && !reserveChecked(f.bmp, f.used + bytes, 4096, f.cap)) {
     evictOthers();
     if (!reserveChecked(f.bmp, f.used + bytes, 4096, f.cap)) {
       bytes = 0;
       px = 0;
+      lostBitmap = true;
     }
   }
 
   EpdGlyph eg{};
-  const int32_t adv12_4 = haveMetrics ? (gm.advance26_6 + 2) >> 2 : (g ? g->advance << 4 : 0);
+  const int32_t adv12_4 = haveAdvance ? (linearAdvance26_6 + 2) >> 2 : (g ? g->advance << 4 : 0);
   eg.advanceX = static_cast<uint16_t>(adv12_4 < 0 ? 0 : adv12_4);
   if (px && g && g->pixels) {
     // Grow the byte arena on demand toward the book's page high-water mark.
@@ -382,6 +391,7 @@ const EpdGlyph* TtfEpdFont::faultGlyph(Face& f, const uint32_t cp) {
     eg.dataLength = 0;
   }
 
+  if (lostBitmap) f.degraded = true;
   f.glyphs.push_back(eg);
   const uint16_t newIdx = static_cast<uint16_t>(f.glyphs.size() - 1);
   const auto it = std::lower_bound(f.cps.begin(), f.cps.end(), cp);
@@ -461,6 +471,13 @@ bool TtfEpdFont::build(const char* utf8) {
 }
 bool TtfEpdFont::addCoverage(const char* utf8) {
   if (!loaded_ || utf8 == nullptr) return false;
+  // Render prewarm is the retry point for glyphs that lost their bitmap to a
+  // failure (see Face::degraded): rebuild just those faces so the glyph is
+  // faulted again, instead of leaving it blank until the cache next fills. Healthy
+  // faces keep everything they have.
+  for (Face& f : faces_) {
+    if (f.degraded) flushFace(f);
+  }
   const auto* p = reinterpret_cast<const unsigned char*>(utf8);
   while (*p != '\0') faultGlyph(faces_[0], utf8NextCodepoint(&p));
   return true;

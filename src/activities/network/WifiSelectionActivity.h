@@ -6,13 +6,13 @@
 #include <string>
 #include <vector>
 
+#include "WifiCredentialStore.h"
 #include "activities/Activity.h"
 #include "components/UiAppHost.h"
 #include "util/ButtonNavigator.h"
 
 struct Rect;
 struct ThemeMetrics;
-struct WifiCredential;
 
 // Structure to hold WiFi network information
 struct WifiNetworkInfo {
@@ -21,6 +21,8 @@ struct WifiNetworkInfo {
   bool isEncrypted;
   bool hasSavedPassword;             // Whether we have saved credentials for this network
   bool isHiddenPlaceholder = false;  // Synthetic "Add hidden network..." list entry
+  bool enterprise = false;
+  bool peapSupported = true;
 };
 
 // WiFi selection states
@@ -30,8 +32,11 @@ enum class WifiSelectionState {
   NETWORK_LIST,       // Displaying available networks
   HIDDEN_SSID_ENTRY,  // Entering SSID for a hidden network
   PASSWORD_ENTRY,     // Entering password for selected network
+  IDENTITY_ENTRY,
+  VALIDATION_PROMPT,
+  DOMAIN_ENTRY,
+  CA_ENTRY,
   CONNECTING,         // Attempting to connect
-  CONNECTED,          // Successfully connected
   SAVE_PROMPT,        // Asking user if they want to save the password
   CONNECTION_FAILED,  // Connection failed
   FORGET_PROMPT       // Asking user if they want to forget the network
@@ -74,7 +79,7 @@ class WifiSelectionActivity final : public Activity, private UiAppHost {
   std::string connectionError;
 
   // Password to potentially save (from keyboard or saved credentials)
-  std::string enteredPassword;
+  WifiCredential selectedCredential;
 
   // Cached MAC address string for display
   std::string cachedMacAddress;
@@ -84,6 +89,7 @@ class WifiSelectionActivity final : public Activity, private UiAppHost {
 
   // Whether to attempt auto-connect on entry
   const bool allowAutoConnect;
+  const bool keepConnection;
 
   // Whether we are attempting to auto-connect or auto-scan saved networks.
   bool autoConnecting = false;
@@ -119,9 +125,8 @@ class WifiSelectionActivity final : public Activity, private UiAppHost {
 
   void renderNetworkList(const Rect* screen, const ThemeMetrics* metrics);
   void renderPasswordEntry(const Rect* screen, const ThemeMetrics* metrics) const;
-  void renderConnecting(const Rect* screen, const ThemeMetrics* metrics) const;
-  void renderConnected(const Rect* screen, const ThemeMetrics* metrics) const;
-  void renderConnectionFailed(const Rect* screen, const ThemeMetrics* metrics) const;
+  void renderConnecting(const ThemeMetrics* metrics) const;
+  void renderConnectionFailed() const;
 
   void startWifiScan(bool autoScan = false);
   void processWifiScanResults();
@@ -129,6 +134,10 @@ class WifiSelectionActivity final : public Activity, private UiAppHost {
   void selectNetwork(int index);
   void promptHiddenSsid();
   void promptPasswordEntry();
+  void promptIdentityEntry();
+  void chooseValidation(int choice);
+  void promptDomainEntry();
+  void promptCaEntry();
   void attemptConnection();
   void checkConnectionStatus();
   bool tryAutoConnectCredential(const WifiCredential& cred);
@@ -141,7 +150,8 @@ class WifiSelectionActivity final : public Activity, private UiAppHost {
   void onComplete(bool connected);
 
  public:
-  explicit WifiSelectionActivity(GfxRenderer& renderer, MappedInputManager& mappedInput, bool autoConnect = true);
+  explicit WifiSelectionActivity(GfxRenderer& renderer, MappedInputManager& mappedInput, bool autoConnect = true,
+                                 bool keepConnection = true);
   void onEnter() override;
   void onExit() override;
   void loop() override;

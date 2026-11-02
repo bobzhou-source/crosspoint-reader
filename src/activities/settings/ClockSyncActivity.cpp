@@ -6,6 +6,7 @@
 #include <Logging.h>
 #include <WiFi.h>
 
+#include <algorithm>
 #include <cstdio>
 
 #include "CrossPointSettings.h"
@@ -103,37 +104,45 @@ void ClockSyncActivity::loop() {
 void ClockSyncActivity::render(RenderLock&&) {
   const auto& metrics = UITheme::getInstance().getMetrics();
   const auto pageWidth = renderer.getScreenWidth();
-  const auto pageHeight = renderer.getScreenHeight();
 
   renderer.clearScreen();
 
   GUI.drawHeader(renderer, Rect{0, metrics.topPadding, pageWidth, metrics.headerHeight}, tr(STR_CLOCK_SYNC));
 
-  const int midY = pageHeight / 2;
+  const Rect body = UITheme::getContentBounds(renderer);
+  const Rect title{body.x, body.y, body.width, body.height / 2 - 8};
+  const Rect detail{body.x, body.y + body.height / 2 + 8, body.width, body.height / 2 - 8};
 
   switch (state) {
     case SYNCING:
-      renderer.drawCenteredText(UI_12_FONT_ID, midY, tr(STR_CLOCK_SYNCING));
+      UITheme::drawCenteredWrappedText(renderer, body, UI_12_FONT_ID, tr(STR_CLOCK_SYNCING), 8);
       break;
     case SUCCESS: {
-      renderer.drawCenteredText(UI_12_FONT_ID, midY - 20, tr(STR_CLOCK_SYNC_OK), true, EpdFontFamily::BOLD);
+      UITheme::drawCenteredWrappedText(renderer, title, UI_12_FONT_ID, tr(STR_CLOCK_SYNC_OK), 4, true,
+                                       EpdFontFamily::BOLD, UITheme::TextVerticalAlignment::BOTTOM);
       if (syncedTime[0] != '\0') {
-        // Sized for the label in any language: STR_CURRENT_TIME is 26 bytes in
-        // Russian (UTF-8 Cyrillic is 2 bytes per letter) versus 13 in English,
-        // plus a separator and up to "08:56 PM".
-        char line[64];
-        snprintf(line, sizeof(line), "%s %s", tr(STR_CURRENT_TIME), syncedTime);
-        renderer.drawCenteredText(UI_10_FONT_ID, midY + 10, line);
+        // Keep translated labels separate from the bounded ASCII clock value.
+        const int labelHeight = std::min(detail.height / 2, 2 * renderer.getLineHeight(UI_10_FONT_ID));
+        UITheme::drawCenteredWrappedText(renderer, Rect{detail.x, detail.y, detail.width, labelHeight},
+                                         UI_10_FONT_ID, tr(STR_CURRENT_TIME), 2, true,
+                                         EpdFontFamily::REGULAR, UITheme::TextVerticalAlignment::TOP);
+        UITheme::drawCenteredWrappedText(renderer,
+            Rect{detail.x, detail.y + labelHeight + 8, detail.width, detail.height - labelHeight - 8},
+            UI_10_FONT_ID, syncedTime, 2, true, EpdFontFamily::REGULAR, UITheme::TextVerticalAlignment::TOP);
       }
       break;
     }
     case NO_WIFI:
-      renderer.drawCenteredText(UI_12_FONT_ID, midY - 20, tr(STR_CLOCK_SYNC_NO_WIFI), true, EpdFontFamily::BOLD);
-      renderer.drawCenteredText(UI_10_FONT_ID, midY + 10, tr(STR_CLOCK_SYNC_NO_WIFI_HINT));
+      UITheme::drawCenteredWrappedText(renderer, title, UI_12_FONT_ID, tr(STR_CLOCK_SYNC_NO_WIFI), 4, true,
+                                       EpdFontFamily::BOLD, UITheme::TextVerticalAlignment::BOTTOM);
+      UITheme::drawCenteredWrappedText(renderer, detail, UI_10_FONT_ID, tr(STR_CLOCK_SYNC_NO_WIFI_HINT), 6, true,
+                                       EpdFontFamily::REGULAR, UITheme::TextVerticalAlignment::TOP);
       break;
     case FAILED:
-      renderer.drawCenteredText(UI_12_FONT_ID, midY - 20, tr(STR_CLOCK_SYNC_FAIL), true, EpdFontFamily::BOLD);
-      renderer.drawCenteredText(UI_10_FONT_ID, midY + 10, tr(STR_CHECK_SERIAL_OUTPUT));
+      UITheme::drawCenteredWrappedText(renderer, title, UI_12_FONT_ID, tr(STR_CLOCK_SYNC_FAIL), 4, true,
+                                       EpdFontFamily::BOLD, UITheme::TextVerticalAlignment::BOTTOM);
+      UITheme::drawCenteredWrappedText(renderer, detail, UI_10_FONT_ID, tr(STR_CHECK_SERIAL_OUTPUT), 6, true,
+                                       EpdFontFamily::REGULAR, UITheme::TextVerticalAlignment::TOP);
       break;
   }
 

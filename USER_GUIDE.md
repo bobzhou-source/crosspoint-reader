@@ -124,10 +124,9 @@ The Browse Files screen acts as a file and folder browser. The full path to the 
 
 ### 3.4 Library Screen
 
-The Library indexes up to 4,096 supported books on the SD card and shows their titles and authors without requiring you to remember their folders. Its four tabs provide different views. An arrow beside an indexed tab shows the sort direction:
+The Library indexes up to 4,096 supported books on the SD card and shows their titles and authors without requiring you to remember their folders. Its three tabs provide different views. An arrow beside the active tab shows the sort direction:
 
-- **Recent** lists the ten books you opened most recently. Hold a book to remove it from this list.
-- **Added** keeps books in the order in which the Library first discovered them. Down shows newest additions first; up shows oldest first.
+- **Recent** pins the ten books you opened most recently above books sorted by file modification time, newest first. Reverse the direction for oldest first without the pinned overlay. Hold a book for Open, Remove from recents (when pinned), Delete, or Rebuild.
 - **Title** groups books by the first letter of the title. Up sorts A-Z and down sorts Z-A. Titles beginning with numbers or punctuation appear under `#`; letters from non-English scripts, including Hebrew, have their own groups.
 - **Author** groups books by author. Up sorts A-Z and down sorts Z-A.
 
@@ -136,12 +135,14 @@ On a button-only device:
 - Use **Up/Down** or **Left/Right** to move one row at a time. Hold a direction to move a page at a time.
 - Press **Confirm** to open the selected book.
 - Press **Back** from the book list to focus the tabs. Use **Left/Right** to select another tab, press **Confirm** to reverse its sort direction, or press **Down** to return to the list.
-- While the tabs are focused, hold **Confirm** to open Search.
+- While the tabs are focused, use **Left** to open Search, or hold **Confirm** to reverse the sort direction.
 - In the Title or Author views, hold **Confirm** on a book to collapse the list to its letter or author groups. The matching group remains selected. Press **Confirm** to enter a group, or **Back** to restore the exact book and position you came from.
 
-On a touch device, tap tabs, books, and the Search icon directly. Tap an active indexed tab again to reverse its sort direction. Swipe to scroll. Long-press a book in the Recent view to remove it from the list. Long-press a book in a Title or Author view to collapse to the group list, then tap a group to expand it. The **Added** view is not grouped; tapping or long-pressing a book opens it.
+On a touch device, tap tabs, books, and the Search icon directly. Tap the active tab again to reverse its sort direction. Swipe to scroll. Long-press a book in Recent to open its options. Long-press a book in Title or Author to collapse to the group list, then tap a group to expand it.
 
-The index is created automatically the first time the Library is opened. To pick up later file changes or updated metadata, use **Settings → System → Rebuild library index**. The **Use book metadata** setting controls whether the index reads titles and authors stored inside books.
+The index is created automatically the first time Library opens. Later transfers mark it for refresh. Your existing shelf stays available while new or changed books are indexed in the background; the bottom readout shows progress. You can navigate and open existing books during the refresh. Leaving Library pauses the build after the current metadata operation; completed metadata is saved and reused when you return, including after a restart. The new shelf replaces the old one only when complete. On a first build, Browse Files remains available without waiting for an index.
+
+Use the Library refresh icon or the Recent row's **Rebuild** action to check for file changes. **Use book metadata** controls whether titles and authors are read from EPUB metadata. Unchanged books reuse indexed metadata; metadata indexing does not generate covers.
 
 ### 3.5 File Transfer Screen
 
@@ -254,7 +255,11 @@ The Settings screen allows you to configure the device's behavior. There are a f
   - "In Reader" - Show battery percentage everywhere except in reading mode
   - "Always" - Always hide battery percentage
 
-- **Refresh Frequency**: Set how often the screen does a full refresh while reading to reduce ghosting; options are every 1, 5, 10, 15, or 30 pages.
+- **Automatic screen clearing**: Reading pages choose a clearing refresh from accumulated content change instead of a fixed page interval. Each page is charged a conservative estimate of changed pixels from its ink density and the previous page's, weighted up for visible images and grayscale; the shipping firmware does not keep an exact copy of the previous frame, so this is always an estimate, never a pixel-by-pixel comparison. Initial pages, manual refreshes and required image/popup cleanup still use a clearing refresh, and a safety ceiling bounds long runs of fast refreshes; pages are not cleared every turn. The thresholds are engineering estimates, not a physical ghosting sensor or panel calibration; the manual **Refresh** action remains available. Older saved refresh-frequency values are retired without changing unrelated preferences.
+
+- **Night mode**: Uses a dark reading background and a dark boot splash. **Dark menus with night mode** is on by default: Home, Library, Settings, dialogs and update screens follow night mode. Turn it off for light menus while keeping reading pages dark; overlays drawn directly on a reading page retain that page's polarity.
+
+  Clearing refreshes keep the requested dark content. Manual refresh and adaptive ghost cleanup still use the controller's clean waveform. Its physical intermediate flashes can remain visible, even with a black final image; night mode does not disable ghost cleanup or promise a flash-free panel.
 
 - **UI Theme**: Set which UI theme to use:
   
@@ -280,9 +285,9 @@ The Settings screen allows you to configure the device's behavior. There are a f
 
 - **Reader Line Spacing**: Adjust the spacing between lines; options are "Tight", "Normal" (default), or "Wide".
 
-- **Reader Screen Margin**: Controls the screen margins in Reading Mode between 5 and 40 pixels in 5-pixel increments.
+- **Reader Screen Margin**: **Auto** uses 20 pixels in portrait and 16 pixels in landscape. You can instead choose a fixed margin between 5 and 40 pixels in 5-pixel increments; existing fixed-margin settings are preserved.
 
-- **Reader Paragraph Alignment**: Set the alignment of paragraphs; options are "Justified" (default), "Left", "Center", or "Right".
+- **Reader Paragraph Alignment**: **Book style** (the default for new settings) follows the book's explicit alignment and otherwise uses left alignment. You can also choose **Justify**, **Left**, **Center**, or **Right**.
 
 - **Embedded Style**: Whether to use the EPUB file's embedded HTML and CSS stylisation and formatting; options are "ON" or "OFF".
 
@@ -400,6 +405,25 @@ Behavior notes:
 - Passwords are never shown back in the web UI after saving.
 - Leaving Password blank while editing keeps the existing saved password unchanged.
 - The web UI can save hidden-network SSIDs, but connecting to hidden networks still depends on the device-side Wi-Fi connection flow.
+- Enterprise entries are listed/deletable in the web UI, but editing or overwriting them with PSK fields is refused. On the reader, forget and reconnect to change an enterprise login.
+
+**Enterprise Wi-Fi (PEAP / MSCHAPv2).** Scan rows marked **Enterprise** support username/password networks, including WPA2/WPA3-Enterprise (not certificate-only Suite-B 192). Select the network, enter **Identity (username / email)**, then the password (masked). Saved enterprise entries work in every network activity and in background Reader sync. The X4 Pro radio is **2.4 GHz only**.
+
+For **Colby Access**:
+
+1. Obtain the current RADIUS CA from Colby ITS or the verified CA export supplied with the firmware. Copy it to `/.crosspoint/wifi-ca/colby.pem` on the SD card. This is a public certificate, not a password.
+2. Ensure the reader clock is correct, using another working network to sync the clock first if needed. Certificate validity dates are checked.
+3. Open **Settings → System → Wi-Fi Networks**, select **Colby Access**, enter your full Colby email as Identity, then your Colby password. Do not send these credentials to anyone.
+4. Prefer **Validate server (SD CA)**. Accept the preset certificate server name `clearpass.colby.edu` and CA path `/.crosspoint/wifi-ca/colby.pem`. This exact server name was observed in Colby's EAP certificate; the IDF API checks a hostname, not a domain suffix, so `colby.edu` alone is not equivalent.
+5. After connecting, choose **Yes** to save. The SD store `/.crosspoint/wifi.json` keeps identity and validation settings plus a MAC-XOR/base64-obfuscated password. This is **not encryption**: possession of the card/device can expose the login.
+
+If ITS changes the RADIUS server or CA, obtain the new trusted settings rather than bypassing a validation failure. Missing/unreadable CA files, an incorrect hostname, an expired/untrusted certificate or a wrong clock fail closed. **Don't validate (unsafe)** is an explicit alternative; it disables server authentication. An evil-twin access point using the same SSID can then capture an MSCHAPv2 exchange and attack your college password. HTTPS validation for Reader sync remains enabled, but does not protect this earlier Wi-Fi login.
+
+Advanced SD settings: the additive `enterpriseCredentials` array uses `type: "enterprise"`, `eap: "PEAP"`, `phase2: "MSCHAPv2"`, `ssid`, `identity`, optional `anonymous_identity`, `ca_path`, `domain` (exact certificate hostname), and `validation: "ca"` or explicitly `"none"`. Missing validation defaults to `"ca"`. Password storage uses the same `password_obf`, `password_len`, `password_crc32` fields as PSK entries; legacy plaintext imports are upgraded. Existing PSK/open entries stay in the unchanged `credentials` array, so old firmware still reads them. Old firmware cannot use enterprise entries and may discard that new array when it rewrites the file; back up the card before downgrading. At most eight saved networks total are retained.
+
+**Connection diagnostics.** Failed attempts now distinguish network-not-found, rejection, security-handshake timeout, 802.1X rejection and an associated network that did not supply a DHCP address. Both the picker and Reader sync append one nonsecret record per attempt to `/.crosspoint/wifi-log.txt` (8 KiB, with one rotated `wifi-log.1.txt`). Records include SSID, raw ESP-IDF disconnect reason, BSSID, RSSI, channel, numeric authmode, association/IP flags and duration; unavailable channel/auth/RSSI remain `0/-1/0`, not fabricated scan data. Identities/passwords are never logged. For an open MAC-registered network such as **Colby Guest Access**, register the **MAC address displayed on the Wi-Fi screen** and use these diagnostics to distinguish association rejection from DHCP failure. A successful IP lease does not prove ClearPass authorization, captive-portal completion or internet access. The private log is not exposed through file transfer; retrieve it through USB/SD access.
+
+After leaving a settings-only Wi-Fi picker, the station is stopped even when Home or sleep bypasses the result callback. This releases it for **Reader sync → Sync now**; the worker never takes over a live foreground transfer. Open networks also offer **Save network for next time?**, which is necessary for later unattended sync. The sync status explains a blocked request (Wi-Fi in use, foreground activity/book opening, return Home, next wake/event, no saved Wi-Fi, or retry backoff in minutes) rather than showing only “Configured; waiting.” “No saved Wi-Fi” means no stored credential, not evidence that a scan found nothing. An offline attempt is reported separately; consult `wifi-log.txt` for its actual failure.
 
 #### 3.6.7 KOReader Sync Quick Setup
 
@@ -545,6 +569,8 @@ The **Sleep Screen** setting controls what is displayed when the device goes to 
 | **Transparent**    | A BMP or PNG overlay drawn over the current screen. Supports PNG and 32-bit BGRA alpha transparency, and treats white as transparent in regular BMPs. Falls back to **Dark** if no valid overlay image is found. |
 | **None**           | A blank screen.                                                                                                              |
 
+With **Night mode** on, the built-in logo is dark even if **Light** is selected, and **None** is black. The entering-sleep popup keeps the current page's polarity, and Quick resume retains the page. Custom images, covers and transparent overlays keep their own colors and the explicitly selected cover filter; night mode does not automatically invert user artwork. Wake keeps the retained image until useful content is ready.
+
 #### Cover settings
 
 When using **Cover** or **Cover + Custom**, two additional settings apply:
@@ -600,6 +626,8 @@ See [docs/sd-card-fonts.md](./docs/sd-card-fonts.md) for full installation detai
 
 Once you have opened a book, the button layout changes to facilitate reading.
 
+For EPUBs that group several chapters in one section, the chapter-title footer and **Contents → Current** follow the latest chapter anchor at or before the displayed page, including fragment jumps and page turns across chapter boundaries. Large EPUB metadata tables use external RAM when available; boards without it retain small internal-memory blocks, and allocation failures stop indexing rather than spilling external tables into internal RAM.
+
 ### Page Turning
 
 | Action            | Buttons                              |
@@ -617,6 +645,16 @@ If the **Short Power Button Click** setting is set to "Page Turn", you can also 
 * **Previous Chapter:** Press and **hold** the **Left** (or **Side Up**) button briefly, then release.
 
 This feature can be disabled in the **[Controls Settings](#363-controls)** to help avoid changing chapters by mistake.
+
+### Plain-text books (TXT)
+
+TXT books show the first page before the full page index is built. Indexing continues in the background while reading and pauses whenever a button or the touchscreen is in use, so page turns are not held up by it; on X4 Pro, pending GT911 touch frames also interrupt indexing before the normal touch poll runs. A `~` before the page count marks an estimate. Predominantly Chinese text uses a two-character first-line indent, hides blank paragraph separators, and avoids prohibited punctuation at line starts.
+
+On X4 Pro, navigation-button contacts are captured independently of the reader loop, including while TXT indexing or EPUB idle prerendering is busy. A captured click is delivered once if it ended before the normal button poll; held buttons retain normal debounce and mapping. Power-button hold and wake behaviour are unchanged.
+
+Press **Confirm** or tap the reading menu area for **Contents**, **Go to page**, **Go to percent**, frontlight, and refresh. Contents lists chapters found so far and marks the current one. While indexing, Go to page accepts the estimated range: selecting a page beyond the indexed portion builds up to it behind an **Indexing** progress popup. If the estimate exceeds the actual book length, the jump stops at the last page. Go to percent can open a nearby paragraph immediately without indexing the whole book; stepping back from an unindexed position may show the progress popup.
+
+Sleep or leaving the book saves the partial index and byte position. Reopening resumes the same text and continues indexing; completed indexes are reused. Positions saved by older page-number-only firmware are translated through its saved index when available.
 
 ### Auto Page Turn
 
@@ -660,6 +698,12 @@ Original files must remain at their saved paths. Renaming/moving a source change
 
 Words on the current page can be looked up in an offline StarDict dictionary stored on the SD card. Copy a dictionary to the `/dictionaries/` folder, select it in **Settings → Reader → Dictionary**, then start a lookup by choosing **Look Up** in the **[Reader Menu](#5-reader-menu)** (or by holding **Confirm**, if the **Long-press Menu** setting in **[Controls Settings](#363-controls)** is set to "Dictionary"). Use **Left/Right** to highlight a word and press **Confirm** to show its definition.
 
+For Chinese novels, install the **CC-CEDICT Chinese-English** folder and select `cedict` in the Dictionary setting. In Look Up mode, tap the **first character** of a word (or move the highlight with the direction buttons and press Confirm). The reader checks up to **eight consecutive CJK characters** and opens the longest exact dictionary match. The definition begins with the matched Chinese headword, tone-mark pinyin and English glosses. Tap **Shorter / Longer** at the top of the definition, or press the side **Up / Down** buttons, to move between available matching lengths. Definition paging and Back work as before.
+
+Matching stops at punctuation, non-CJK text and the **end of the visible line**; it does not join a word split across two lines or pages. Choose a different layout/font size if that word is split. Both simplified and traditional headwords are indexed. English lookup keeps its existing exact-match, synonym and stemming behavior; select an English dictionary when reading English. No dictionary index is loaded into RAM. The first lookup creates the usual small on-card `.qidx` sidecar.
+
+Generate the redistributable dictionary with `python3 companion/scripts/build_cedict.py OUTPUT/cedict` (see the companion README). Copy the whole `cedict` folder into `/dictionaries/`, including `LICENSE.txt` and `ATTRIBUTION.txt`. CC-CEDICT and this converted database are licensed **CC BY-SA 4.0**.
+
 See [docs/dictionary.md](docs/dictionary.md) for supported formats, setup, and where to find dictionaries.
 
 ### System Navigation
@@ -688,6 +732,7 @@ Press **Confirm** while reading to open the Reader Menu. From here you can acces
 Available options include:
 
 - **Select Chapter** – Open the table of contents to jump to a specific chapter (see [Chapter Selection](#51-chapter-selection) below).
+- **Reading stats** – Active reading time, pages, sessions, average pace and estimated time left for this book; available in EPUB, TXT and XTC menus.
 - **Footnotes** – Navigate to the footnotes for the current section *(only shown in books that contain footnotes)*.
 - **Look Up** – Select a word on the current page and show its dictionary definition (see [docs/dictionary.md](docs/dictionary.md)). Requires a dictionary to be selected in **Settings → Reader → Dictionary**.
 - **Reading Orientation** – Cycle through screen orientations without leaving the reader.
@@ -721,6 +766,20 @@ To open bookmarks, press **Confirm** while inside a book. Then navigate to the *
 
 Bookmarks are stored in the `.crosspoint/bookmarks` folder in the JSON format.
 
+### 5.3 Reading statistics
+
+Open **Reader menu → Reading stats** for the current book, or **Settings → System → Reading stats** for today's total, the last 7 and 30 local-calendar days, and the ten most-read books by all-time active time. The book screen also links to **Reading overview**. Durations use `hours:minutes:seconds`.
+
+Time starts after the first page has rendered. Only the foreground, awake reader earns time, and credit stops five minutes after the last button or touch input. Another input resumes credit without backfilling the idle interval. Opening menus, dictionaries or the light panel pauses credit. Returning to the reader continues the same session; reopening a book or waking into it starts a new session. Automatic benchmark fixtures do not contribute.
+
+Pages count completed changes of displayed page, in either direction; a chapter/percentage jump counts as one displayed-page change, not every skipped page. Progress advanced sums forward movement in hundredths of a percent (EPUB content-position estimate, TXT byte-position estimate, XTC page position). It is not a count of characters read; rereading and jumps can exceed 100%. Average pace uses active time per page change. Time left uses active time divided by forward progress and is unavailable until at least one minute and some forward progress have been recorded. It is an estimate, especially after jumps, rereading or layout changes.
+
+First/last dates and daily buckets use the configured local clock. If it is unavailable or unset, book totals still accumulate, dates show `--`, and the overview asks you to set the clock; undated time is not retroactively assigned to a day. Renaming or moving a book starts a separate record because identity is its full SD path.
+
+Statistics live privately under `/.crosspoint/reading-stats/`: one small book record per path plus a fixed-size daily/top-books summary. Version 1 records have a checksum and two alternating generations; each new generation is written and synced to a temporary file, then renamed. Startup chooses the newest valid generation, falls back to the previous one after corruption/interruption, or starts empty if both are invalid. The format is independent of rebuildable book-layout caches.
+
+There are no statistics writes on individual page turns. Dirty totals are checkpointed every three minutes and on covering/leaving the reader, including sleep. Continuous active reading therefore makes at most **20 periodic checkpoints / 40 logical record commits per hour**, plus lifecycle checkpoints (two record commits each). Filesystem metadata and SD-controller physical writes are additional, not measured by that count. An interrupted save can lose up to the checkpoint interval; book and summary records are independently recoverable, so their latest totals can differ by one checkpoint after interruption. A failed save is logged and retried at the next checkpoint rather than every loop.
+
 ## 6. Current Limitations & Roadmap
 
 Please note that this firmware is currently in active development. The following features are **not yet supported** but are planned for future updates:
@@ -735,6 +794,84 @@ Please note that this firmware is currently in active development. The following
 If an issue or crash is encountered while using Crosspoint, feel free to raise an issue ticket and attach the logs.
 
 **Crash reports on SD card:** After a crash, CrossPoint automatically saves a crash report to the SD card (no USB connection needed). Check the root of the SD card for a crash log file and include it with any bug report.
+
+### Benchmark and normal-use recording
+
+Open **Settings → System → Benchmark**. No serial connection, marker file, copied test book, or manual page-turn checklist is needed. Recording is off by default and independent of the firmware's serial log level.
+
+- **Run benchmark** prepares built-in EPUB, TXT and BMP fixtures in the private `/.crosspoint/benchmark/fixtures-v1/` directory, resets only those EPUB/TXT caches, and opens the actual readers. It completes **10 EPUB forward turns**, reopens the EPUB with warm caches for **3 more turns**, completes **5 TXT forward turns**, and paints the BMP. Each turn waits for a newly completed, advanced page followed by about two seconds of visible dwell; indexing and error screens do not count. Each reading open starts at the beginning rather than loading fixture progress.
+- The screen returns to the Benchmark menu with the outcome, actual completed counts and a unique `/Benchmark/logs/session-….jsonl` path. **Finished; result saved** appears only after the workload and log footer/sync/close all succeed. A failed or cancelled run is not a successful benchmark. **Not finalized** means that the file may contain useful preceding rows but must not be treated as a complete result.
+- **Back, Home or power** cancels the run; Home leaves the menu, and normal manual sleep still works. If indexing or a render is already in progress, cancellation is remembered but navigation waits for that work to finish; no further automatic page turns are issued. Automatic sleep is inhibited during the run. A missing completed page times out after two minutes; a loading/render failure, lack of forward progress, fixture conflict, or recorder error is reported instead of advancing the workload. A conflicting private fixture is never overwritten. If the selected reader font is not loaded, the test reports that before preparing files or starting a session; it does not silently benchmark a built-in fallback or rewrite your font preference.
+- **Record normal use: On/Off** is persisted and starts/stops recording immediately, including without a reboot. This control is owned by the on-device Benchmark submenu and is not exposed or editable through the web settings API. When On, later boots/wakes also start a fresh normal session. The recording subtitle shows whether a session is actually active; after an error or file limit it stays stopped until you toggle Off then On or boot again. A later failure of resumed normal recording does not replace an already saved automatic result.
+- Running the automatic test closes any normal-use session, creates a separate automatic session, and resumes normal recording afterward if it was enabled/active. The displayed automatic result path is retained even when the resumed normal session creates another file. The run does not change your book files, current book, recents, reading progress or reader settings, and it never clears unrelated reading caches.
+- Normal sleep, restart and entering **File transfer → USB drive** flush and close recording before SD ownership changes. Retrieve logs from `Benchmark/logs` using a card reader or the existing file-transfer workflow, and safely eject storage. Logs are never overwritten or automatically deleted; remove collected logs manually if desired.
+
+Each session has a schema **3** `session` row with `mode` (`normal` or `automatic`), compiled version, build time/date, and the **application ELF SHA-256** (not a hash of the packaged firmware `.bin`), plus ESP reset/wake causes and the HAL wake classification. `refresh_policy` identifies `adaptive-content-v1`; schema 2 recordings instead used a fixed refresh-page count. The `hardware` row records runtime board, controller enum, controller variant and panel-probe verdict/validity. A profile-default controller with an inconclusive or invalid probe is not proof of the physical controller. Older `/Benchmark/RECORD` files have no effect.
+
+**Measurements and limits**
+
+- Records include activity entry, completed render-call spans for EPUB/TXT and the synchronous BMP viewer, display API calls and BUSY-wait calls, selected settings snapshots at entry/render when changed, internal/PSRAM free/total/minimum/largest-block bytes, existing EPUB/library indexing intervals, reader-only input activity flags, battery voltage/percent samples, one summary row per Reader sync run (trigger, duration, transferred byte counts, battery before and after), and sleep/session end. No book text, document paths, credentials, network payloads (a sync run records only how many bytes moved, never what they were), key identities or touch coordinates are recorded. Activity, BUSY-tag and SD-font identifiers use stable FNV-1a 32-bit hashes; these are identifiers, not cryptographic anonymization.
+- `start_us`, `end_us` and `duration_us` use the monotonic ESP timer **within one boot**, not wall-clock time. EPUB phases and index intervals retain their existing `millis()` start/end values at 1 ms resolution; their microsecond start is reconstructed from that duration and the observation time. Do not compare monotonic timestamps across session files.
+- `render` measures a render call, not button-to-page latency; asynchronous submission and subsequent wait are separate display events. BUSY measurements are the **software wait-call interval**, including its polling/grace delays and power hooks, not exact electrical edge widths or optical settling. `index` is combined parsing/cache/indexing work, **not raw SD latency**.
+- The fixed RAM queue holds 64 events. Overflow drops new events, preserves queued events, increments the cumulative `loss` count and leaves gaps in positive sequence numbers. Each session file is capped at 1 MiB; a reserved footer records the limit and discarded tail count, then recording stops until an explicit new session or boot. Logs are never automatically deleted or rotated over older sessions.
+- The main loop attempts a flush every two seconds only after actually acquiring the render lock, so an active render postpones it. `flush` reports the preceding batch's write-and-sync time and bytes. That measurement excludes persistence of the observer row itself and final close; recording still adds RAM/callback/SD overhead and is not a zero-overhead benchmark.
+- Open/write/sync/close failure disables that session without stopping normal reading. Keep complete preceding JSON lines if the final row is truncated. Normal terminal paths close the file before SD unmount/raw USB ownership. Sudden power loss, panic, removal, or a failing card may lose the buffered tail or leave filesystem damage: this is **not a crash-safe journal**. A missing `end` row means the session was not cleanly finalized.
+- **Battery sampling.** While a session is recording, the main loop reads the battery about **every 5 minutes while awake** (`battery_sample`), plus one reading when each session starts and one at deep-sleep entry (after any pre-sleep sync, before the SD log closes). Nothing is sampled while the CPU sleeps, so the drain across a sleep is the difference between its sleep-entry sample and the next session's first sample; compare `millivolts` rather than `percent` where precision matters, and use the flags to discard samples taken while charging. A sample costs one fuel-gauge read, is skipped while recording is off, and is not taken during **File transfer → USB drive**. It does not change the smoothed battery percentage shown in the UI.
+
+**Schema 3 event data**
+
+Every timed event has `event`, `seq`, `start_us`, `end_us`, `duration_us`, and an eight-element numeric `data` array. Unused trailing slots are zero. `seq=0` identifies flush/loss/footer records generated by the writer, not the producer sequence. Units and slot meanings:
+
+| Event | `data` slots, in order |
+| --- | --- |
+| `activity` | Activity-name ID, is-reader flag. Common names to hash: `EpubReader`, `TxtReader`, `BmpViewer`, `Home`, `Sleep`. |
+| `render` | Activity-name ID, activity healthy-render flag (BMP: this image completed), source: 0 ordinary render task / 1 reader render task / 2 synchronous viewer. A reader's healthy flag may remain true after its first good frame; it is not per-page error certification. |
+| `display_call` | Operation: 0 buffer / 1 async submit / 2 async wait / 3 refresh / 4 grayscale base / 5 grayscale display / 6 precondition / 7 display sleep / 8 configured grayscale base; requested mode enum where applicable. Operation 8 uses a grayscale-mode enum in slot 1 and fallback refresh-mode enum in slot 2; operation 4 uses the refresh-mode enum in slot 1. |
+| `busy_wait` | Driver-tag ID, method: 0 poll / 1 interrupt; outcome: 0 idle observed / 1 timeout / 2 assertion not observed. Poll fallback excludes any grace period performed by its caller before entering the poll; the encompassing display call includes it. |
+| `memory` | Internal free, total, minimum-ever free, largest block; then the same four PSRAM counters; all **bytes** (zero when PSRAM is absent). |
+| `index` | Kind: 0 EPUB spine/TOC/cache build / 1 complete library build; start `millis()`, end `millis()`, success flag. Library subphases are 2 prepare/prior lookup, 3 directory walk/staging, 4 reconciliation, 5 title ordering, 6 author ordering/emission. Slot 3 is source parsing/checkpoint time in milliseconds for kind 3, reserved (zero) for kinds 2/4/5, and emission success for kind 6. Subphases overlap the complete-build interval; do not sum them with kind 1. Cached EPUB loads do not emit a new index event. |
+| `epub_phase` | Phase enum, start `millis()`, end `millis()`, detail. Phases: 0 prewarm, 1 BW render, 2 display, 3 gray render, 4 wait, 5 gray write, 6 gray display, 7 cleanup, 8 BW store, 9 gray LSB, 10 gray MSB, 11 BW restore, 12 total, 13 idle prerender. Branch-specific phases can overlap or include other work; do not sum all phase/total rows. Detail (slot 3): on phases 1 and 12 it is 1 when that page was presented from an idle-prerendered body and 0 when it was rendered in full (always 0 before the prerender existed); on phase 13 it is the prerender outcome: 1 built (B/W body), 2 built (B/W body plus both text-grayscale planes), 3 abandoned because input arrived, 4 skipped for lack of spare PSRAM, 5 skipped as ineligible (image page, a grayscale route that is not buffered, or a next section without a complete cache). Phase 13 spans one idle build, is emitted while the screen is idle and sits inside no `render` span. |
+| `reader_input` | Any button pressed, any button released, touch activity flags, observed after input polling while a reader activity is current. No event is consumed or automatically paired to a render. |
+| `sleep_request` | Automatic-timeout flag. The final `end` row also covers early boot paths returning to sleep. |
+| `reader_settings` | Font-family enum, font point size, spacing enum, orientation enum, adaptive refresh-policy version (1), text-AA flag, inverted flag, margin setting (0 means automatic). In schema 2 only, slot 4 was the fixed full-refresh frequency in pages; do not interpret version 1 as a one-page interval. |
+| `display_settings` | Sleep-screen enum, SD-font-name ID. Paired with `reader_settings` at the same timestamp; snapshots are emitted only when changed. |
+| `loss` | Cumulative queue-overflow count. |
+| `flush` | Batch bytes written before its sync completed, cumulative file bytes before this observer row. |
+| `run_step` | Phase: 1 EPUB first open / 2 EPUB reopen / 3 TXT / 4 BMP; completed turns (BMP: completed paint); target count; state: 8 newly completed page / 9 phase start, otherwise terminal outcome below. The initial reader page has count 0 and is not a forward turn. |
+| `run_result` | Outcome: 0 complete / 1 cancelled / 2 loading failed / 3 rendering failed / 4 no progress / 5 timeout / 6 recorder unavailable; actual EPUB-first, EPUB-reopen, TXT and BMP counts; last phase; elapsed milliseconds. A complete result also requires the successful `end` footer; a cap/write failure may prevent the summary itself from being written. |
+| `sync_run` | Trigger: 1 manual / 2 wake / 3 pre-sleep / 4 charging / 5 interval / 6 continue; status: Reader-sync phase code in the low byte (0 unconfigured, 1 disabled, 2 waiting, 3 connecting, 4 syncing, 5 up to date, 6 offline, 7 invalid config, 8 clock error, 9 memory error, 10 storage error, 11 protocol error, 12 auth error, 13 rate limited, 14 needs re-delivery, 15 annotation error, 16 cancelled) plus `256` if the radio was **not** confirmed off; HTTP response-body bytes received; request-body bytes sent (headers and TLS framing excluded); battery millivolts before, after; battery percent before, after. The span is the worker's run from start to radio off. Its `end_us` is reconstructed from the worker's finish time, because the row is written by the main loop shortly afterwards. "Before" is read just before the radio starts and "after" once it is off; an unreadable value is 0. |
+| `battery_sample` | Battery millivolts, battery percent (0 when unreadable); reason: 0 periodic / 1 session start / 2 deep-sleep entry; flags: bit 0 the charger reports charging, bit 1 USB power is present. An instant event (`start_us` = `end_us`). |
+| `end` | Reason: 0 sleep / 1 USB drive / 2 restart / 3 file limit / 4 user toggle or normal-session pause / 5 automatic complete / 6 automatic cancelled / 7 automatic failure; cumulative queue losses; queued events discarded at the limit; file bytes before the footer. |
+
+**Schema note.** The session schema stays **3**. `sync_run` and `battery_sample` were appended to the event-name table as additive events: every existing row, slot meaning and name is unchanged, so a schema-3 reader that skips unknown `event` names keeps working, and logs recorded before this change simply contain neither event. A strict reader that rejects unknown names must learn these two. Names and the trigger/reason/phase codes in their slots are append-only. `data` carries integers only: no server name, path, SSID or content.
+
+**Idle prerender note (additive within schema 3).** The EPUB reader now renders the page after the one on screen into spare PSRAM once the screen has been idle for about 0.4 s, and presents that body when a forward turn lands on exactly that page; the status bar is always drawn fresh. It is built only under the render lock, is abandoned when any button or touch input is seen (so it never delays a turn), is skipped unless a healthy PSRAM reserve stays free, and is dropped on any layout, font, orientation, anti-aliasing, night-mode, book or menu change. A next-section page is prerendered only when that section's cache already exists and is complete; sections are never built in the background. Schema 3 itself is unchanged: `epub_phase` gains phase code 13 and meaning for slot 3 on phases 1, 12 and 13 (above); no existing row, slot or name changes meaning, and a reader that ignores unknown phase codes keeps working. To judge it, compare `epub_phase` total (12) spans with detail 1 against those with detail 0, divide the detail-1 count by all phase-12 rows for the hit rate, and read the phase-13 rows for built, abandoned and skipped counts; the `memory` rows show whether the PSRAM minimum stayed above the reserve. On the measured device a turn is dominated by the display refresh, so only the non-display CPU part can shrink.
+
+For source builds, use `pio run -e x4pro-gh_release` (INFO release profile; no wait for a serial host). Host recorder, page-clearing policy and prerender-key regressions are part of the existing CMake suite: `cmake -S test -B /tmp/reader-benchmark-tests`, `cmake --build /tmp/reader-benchmark-tests --target BenchmarkTest LibraryBuilderTest AdaptiveRefreshPolicyTest EpubPrerenderKeyTest`, then `ctest --test-dir /tmp/reader-benchmark-tests -R 'Benchmark|BatterySampling|LibraryBuilder|AdaptiveRefresh|EpubPrerenderKey' --output-on-failure`. These checks do not replace emulator or physical-device validation.
+
+**Measured result (emulator, current candidate).** The candidate (application SHA-256 `dcb9d3668f5308bb9e46050fc6bfb9a1e1fa3c3992654143fe977ec1ff805aa1`, ELF `356c2aa282abb6668f12b241e00e2c140a03ebf559fb0fb8c475a8c756512325`) was compared with the frozen pre-change baseline (application `07e5a427…`, ELF `b65173f2…`). Both ran the automatic benchmark with the same seeds, reader font (14 pt LXGW WenKai SD font, text anti-aliasing on) and UC8279 display-timing model, once in night mode and once in light mode. All four runs completed with 10/3/5/1 turns, a complete footer, zero queue losses and zero discarded events. Medians, baseline → candidate:
+
+| Measurement | Night | Light |
+| --- | --- | --- |
+| EPUB later page, render call | 2268 → 509 ms | 3013 → 1269 ms |
+| EPUB later page, non-display CPU | 1775 → 17 ms | 1796 → 52 ms |
+| EPUB warm reopen, later page | 2277 → 510 ms | 3028 → 1269 ms |
+| EPUB first page after open | 7.50 → 3.86 s | 8.15 → 4.48 s |
+| TXT later page, render call | 5228 → 561 ms | 5973 → 1319 ms |
+| TXT first open (index + first page) | 27.3 → 20.9 s | 28.1 → 21.6 s |
+| BMP paint (FAST refreshes) | 2128 → 1140 ms (4 → 2) | 2231 → 1253 ms (4 → 2) |
+| Whole run, including about 38 s of intentional dwell | 151.9 → 86.9 s | 167.4 → 103.3 s |
+
+Display time per page is unchanged (about 493 ms FAST in night mode, and about 1217 ms in light mode, where FAST is followed by the grayscale pass). The page-turn gain is CPU work removed before the refresh. Most of it comes from the SD font cache: EPUB font prewarm fell from 1656 ms to 1 ms, and black-and-white text drawing from 97 ms to 10 ms. This is because cached glyphs now survive page turns and a cache miss costs one FreeType load. Skipping the unsupported grayscale planes in night mode saves only about 15 ms. The adaptive clearing policy does not make page turns faster. Clearing is now driven by estimated content: the baseline's fixed 15-page interval produced 3 HALF refreshes per run, all on initial pages. The candidate produced 4 HALF refreshes in night mode and 5 in light mode. On these dense CJK EPUB pages, the estimated debt cleared about every 7th page in night mode and every 5th in light mode, where anti-aliased grayscale is weighted more heavily. The five TXT turns stayed FAST after the clear that follows indexing. The 319-page TXT index stays format v3, and its page offsets are identical to the baseline's. Minimum-ever free internal RAM was 153,136 → 154,268 B. Minimum-ever free PSRAM was 5,640,252 → 5,688,628 B (night) and 5,640,236 B (light). Static RAM stayed 108,368 B, and program flash grew by 2,896 B.
+
+Limits:
+
+- Emulator CPU and timing are not the physical device; use these results as ratios, not latency predictions.
+- Display and BUSY durations come from the modeled panel timing, not optical measurement, and no ghosting was measured.
+- The shipping single-buffer display path never keeps an exact previous frame, so on hardware the policy always uses the ink-density estimate.
+- Settled frames matched the baseline pixel for pixel: CJK TXT light (8 pairs), CJK TXT night (8), CJK-mixed EPUB light (15) and XTC normal/night (12). Evidence: `adaptive-perf-nxtmx4fe/report.md` and `verification-summary.json`. The candidate is staged on the SD card but has not been installed or verified on the physical reader.
+
+### Serial diagnostics
 
 **Serial monitor logs:** For more detailed debugging, connect the device to a computer and run the custom debugging monitor script (requires Python 3 with `pyserial`, `colorama`, and `matplotlib`; install via `pip3 install pyserial colorama matplotlib`):
 
@@ -797,3 +934,65 @@ Choose **Export all inbox entries** to write `/annotations/reading-inbox.md` on 
 The Markdown uses the same per-entry interchange fields as book-local annotation exports: original **Source** path, **Title**, **Type**, chapter title/path, spine index, XPath, optional visible-text offset, capture progress/page context, excerpt, note, and a UTC creation timestamp when the device clock was set. The document header says **Scope: All sources**; each entry carries its own source. Numeric annotation IDs are book-local, so companion return/sync identity is the **original source path plus entry ID**, not the heading number alone. These original paths and location fields are the local annotation-return handoff for a separately connected, opt-in robertzhou.dev transport.
 
 Exports are streamed one record at a time. A failed read/write does not replace the last complete export; success is shown only after the replacement is committed. This is a local snapshot, not a cloud queue, remote bookmark downloader, or two-way cloud-sync implementation. Keep `/.crosspoint/annotations/` and the original documents backed up: clearing all of `/.crosspoint/` also deletes the native inbox entries.
+
+## 9. Private Wi-Fi Reader sync
+
+**Verification status:** the installed image is SHA256 `2383850eeb9d33447c418ba9ea524f4750aae832a5319754efbc4725bc3deac6` (ELF `692b021665f30b12b9ff4914f9c38e65446db431049d4cf93466df486b47b0db`). It adds the incremental TXT reader (first page before the full index, chapters and TXT menu, UTF-8-safe windows, CJK line breaking and paragraph style), the idle EPUB next-page prerender, event-driven Reader sync, input latching during background work and the UI fixes. It built for `x4pro-gh_release` (flash 95.1%), and 608 native CTest tests, the reader-sync Python suites, 226,398 FreeInkUI host checks and 244 companion tests passed. Emulator acceptance (`next-txt-ui-sync/report.md`, 58 checks) passed: both OTA slots reach Home, deferred acceptance happens exactly once, interrupted or SD-less boots stay PENDING_VERIFY, night/light benchmarks show no EPUB regression, Latin TXT pagination is unchanged, CJK EPUB/XTC pages are pixel-identical, TXT progress migrates from the previous firmware, and real-novel navigation, touch and 120 ms button presses work while indexing.
+
+On the physical reader it completed the automatic benchmark (session `138c9526`, same settings as the previous image's session `b03ea87c`) with no lost events: first TXT page 31.65 s → 2.27 s, TXT page render median 720 → 644 ms, EPUB page render median 652 → 622 ms, with every forward EPUB turn served from the prerendered page (`adaptive-perf-nxtmx4fe/physical-device-20261101/comparison-vs-b03ea87c.json`). These are software render spans, not button-to-pixel latency. The previous image `dcb9d3668f5308bb9e46050fc6bfb9a1e1fa3c3992654143fe977ec1ff805aa1` remains the reviewed rollback image. No check so far establishes physical Wi-Fi/cloud end-to-end operation, battery consumption, optical latency or ghosting, the light-mode physical benchmark, or full cold-power-cut rollback. The known emulator cold-start flash-erase limitation remains.
+
+**Staged, not yet installed (rc8):** the card's `reader-workbench-rollback-reviewed.bin` is now SHA256 `9c691695e2aeefa928d9528b40a3ce97feb46dbabacd9ce3b5306659fd43330d` (ELF `66d4bbe9e6354da10114980b8f824c6520199d3da87f739ea6f195af27bc2398`, 6,450,496 bytes). It adds the Wi-Fi sync TLS fix (SHA-384/P-384 chains), Colby Access (PEAP/MSCHAPv2 with `/.crosspoint/wifi-ca/colby.pem`), Wi-Fi failure reasons and `/.crosspoint/wifi-log.txt`, night-mode flash fixes, big-EPUB tables, background library indexing, the CC-CEDICT dictionary (`/dictionaries/cedict/`) and reading statistics. It passed 644 host tests and emulator acceptance (`next-txt-ui-sync/rc8-report.md`); it has not yet run on the physical reader. After installing, the image above stays in the other slot as the fallback.
+
+The separately provisioned service downloads the private robertzhou.dev ready queue directly over saved Wi-Fi to `/books/Inbox`, and uploads native annotations. It does not require routine Mac/SD delivery. A collector on a Windows WSL host gathers RSS feeds, shared links, signed-in Substack subscriptions and the X Following feed for the site every 15 minutes. It runs on a persistent `OnCalendar` timer, so a run missed while the host was off happens on the next start. Its dedicated Chrome profile is signed in by hand; to sign in again from the Mac, run `ssh -L 6080:127.0.0.1:6080 windows "wsl -d Ubuntu -- /home/bob/reader-collector/bin/login-profile-remote"` and open `http://localhost:6080/vnc.html`. The Mac LaunchAgent `dev.reader-workbench.reader-send-subscriptions` is disabled (`launchctl enable gui/$(id -u)/dev.reader-workbench.reader-send-subscriptions` and `launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/dev.reader-workbench.reader-send-subscriptions.plist` restore it). The site holds at most 256 unread books (128 MiB); when the reader has not synced for a while, uploads stop with HTTP 507 and resume after the reader drains the queue. Powering off the reader does not make that material available on its SD card.
+
+Open **Settings → System → Reader sync**:
+
+- **Enabled** changes only the enable flag, preserving the private device key.
+- **Schedule** switches between **Wake, sleep, charging** (event-driven; the default) and **Fixed interval** (the previous periodic behaviour). The choice is saved in `reader-sync.json` as `schedule`; see **Schedule** below. It is an on-device setting only: like the rest of Reader sync it is not exposed through the web settings API.
+- **Sync now** requests a background attempt; it does not freeze the reading loop. Server rate-limit cooldowns still apply.
+- **Choose Wi-Fi** uses the existing saved-network selector. Selecting it first cancels and joins any background transfer.
+- **Status**, **Last success** (UTC), **Books received**, and **Notes sent / skipped** show nonsecret state. Offline, invalid configuration, clock, authentication, SD-space, memory and rejected-note conditions remain visible.
+
+The SD provisioner creates `/.crosspoint/reader-sync.json` with six fields: `version: 1`, HTTPS `origin`, scoped `device_key` (64 lowercase hex characters), stable `device_id` (SD volume UUID), boolean `enabled`, and `interval_seconds` (60–86400, normally 900). A seventh, optional field `schedule` is `"events"` or `"interval"`. **Backward compatibility:** a six-field file, including every existing one with `interval_seconds: 900`, still loads unchanged and runs the event-driven schedule. The firmware writes `schedule` only after you choose one in Settings, so an untouched card stays readable by older firmware. Once `schedule` is present, firmware from before this change rejects the file (it requires exactly six fields) and disables sync: roll back by deleting that key. Any other `schedule` value, or any other extra field, is invalid. `card provision` writes six fields on a fresh card and preserves an existing `schedule`. Never use the management or share key. Missing or invalid configuration safely disables the service. The key is physically readable on the SD card, not encrypted; it is restricted and revocable, is never displayed in settings/status, and is blocked from generic web/WebDAV file APIs. Do not publish the file or include it in support logs.
+
+**Schedule.** One lazy worker starts only after a completed healthy Home/reader render and never during a benchmark workload. It does not wake a sleeping reader. With the default `"schedule": "events"`, only these events start a sync:
+
+- **Wake or boot:** the first time Home is on screen after the reader boots or wakes. A sync therefore never competes with a book that is still opening, and waking straight into a book defers the wake sync until Home is next shown. It is skipped, and not retried later in that session, when the last successful sync is under 15 minutes old or any attempt, even a failed one, is under 5 minutes old; an offline reader does not scan for Wi-Fi on every wake.
+- **Before deep sleep:** only if an annotation was saved since the last clean upload pass. A private marker, `/.crosspoint/reader-sync/notes.pending`, records this and survives a reboot or power loss. The sleep screen is already drawn when the sync starts. It is the normal sync run (it may also fetch waiting books), but it is given 20 seconds and then told to stop, so sleep is delayed by at most that plus the time an in-flight request needs to unwind (bounded by the HTTP timeout). It is skipped when an attempt ran in the last 5 minutes, in Fixed-interval mode, and after benchmark runs. A stopped attempt is recorded as an attempt, so the next sleep does not wait again at once.
+- **While charging:** when USB power is present, once every `interval_seconds` (900 s by default), counted from the last run. That age is persisted, so it survives reboots. On battery nothing runs periodically.
+- **More work pending:** after a bounded batch reports more books or notes, the next batch follows at least 60 seconds later, charging or not.
+- **Manual:** **Sync now**, or switching **Enabled** on. It bypasses the debounce and the book-opening rule but not a server cool-down.
+
+`"schedule": "interval"` keeps the previous behaviour exactly: one attempt after the first healthy render following boot or wake, then every `interval_seconds` of awake time, whatever the power or screen; no wake debounce and no pre-sleep sync. `interval_seconds` keeps its meaning in both modes. Bounded batches drain at least 60 seconds apart; 429 respects `Retry-After` (and also holds back **Sync now**), and 503 parks until the next wake. A cancelled run is retried after 60 seconds. Page turns continue on the main loop. Navigation into another activity, foreground networking, USB handoff and sleep cancel/join the worker before sharing the radio or SD.
+
+**Radio.** Every attempt ends with Wi-Fi fully off (`WIFI_OFF`; saved credentials are kept) before it is reported finished. If the first switch-off does not take, the station is disconnected and switched off again; a persistent failure is logged as `radio still on after sync` and flagged in the sync log. An attempt only switches off a radio it actually started; normal background completion does not reboot the reader.
+
+**Sync log.** Each run is logged on the serial console (INFO) as `RSYNC run trigger=… phase=… ms=… rx=… tx=… books=… notes=… mv=<before>><after> pct=<before>><after> radio_off=1`. `trigger` is `manual`, `wake`, `pre_sleep`, `charging`, `interval` or `continue`. `ms` runs from worker start to radio off. `rx`/`tx` are HTTP body bytes received and sent (headers, TLS framing and DNS excluded). Battery is read just before the radio starts and again once it is off; the second reading is taken by the main loop, so it can lag the radio-off moment by a loop pass. With **Record normal use** on, the same run is also a `sync_run` row in the session log (see **Benchmark and normal-use recording**), which is how to compare wake, pre-sleep and charging syncs by battery cost.
+
+CPU full-speed protection is reference-counted across overlapping render and sync work; one owner finishing cannot release another owner's protection. A sync attempt switches off only the radio it actually started, so missing saved credentials do not trigger a disconnect against an uninitialized station. The post-fix host ownership checks and targeted offline emulator run passed; earlier captures under `qemu-targeted-y2f78xc_` remain pre-fix evidence rather than proof of this correction.
+
+Each EPUB is at most 8 MiB. Streaming does not require `Content-Length`: metadata size, the `X-Reader-Sha256` header, the streamed hash, and closed-file readback must all agree. Private `.part` files are never library books. The client never overwrites an existing book: it tries the source basename, `<stem>-<sha8>.epub`, then `<item-uuid>.epub`; identical verified bytes are reused. A pending private receipt, durable library-dirty marker, then completed receipt precede ACK. An interrupted install is reconciled from verified final bytes. ACK releases the server's content bytes, so a later fresh download requires re-delivery under a new item ID.
+
+Native annotation files are not rewritten to insert cloud IDs. Upload IDs and anchors use the companion's exact sorted compact UTF-8 JSON/UUID5 mapping, with the SD UUID as `device_id` and `item_id: null`; Mac fallback and device uploads therefore share an identity. Accepted UUID/digest receipts live under `/.crosspoint/reader-sync/`, never the annotation tree. Oversized/invalid notes stay local without truncation; unchanged deterministic server rejections are recorded separately and are not retried in a tight loop. The annotation service is append-only: deleting a local note does not delete its cloud copy.
+
+Annotation batches inspect at most 256 native records and make at most eight upload attempts. A private durable scan cursor advances across the entire native store, including stores larger than one batch; a vanished cursor restarts safely using accepted UUID receipts.
+
+Release-integrator checks, from the repository root:
+
+```sh
+/Users/b/.platformio/penv/bin/pio run -e x4pro-gh_release
+python3 test/reader_sync/run_protocol.py
+python3 test/reader_sync/canonical_oracle.py
+python3 test/reader_sync/power_lifecycle.py
+cmake -S test -B /tmp/reader-sync-tests
+cmake --build /tmp/reader-sync-tests --target ReaderSyncScheduleTest BenchmarkTest
+ctest --test-dir /tmp/reader-sync-tests -R 'ReaderSyncSchedule|BatterySampling|Benchmark' --output-on-failure
+```
+
+The protocol runner builds the real `SecureHttpClient`/`SecureClient` and pinned wolfSSL against an isolated HTTPS peer, with POSIX storage/TCP adapters and temporary credentials. It exercises chunked/close-delimited payloads, size/hash failures, cancellation, full/write-failed storage, rename failure, collision refusal/reuse, interrupted installs, pagination/cursor recovery, canonical annotation receipts, bounded annotation traversal and rate/auth errors. It also checks configuration compatibility (a six-field file with `interval_seconds: 900` loads as the default schedule and is written back with six fields, explicit `schedule` values round-trip, invalid or extra fields are rejected) and that received/sent byte counts match the traffic. `ReaderSyncScheduleTest` covers the pure trigger decision in `ReaderSyncSchedule.h` (state in, sync or no sync out): wake debounce, Home and book-opening gating, charging pacing, pre-sleep conditions, back-off and the Fixed-interval mode. It never accesses production or a real card. Run the canonical cross-language fixture runner and the existing deferred-OTA/QEMU healthy-render/offline cases against the final image. QEMU cannot prove the physical radio, simultaneous panel latency or battery cost.
+
+The power-lifecycle runner compiles the production power HAL with host clock/Wi-Fi/semaphore adapters. It checks overlapping owners in both release orders, real cross-thread overlap, hardware clock-write failure retries, and the independent Wi-Fi full-speed override; it does not measure physical clock or battery behavior.
+
+### SD-card fallback: delivery by plugging the card into the Mac
+
+When the reader cannot reach Wi-Fi (or Wi-Fi sync is not installed yet), plug the SD card into the Mac and wait for the notification "N books delivered to the reader card". A user LaunchAgent (`dev.reader-workbench.card-autosync`, started by macOS whenever any volume mounts) runs `reader-send card autosync`, which acts only for the configured card's exact volume UUID: it downloads the ready books from the private queue, copies them into `/books/Inbox` on the card, reads every copy back and checks its SHA-256, and only then acknowledges those books on the server. A book whose copy does not verify is left on the server and retried at the next plug-in; HTTP 429 (rate limit) stops the run and the rest follows next time. It also copies the card's annotations to `~/papyrix/annotations`. It never ejects the card, never touches `/books/Novels` or `/books/Books`, never deletes a book and never installs firmware. Eject the card in Finder yourself, put it back in the reader, and the new books appear in Browse Files/Library (the library rescans because the delivery sets the `library.dirty` marker). The run log is `~/Library/Logs/reader-card-autosync.log`; the management key is read from the Mac Keychain at run time and is never written to the card, the log or the agent file. Setup and details: `companion/README.md`, "Automatic delivery when the card is plugged in".

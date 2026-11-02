@@ -13,6 +13,9 @@ class BmpViewerActivity final : public Activity {
   void onEnter() override;
   void onExit() override;
   void loop() override;
+  void configureBenchmark(uint8_t& completed) { benchmarkCompleted = &completed; }
+  bool isBenchmarkActivity() const override { return benchmarkCompleted != nullptr; }
+  bool preventAutoSleep() override { return isBenchmarkActivity(); }
 
  private:
   void loadSiblingImages();
@@ -23,4 +26,7 @@ class BmpViewerActivity final : public Activity {
   std::string filePath;
   std::vector<std::string> siblingImages;
   int currentImageIndex = -1;
+  uint8_t* benchmarkCompleted = nullptr;
+  uint32_t benchmarkPaintedAt = 0;
+  bool painted = false;
 };

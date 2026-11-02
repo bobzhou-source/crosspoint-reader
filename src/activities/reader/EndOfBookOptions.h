@@ -10,9 +10,7 @@ class GfxRenderer;
 class MappedInputManager;
 
 // Shared End-of-Book next-book menu for the EPUB and XTC readers. Collects up to
-// MAX_SUGGESTIONS sibling books once per reader session, handles the menu input, and
-// draws the end screen. With no suggestions the end screen keeps its historical
-// plain-title look and behavior.
+// MAX_SUGGESTIONS sibling books once per reader session, followed by Home.
 class EndOfBookOptions : private UiAppHost {
  public:
   enum class Action { None, Redraw, OpenBook, GoHome, LastPage };
@@ -27,8 +25,9 @@ class EndOfBookOptions : private UiAppHost {
   // list safely.
   void loadOnce(const std::string& currentBookPath);
 
-  // True when the suggestion menu is showing and should own the reader's input.
+  // True when the end menu (including Home-only) owns touch/confirm/back input.
   bool menuActive() const;
+  bool hasSuggestions() const { return menuActive() && !names.empty(); }
 
   // Menu input handling, following the standard list idiom: a tap on a row opens it
   // (or Home), side Up/Down and front Left/Right move the selection (wrapping),
@@ -38,7 +37,7 @@ class EndOfBookOptions : private UiAppHost {
   // long-press Back to the file browser working).
   Action handleMenuInput(const MappedInputManager& input, std::string* openPath);
 
-  // Draws the full end screen (plain title, or the suggestion menu) onto a cleared buffer.
+  // Draws the end screen with standard header/back chrome onto a cleared buffer.
   void render(GfxRenderer& renderer, const MappedInputManager& input);
 
  private:
@@ -55,6 +54,7 @@ class EndOfBookOptions : private UiAppHost {
   std::vector<std::string> names;
   // Main-task selection updates may overlap a repaint on the render task.
   std::atomic<int> selector{0};
+  freeink::ui::ListNav nav;
   std::atomic<bool> isLoaded{false};
 
   // Row storage, built once in loadOnce() (same acquire/release publication

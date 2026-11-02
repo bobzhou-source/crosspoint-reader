@@ -6,6 +6,8 @@
 #include <string>
 #include <vector>
 
+#include "CjkDictionary.h"
+
 // Result of an index search — file location of a definition without reading it.
 struct DictLocation {
   uint32_t offset = 0;  // byte offset in .dict data
@@ -83,6 +85,11 @@ class Dictionary {
   // decompression / low-memory / read failure.
   bool lookup(const char* word, std::string& definitionOut, std::string& matchedHeadwordOut,
               LookupResult* outResult = nullptr);
+
+  // Probe at most eight CJK prefixes in one on-SD search session, read only
+  // the longest hit. Bit (length - 1) records each exact-match length.
+  bool lookupCjk(const char* run, std::string& definitionOut, std::string& matchedHeadwordOut, uint8_t& matchMask,
+                 LookupResult* outResult = nullptr);
 
   static std::string cleanWord(const char* word);
 

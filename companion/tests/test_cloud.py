@@ -13,8 +13,8 @@ from unittest.mock import patch
 
 from reader_send.cache import Cache
 from reader_send.cli import main, parser
-from reader_send.cloud import (MAX_EPUB, CloudClient, Response, https_request, json_bytes,
-                               origin_url, prepare_push)
+from reader_send.cloud import (MAX_EPUB, CloudClient, CloudContentReleased, Response, https_request,
+                               json_bytes, origin_url, prepare_push)
 from reader_send.cloud_annotations import (annotation_batches, download_annotations, load_annotations,
                                            map_annotation, upload_annotations)
 from reader_send.common import ReaderError
@@ -76,9 +76,12 @@ class MemoryAPI:
         self.nonces.add(headers["X-Reader-Nonce"])
         assert headers["Content-Length"] == str(len(body))
         assert not any(key.lower() in {"cookie", "origin", "content-encoding"} for key in headers)
-        if route == "/reader/items":
+        # Routing ignores query parameters (`state`, `limit`, `after`); the signature above still binds them.
+        path = route.partition("?")[0]
+        if path == "/reader/items":
             if method == "GET":
-                return self.response(200, {"items": list(self.items.values())})
+                return self.response(200, {"items": list(self.items.values()),
+                                           "has_more": False, "next_after": None})
             metadata = json.loads(body)
             prior = self.items.get(metadata["id"])
             if prior and any(prior[key] != value for key, value in metadata.items()):
@@ -86,14 +89,14 @@ class MemoryAPI:
             if not prior:
                 self.items[metadata["id"]] = {**metadata, "state": "uploading", "created_at": NOW * 1000, "consumed_at": None}
             return self.response(200 if prior else 201, {"item": self.items[metadata["id"]]})
-        if route == "/reader/annotations":
+        if path == "/reader/annotations":
             values = json.loads(body)["annotations"]
             if any(value["id"] in self.annotations and self.annotations[value["id"]] != value for value in values):
                 return self.response(409, {})
             inserted = sum(value["id"] not in self.annotations for value in values)
             self.annotations.update({value["id"]: value for value in values})
             return self.response(201 if inserted else 200, {"accepted": len(values), "inserted": inserted})
-        item_id = route.split("/")[3]
+        item_id = path.split("/")[3]
         if method == "DELETE":
             self.items.pop(item_id, None)
             self.blobs.pop(item_id, None)
@@ -221,6 +224,125 @@ class CloudTest(unittest.TestCase):
             CloudClient().items()
         conn.close.assert_called_once()
 
+    def test_pull_classifies_410_through_the_real_transport_with_bounded_reads(self):
+        import http.client
+        from unittest.mock import Mock
+        released = b'{"error":"content released"}'
+
+        class Stream(io.RawIOBase):
+            """HTTP/1.1 410 response; the body is followed by endless padding when ``endless``."""
+            def __init__(self, body, endless):
+                self.pending = b"HTTP/1.1 410 Gone\r\nContent-Type: application/json\r\n\r\n" + body
+                self.endless = endless
+                self.produced = 0
+
+            def readable(self):
+                return True
+
+            def readinto(self, buffer):
+                chunk = self.pending[:len(buffer)]
+                self.pending = self.pending[len(chunk):]
+                if self.endless and len(chunk) < len(buffer):
+                    chunk += b" " * (len(buffer) - len(chunk))
+                self.produced += len(chunk)
+                if self.produced > 64 * 1024:
+                    raise AssertionError("410 body read was not bounded")
+                buffer[:len(chunk)] = chunk
+                return len(chunk)
+
+        class Socket:
+            def __init__(self, stream):
+                self.stream = stream
+
+            def makefile(self, mode):
+                return io.BufferedReader(self.stream)
+
+        def pull(body, endless):
+            response = http.client.HTTPResponse(Socket(Stream(body, endless)))
+            response.begin()
+            connection = Mock()
+            connection.getresponse.return_value = response
+            with tempfile.TemporaryDirectory() as root, \
+                    patch("reader_send.cloud.http.client.HTTPSConnection", return_value=connection):
+                client = CloudClient("https://example.com", clock=lambda: NOW, nonce=self.nonce)
+                try:
+                    client.pull(ITEM_ID, Path(root), item=item(state="ready"))
+                except ReaderError as error:
+                    return error, sorted(path.name for path in Path(root).iterdir())
+            self.fail("a 410 must never install content")
+
+        for body in (released, released + b" " * (256 - len(released))):
+            with self.subTest(confirmed_length=len(body)):
+                error, files = pull(body, endless=False)
+                self.assertIsInstance(error, CloudContentReleased)
+                self.assertEqual(files, [])
+        # Unknown, unparseable, empty, and valid-JSON-plus-whitespace bodies longer than 256 bytes
+        # (finite or endless) are never the confirmation.
+        for body, endless in ((b'{"error":"gone"}', False), (b"not json", False), (b"", False),
+                              (released, True), (released + b" " * 300, False)):
+            with self.subTest(body=body[:40], length=len(body), endless=endless):
+                error, files = pull(body, endless)
+                self.assertNotIsInstance(error, CloudContentReleased)
+                self.assertRegex(str(error), "HTTP 410")
+                self.assertEqual(files, [])
+
+    def test_item_pagination_handles_63_exact_64_and_multi_page_boundaries(self):
+        data = epub_bytes()
+        for count in (63, 64, 65):
+            with self.subTest(count=count):
+                records = [item(data, id=str(uuid.UUID(int=index)), state="ready")
+                           for index in range(1, count + 1)]
+                routes = []
+
+                def transport(*args):
+                    route = args[2]
+                    routes.append(route)
+                    if len(routes) == 1:
+                        page = records[:64]
+                        more = count > 64
+                    elif len(routes) == 2 and count > 64:
+                        page = records[64:]
+                        more = False
+                    else:
+                        raise AssertionError("unexpected cloud inbox page request")
+                    return MemoryAPI.response(200, {
+                        "items": page,
+                        "has_more": more,
+                        "next_after": page[-1]["id"] if more else None,
+                    })
+
+                listed = self.client(transport).items(ready_only=True)
+                self.assertEqual([record["id"] for record in listed],
+                                 [record["id"] for record in records])
+                expected_routes = ["/reader/items?state=active&limit=64"]
+                if count > 64:
+                    expected_routes.append(
+                        f"/reader/items?after={records[63]['id']}&limit=64&state=active")
+                self.assertEqual(routes, expected_routes)
+
+    def test_item_pagination_rejects_repeated_cursor_and_cross_page_duplicate(self):
+        data = epub_bytes()
+        records = [item(data, id=str(uuid.UUID(int=index)), state="ready")
+                   for index in range(1, 129)]
+        first = {"items": records[:64], "has_more": True, "next_after": records[63]["id"]}
+        cases = (
+            ("repeated a cursor",
+             [first, {"items": records[64:], "has_more": True, "next_after": records[63]["id"]}]),
+            ("duplicate IDs",
+             [first, {"items": [records[0]], "has_more": False, "next_after": None}]),
+        )
+        for message, pages in cases:
+            with self.subTest(message=message):
+                calls = []
+
+                def transport(*args):
+                    calls.append(args[2])
+                    return MemoryAPI.response(200, pages[len(calls) - 1])
+
+                with self.assertRaisesRegex(ReaderError, message):
+                    self.client(transport).items()
+                self.assertEqual(len(calls), 2)
+
     def test_push_retry_ack_delete_idempotency_and_binary_identity(self):
         data = epub_bytes()
         metadata = item(data)
@@ -338,8 +460,10 @@ class CloudTest(unittest.TestCase):
         data = epub_bytes()
         exact = data + b"\0" * (MAX_EPUB - len(data))
         self.assertEqual(self.client().push(item(exact), exact)["size"], MAX_EPUB)
-        for payload in ({"items": [{**item(), "state": {}}]}, {"items": [None]},
-                        {"items": [{**item(), "state": "ready", "size": True}]}):
+        for payload in ({"items": [{**item(), "state": {}}], "has_more": False, "next_after": None},
+                        {"items": [None], "has_more": False, "next_after": None},
+                        {"items": [{**item(), "state": "ready", "size": True}],
+                         "has_more": False, "next_after": None}):
             with self.assertRaises(ReaderError):
                 self.client(lambda *args: MemoryAPI.response(200, payload)).items()
         for raw in (b'{"items":[],"items":[]}', b'{"items":NaN}', b"\xff"):
@@ -554,6 +678,47 @@ class CloudAnnotationTest(unittest.TestCase):
             self.assertEqual(output.read_bytes(), raw)
             with patch("reader_send.cloud.https_request", side_effect=AssertionError("network forbidden")), patch("sys.stderr", new_callable=io.StringIO):
                 self.assertEqual(main(["cloud", "annotations", "export", "--output", str(output)]), 2)
+
+    def test_native_directory_skips_only_genuine_appledouble_sidecars(self):
+        appledouble = b"\x00\x05\x16\x07\x00\x02\x00\x00" + bytes(18) + b"Mac OS X        \x00\x02binary"
+        with tempfile.TemporaryDirectory() as temporary:
+            store = Path(temporary) / "native"
+            (store / "0000000000000001").mkdir(parents=True)
+            (store / "0000000000000001" / "001.json").write_bytes(json_bytes(native()))
+            (store / "0000000000000001" / "._001.json").write_bytes(appledouble)
+            (store / "._0000000000000001").write_bytes(appledouble)
+            self.assertEqual(load_annotations(store), [native()])
+            # A `._` name that is not AppleDouble is an ordinary record file: parsed like any other.
+            (store / "0000000000000001" / "._002.json").write_bytes(json_bytes(native(id=3)))
+            self.assertCountEqual(load_annotations(store), [native(), native(id=3)])
+            # An AppleDouble payload under a normal name is not a sidecar and is still rejected.
+            (store / "0000000000000001" / "003.json").write_bytes(appledouble)
+            with self.assertRaises(ReaderError):
+                load_annotations(store)
+            (store / "0000000000000001" / "003.json").unlink()
+            # A malformed non-sidecar record, and a malformed `._x.json` without the magic, are rejected.
+            (store / "0000000000000001" / "004.json").write_bytes(b"{not json")
+            with self.assertRaises(ReaderError):
+                load_annotations(store)
+            (store / "0000000000000001" / "004.json").unlink()
+            (store / "0000000000000001" / "._005.json").write_bytes(b"{not json")
+            with self.assertRaises(ReaderError):
+                load_annotations(store)
+            (store / "0000000000000001" / "._005.json").unlink()
+            # A symlinked `._*.json` is never skipped, and an explicit sidecar path is never skipped.
+            link = store / "0000000000000001" / "._006.json"
+            link.symlink_to(store / "0000000000000001" / "001.json")
+            with self.assertRaises(ReaderError):
+                load_annotations(store)
+            link.unlink()
+            with self.assertRaises(ReaderError):
+                load_annotations(store / "0000000000000001" / "._001.json")
+            # A store holding only shadows has no records.
+            only = Path(temporary) / "only"
+            only.mkdir()
+            (only / "._001.json").write_bytes(appledouble)
+            with self.assertRaises(ReaderError):
+                load_annotations(only)
 
 
 if __name__ == "__main__":

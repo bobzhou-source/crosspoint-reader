@@ -27,12 +27,31 @@
 //     a book with no bold pays nothing for it.
 //   * per-face glyph caches that GROW TO CONVERGE (no worst-case pre-reserve):
 //     the byte arena and glyph tables start empty and grow only to the book's
-//     actual page needs, then stop touching the allocator (clearCache keeps the
-//     capacity across page turns). Bounded by a hard byte cap that flushes when
-//     full, and shed entirely by releaseResidentCaches() on heap-critical
-//     transitions — on par with the SD (.cpfont) font system's discipline.
+//     actual needs, then stop touching the allocator. Bounded by a hard byte/
+//     glyph cap that flushes a full face, and shed entirely by
+//     releaseResidentCaches() on heap-critical transitions — on par with the
+//     SD (.cpfont) font system's discipline.
 //   * caches live in PSRAM when the board has it (FontPsram / FontAlloc), so
 //     glyph arenas don't consume scarce internal SRAM.
+//
+// Lifetime of cached content (glyph metrics + bitmaps, kerning pairs):
+//   * RETAINED across render scopes and page turns: the cache is the book's
+//     bounded working set, so a warm page costs no FreeType glyph loads (and no
+//     streamed SD reads). FontCacheManager::PrewarmScope does
+//     not invalidate it, and render prewarm only ADDS absent codepoints
+//     (addCoverage), never replaces (build).
+//   * INVALIDATED by: load() (new size/sources/bit depth), explicit
+//     clearCache(), releaseResidentCaches() (memory pressure / heap-critical
+//     transitions), and a byte/glyph/kern cap flushing a full face.
+//   * One FreeType load per MISS: the fractional advance and the bitmap come from
+//     the same glyph load. A glyph whose bitmap was lost to a failure (load/render
+//     error, byte arena could not grow) is cached advance-only (advance 0 when the
+//     load itself failed) and marks its face degraded; the next addCoverage()/
+//     build() rebuilds that face to retry. A glyph that can never fit (larger than
+//     the whole byte cap) is not a failure and is not retried.
+//   * An EpdGlyph* or bitmap pointer from a face is valid only until the next
+//     glyph fault on that same face — any fault may flush a full cache — so
+//     callers consume it immediately and never hold it across calls.
 //
 // Lifetime: every configured source (resident bytes or streamed read source,
 // e.g. an open SD file) is BORROWED and must outlive this object, which must
@@ -69,11 +88,12 @@ class TtfEpdFont {
 
   EpdFontFamily family() const;
 
-  // Per-scope reset (mirrors SdCardFont::clearCache): drop every face's cached
-  // page glyphs but KEEP the allocations (byte arena + vector capacity), so a
-  // page turn re-faults into buffers already sized to the book and stops touching
-  // the allocator once converged. Driven by FontCacheManager::clearCache() /
-  // PrewarmScope, symmetrically with the SD fonts.
+  // Explicit invalidation (mirrors SdCardFont::clearCache): drop every face's
+  // cached glyphs and kerning but KEEP the allocations (byte arena + vector
+  // capacity), so re-faulting reuses buffers already sized to the book. NOT a
+  // per-render-scope reset: FontCacheManager::PrewarmScope leaves this cache
+  // intact; only FontCacheManager::clearCache() (explicit callers and the
+  // render-glyph-cache memory sink) reaches it.
   void clearCache();
 
   // Heap-critical teardown (mirrors SdCardFont::releaseResidentCaches): free
@@ -84,7 +104,14 @@ class TtfEpdFont {
   // transitions (WiFi + web server, image decode, dictionary, sleep).
   void releaseResidentCaches();
 
-  // Optional batch pre-warm of the REGULAR face (other styles fault lazily).
+  // Batch pre-warm of the REGULAR face (other styles fault lazily).
+  //   build():       REPLACES the regular face's cache with exactly `utf8` — an
+  //                  explicit seed after load()/resize (SdCardFontSystem), never
+  //                  a render-time call.
+  //   addCoverage(): adds only codepoints absent from the cache; what render
+  //                  prewarm uses. First rebuilds any DEGRADED face (all four
+  //                  styles) so glyphs that lost their bitmap get a retry; a
+  //                  healthy face is never touched.
   bool build(const char* utf8);
   bool addCoverage(const char* utf8);
 
@@ -114,6 +141,12 @@ class TtfEpdFont {
     bool wantItalic = false;  // request italic from the source (axis or oblique)
     bool inited = false;      // init attempted (lazy)
     bool ready = false;       // FreeType face live
+    // Some cached entry lost its bitmap to a failure a retry may fix (the glyph load
+    // or render failed, or the byte arena could not grow): its layout advance is
+    // cached but it draws blank. Set by faultGlyph(); cleared when the face is
+    // flushed. addCoverage()/build() rebuild a degraded face once, so the glyph
+    // gets another attempt instead of staying blank until the cache next fills.
+    bool degraded = false;
     // GSUB 'liga' resolution (fi fl ff ffi ffl), resolved once at initFace():
     // ligGid[i] is the raw glyph ID for U+FB00+i (0 = none), and ligPairs is
     // the EpdFont pair table (sorted by key) that routes applyLigatures() to

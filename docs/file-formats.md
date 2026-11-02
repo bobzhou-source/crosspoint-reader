@@ -490,6 +490,41 @@ unreadable entry was seen, the staging files are discarded and the live index is
 left byte-for-byte unchanged. A normal rebuild action is therefore a freshness
 check, not a forced metadata reread.
 
+### Background refresh and interrupted builds
+
+The Library retains its validated index while a low-priority worker scans the
+card and prepares `library.new`. Only the UI publishes that file, after closing
+the displayed index under the render lock. A small progress readout reports
+scanned entries and completed metadata work. Leaving the screen cancels and joins
+the worker; reopening resumes completed metadata work. Home never builds the index
+just to fill empty cover-grid slots.
+
+A build claims `library.dirty` as `library.updating`. Successful publication
+removes only `library.updating`; a new `library.dirty` written by a concurrent
+transfer remains pending. Failure or cancellation leaves a retry marker.
+
+`library.resume` is a bounded, disposable metadata journal, not a second index.
+Its records contain a version, complete-path fingerprint, size, nonzero FAT
+mtime, bounded title/author bytes and a checksum. Successful metadata that fits
+the journal's bounds is synced; oversized values and unknown timestamps are
+reparsed after interruption rather than truncated before author normalization.
+After a restart only complete checksummed records with matching identity are
+reused. A torn tail is overwritten. Directory enumeration is always repeated,
+so removed files are dropped even after interruption. Journal memory is bounded
+by 4,096 compact lookup keys and one record; it is released before index sorting.
+The journal is removed after successful publication. CLX1 v2 remains unchanged.
+
+Changed EPUBs read their source OPF rather than trusting the reader's path-keyed
+`book.bin`; only the current index and validated journal supply freshness-aware
+metadata. Parsing stops at the metadata boundary and never decodes a cover or
+builds spine, TOC, CSS or page caches.
+
+Adding N books requires N EPUB parses, not a parse of every unchanged book.
+Discovering removals still requires an O(total entries) directory scan, and
+emitting the packed sorted index still writes O(total entries) bytes. Ordinary
+paging reads only visible records. A fallible 512-byte blob window shares a
+row's filename/title/author reads; allocation failure uses direct reads.
+
 ### Header flags
 
 `RANKS_DEGRADED` says one or more orders fell back to walk order because a

@@ -13,6 +13,7 @@
 #include "BookmarkEntry.h"
 #include "ChapterPosition.h"
 #include "EpubReaderMenuActivity.h"
+#include "PagePrerender.h"
 #include "ProgressMapper.h"
 #include "ReaderActivity.h"
 #include "ReaderToolbarUi.h"
@@ -52,6 +53,29 @@ class EpubReaderActivity : public ReaderActivity {
   int idlePrewarmSpine = -1;
   int idlePrewarmPage = -1;
   unsigned long lastRenderCompleteMs = 0;
+  // Idle prerender of the page after the one on screen (PagePrerender.h,
+  // PagePrerenderKey.h). loop() builds it into spare PSRAM once the screen has
+  // settled; renderBook() presents it on a turn that lands on exactly that
+  // page, in place of rendering the page body again. Built, presented and
+  // invalidated only under the RenderLock.
+  PagePrerender prerender;
+  // The layout the current section was loaded with (set whenever renderBook()
+  // creates the section) and the oriented margins the last page render drew
+  // at: what a prerendered successor in the same section must share.
+  ReaderRenderSpec sectionSpec;
+  struct PageMargins {
+    int top = 0;
+    int right = 0;
+    int bottom = 0;
+    int left = 0;
+    bool valid = false;
+  };
+  PageMargins lastRenderMargins;
+  // The page the panel currently shows (set when renderBook() finishes it), so
+  // the prerender never starts while a requested turn is still waiting to render.
+  int shownSpineIndex = -1;
+  int shownPage = -1;
+  static constexpr unsigned long PRERENDER_ALLOC_RETRY_MS = 60000;
   bool bookmarkRemoved = false;
   std::vector<BookmarkEntry> cachedBookmarks;
   bool recentsEntryRemoved = false;
@@ -131,7 +155,7 @@ class EpubReaderActivity : public ReaderActivity {
   static constexpr size_t BUILD_POPUP_BYTE_THRESHOLD = 96 * 1024;
   static constexpr unsigned long BUILD_POPUP_DEADLINE_MS = 1000;
   bool buildPopupPending = false;
-  void showBuildPopup(GfxRenderer& renderer, int& pagesUntilFullRefresh);
+  void showBuildPopup(GfxRenderer& renderer);
   bool applyDeferredReposition();
   void clearDeferredReposition();
   void rememberCurrentContentOffset();
@@ -154,6 +178,7 @@ class EpubReaderActivity : public ReaderActivity {
   void handleOverlayInput();
   void renderOverlay();
   std::string currentChapterTitle() const;
+  int currentTocIndex() const;
   // Text panel rows (font, size, line spacing, alignment, focus reading).
   std::string textRowName(int row) const;
   std::string textRowValue(int row) const;
@@ -182,8 +207,30 @@ class EpubReaderActivity : public ReaderActivity {
   void restoreSavedPosition();
 
   void addAnnotation();
+  // `prerendered` replaces `page` when the turn presents an idle-prerendered
+  // body (see PagePrerender); the page itself is then not loaded (null).
   void renderContents(std::unique_ptr<Page> page, int orientedMarginTop, int orientedMarginRight,
-                      int orientedMarginBottom, int orientedMarginLeft);
+                      int orientedMarginBottom, int orientedMarginLeft, const PagePrerender* prerendered = nullptr);
+  // The grayscale route a page render takes. renderContents() and the
+  // prerender both derive it here, so a prerendered page is only presented on
+  // the route it was built for.
+  struct RenderPlan {
+    page_prerender::PlanInputs in;
+    bool combinedGrayscaleBase = false;
+  };
+  RenderPlan planRender(bool pageHasImages) const;
+  page_prerender::Key prerenderKey(int spineIndex, int pageIndex, uint32_t sectionPageCount,
+                                   const ReaderRenderSpec& spec, int marginTop, int marginRight, int marginBottom,
+                                   int marginLeft, page_prerender::Plan plan) const;
+  void invalidatePrerender();
+  // True while a button, touch or raw input is active, polled mid-prerender.
+  bool inputPending() const;
+  // loop(), RenderLock held: warm the glyph caches for the next page and
+  // prerender it where it qualifies.
+  void idlePrewarmNextPage();
+  bool prerenderPage(const Page& page, int spineIndex, int pageIndex, uint32_t sectionPageCount,
+                     const ReaderRenderSpec& spec);
+  void prerenderNextSectionPage(int nextSpineIndex);
   void renderStatusBar() const;
   void applyOrientation(uint8_t orientation);
   void applyInitialOrientation() override;

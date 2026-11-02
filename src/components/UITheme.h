@@ -24,6 +24,9 @@ class UITheme {
   const BaseTheme& getTheme() const { return currentTheme ? *currentTheme : fallbackTheme; }
   Rect getScreenSafeArea(const GfxRenderer& renderer, bool hasFrontButtonHints = false,
                          bool hasSideButtonHints = false);
+  // State-screen body: bezel-safe, below the header and above physical hints.
+  static Rect getContentBounds(const GfxRenderer& renderer, bool hasHeader = true);
+  static bool isRtl();
   static void drawCenteredText(const GfxRenderer& renderer, Rect screen, int fontId, int y, const char* text,
                                bool black = true, EpdFontFamily::Style style = EpdFontFamily::REGULAR);
   // Wraps only overflowing text, then aligns the complete line block within bounds.

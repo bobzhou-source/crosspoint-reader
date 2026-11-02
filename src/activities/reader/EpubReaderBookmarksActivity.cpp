@@ -250,7 +250,10 @@ void EpubReaderBookmarksActivity::buildScreen(UiScreen& screen) {
   screen.spacer(static_cast<int16_t>(metrics.verticalSpacing));
 
   if (bookmarks.empty()) {
-    screen.centeredText(tr(STR_NO_BOOKMARKS), screen.theme().bodyText);
+    auto style = screen.theme().bodyText;
+    style.align = fui::TextAlign::Center;
+    style.maxLines = 4;
+    screen.target().text(screen.body().inset(fui::Insets{0, 20, 0, 20}), tr(STR_NO_BOOKMARKS), style);
     return;
   }
 
@@ -270,38 +273,13 @@ void EpubReaderBookmarksActivity::buildScreen(UiScreen& screen) {
   props.action = ACTION_ROW;
   // Tap opens; long-press shows bookmark actions (physical buttons stay in loop()).
   props.inputMask = fui::InputTouch | fui::InputLongPress;
+  props.labelText = screen.theme().bodyText;
+  props.labelText.maxLines = 2;
   syncListViewport(screen, props);
   screen.list(props);
 }
 
-void EpubReaderBookmarksActivity::render(RenderLock&&) {
-  renderer.clearScreen();
-
-  const auto pageWidth = renderer.getScreenWidth();
-  const auto orientation = renderer.getOrientation();
-  // Landscape orientation: reserve a horizontal gutter for button hints.
-  const bool isLandscapeCw = orientation == GfxRenderer::Orientation::LandscapeClockwise;
-  const bool isLandscapeCcw = orientation == GfxRenderer::Orientation::LandscapeCounterClockwise;
-  // Inverted portrait: reserve vertical space for hints at the top.
-  const bool isPortraitInverted = orientation == GfxRenderer::Orientation::PortraitInverted;
-  const int hintGutterWidth = (isLandscapeCw || isLandscapeCcw) ? 40 : 0;
-  // Landscape CW places hints on the left edge; CCW keeps them on the right.
-  const int contentX = isLandscapeCw ? hintGutterWidth : 0;
-  const int contentWidth = pageWidth - hintGutterWidth;
-  const int contentY = isPortraitInverted ? 50 : 0;
-
-  // Manual centering to honor content gutters.
-  const int titleX =
-      contentX + (contentWidth - renderer.getTextWidth(UI_12_FONT_ID, tr(STR_BOOKMARKS), EpdFontFamily::BOLD)) / 2;
-  renderer.drawText(UI_12_FONT_ID, titleX, 15 + contentY, tr(STR_BOOKMARKS), true, EpdFontFamily::BOLD);
-
-  renderUi();
-
+void EpubReaderBookmarksActivity::render(RenderLock&& lock) {
   if (confirmPopup.processRender(renderer, mappedInput)) return;
-
-  const auto confirmLabel = bookmarks.size() > 0 ? tr(STR_SELECT) : "";
-  const auto labels = mappedInput.mapLabels(tr(STR_BACK), confirmLabel, tr(STR_DIR_UP), tr(STR_DIR_DOWN));
-  GUI.drawButtonHints(renderer, labels.btn1, labels.btn2, labels.btn3, labels.btn4);
-
-  renderer.displayBuffer();
+  UiListActivity::render(std::move(lock));
 }

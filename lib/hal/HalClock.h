@@ -2,12 +2,14 @@
 
 #include <Arduino.h>
 #include <Rtc.h>
+#include <mutex>
 
 class HalClock;
 extern HalClock halClock;  // Singleton
 
 class HalClock {
   bool _available = false;
+  mutable std::mutex clockMutex;
   mutable Rtc _sdkRtc;
   // The RTC keeps UTC; local time comes from newlib's localtime_r under the
   // POSIX TZ rule set via setTimezone(), so zones with DST are correct
@@ -49,5 +51,5 @@ class HalClock {
   //
   // Debouncing (skip if already synced once) is enforced by the caller, not here,
   // so the HAL stays free of any app-layer settings dependency.
-  bool syncFromNTP();
+  bool syncFromNTP(bool (*cancelled)(void*) = nullptr, void* context = nullptr);
 };

@@ -1486,6 +1486,12 @@ int SdCardFont::fetchAdvancesForCodepoints(uint32_t* codepoints, uint32_t cpCoun
     // (returns 0); the slow path is still correct for those codepoints.
     if (advanceTableSize_[si] >= ADVANCE_CACHE_LIMIT) continue;
 
+    // Warm style: every codepoint already has an advance, so there is nothing to
+    // resolve or read. Skip before the per-style scratch allocation below.
+    uint32_t firstUncached = 0;
+    while (firstUncached < cpCount && advanceTableLookup(si, codepoints[firstUncached], nullptr)) firstUncached++;
+    if (firstUncached == cpCount) continue;
+
     // For each codepoint in `codepoints`, skip those already cached, then
     // resolve to a glyph index. Build a parallel array sorted by glyph index
     // for sequential SD reads.
@@ -1503,7 +1509,7 @@ int SdCardFont::fetchAdvancesForCodepoints(uint32_t* codepoints, uint32_t cpCoun
     uint32_t needCount = 0;
     uint32_t missedThisStyle = 0;
     const int32_t replacementIdx = findGlobalGlyphIndex(s, REPLACEMENT_GLYPH);
-    for (uint32_t i = 0; i < cpCount; i++) {
+    for (uint32_t i = firstUncached; i < cpCount; i++) {
       const uint32_t cp = codepoints[i];
       if (advanceTableLookup(si, cp, nullptr)) continue;  // already cached
       int32_t idx = findGlobalGlyphIndex(s, cp);
@@ -1577,6 +1583,43 @@ int SdCardFont::fetchAdvancesForCodepoints(uint32_t* codepoints, uint32_t cpCoun
   return totalMissed;
 }
 
+bool SdCardFont::advancesResident(const char* const* segments, const size_t* segmentLens, const size_t segmentCount,
+                                  const bool includeSpace, const bool includeHyphen, const uint8_t styleMask,
+                                  const char* extraText) const {
+  // A style whose table is full never fetches again (see fetchAdvancesForCodepoints),
+  // so it counts as resident for every codepoint.
+  const auto resident = [&](const uint32_t cp) {
+    for (uint8_t si = 0; si < MAX_STYLES; si++) {
+      if (!(styleMask & (1 << si)) || !styles_[si].present) continue;
+      if (advanceTableSize_[si] >= ADVANCE_CACHE_LIMIT) continue;
+      if (!advanceTableLookup(si, cp, nullptr)) return false;
+    }
+    return true;
+  };
+  // Same termination rule as collectUniqueCodepoints: stop at the first NUL codepoint.
+  const auto textResident = [&](const char* text) {
+    const unsigned char* p = reinterpret_cast<const unsigned char*>(text);
+    while (*p) {
+      const uint32_t cp = utf8NextCodepoint(&p);
+      if (cp == 0) break;
+      if (!resident(cp)) return false;
+    }
+    return true;
+  };
+
+  if (includeSpace && !resident(' ')) return false;
+  if (includeHyphen && !resident('-')) return false;
+  for (size_t seg = 0; seg < segmentCount; ++seg) {
+    const char* p = segments[seg];
+    const char* const end = p + segmentLens[seg];
+    while (p < end) {
+      if (!textResident(p)) return false;
+      p += strlen(p) + 1;
+    }
+  }
+  return extraText == nullptr || textResident(extraText);
+}
+
 int SdCardFont::buildAdvanceTablePacked(const char* const* segments, const size_t* segmentLens,
                                         const size_t segmentCount, const bool includeSpace, const bool includeHyphen,
                                         uint8_t styleMask, const char* extraText) {
@@ -1585,6 +1628,17 @@ int SdCardFont::buildAdvanceTablePacked(const char* const* segments, const size_
   if (styleMask == 0) return 0;
 
   unsigned long startMs = millis();
+
+  // Warm fast path: layout re-asks for the same words every render scope and
+  // every page turn, and the advance tables outlive clearCache(). When every
+  // codepoint already has an advance in every requested style, there is nothing
+  // to resolve, read or merge — skip the 16 KB scratch buffer, the O(n·unique)
+  // dedup, the sort and the per-style scratch. The result is identical: the
+  // fetch below would have found nothing to fetch and reported 0 missed.
+  if (advancesResident(segments, segmentLens, segmentCount, includeSpace, includeHyphen, styleMask, extraText)) {
+    stats_.prewarmTotalMs = millis() - startMs;
+    return 0;
+  }
 
   // +2 reserved slots for space and hyphen injected after the main scan.
   static constexpr uint32_t MAX_UNIQUE_CODEPOINTS = 4096;

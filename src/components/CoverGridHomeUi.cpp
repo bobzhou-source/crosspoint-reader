@@ -10,12 +10,6 @@
 
 #include "MappedInputManager.h"
 #include "UITheme.h"
-#include "icons/blocks.h"
-#include "icons/book.h"
-#include "icons/folder.h"
-#include "icons/library.h"
-#include "icons/settings2.h"
-#include "icons/transfer.h"
 #include "util/BookProgress.h"
 
 namespace fui = freeink::ui;
@@ -24,7 +18,6 @@ constexpr fui::ActionId SELECT = 1;
 // Grid cell padding around each cover; also feeds the screen's horizontal
 // inset so the cover columns land on the header chrome's inset line.
 constexpr int16_t COVER_CELL_INSET = 6;
-constexpr int COVER_ROW_EXTRA_HEIGHT = 8;
 }  // namespace
 
 CoverGridHomeUi::CoverGridHomeUi(GfxRenderer& renderer)
@@ -93,10 +86,7 @@ void CoverGridHomeUi::draw(UiScreen& screen) {
   screen.setContentMarginFromScreen(fui::Insets{
       static_cast<int16_t>(safe.y), static_cast<int16_t>(renderer.getScreenWidth() - safe.x - safe.width),
       static_cast<int16_t>(renderer.getScreenHeight() - safe.y - safe.height), static_cast<int16_t>(safe.x)});
-  // Horizontal inset sized so the outer cover columns (content x plus the
-  // grid's cell inset) sit on the theme's side-padding line: the heading and
-  // tabs then align with the clock and battery, which tuck a few px further
-  // in (headerStatusInset's optical bias).
+  // Outer cover columns align with the header chrome and route labels.
   const int16_t hInset = std::max<int16_t>(
       0, static_cast<int16_t>(UITheme::getInstance().getMetrics().headerSidePadding - COVER_CELL_INSET - safe.x));
   // Drop the status band, hero, and grid down: touch boards get a full step
@@ -105,19 +95,16 @@ void CoverGridHomeUi::draw(UiScreen& screen) {
   const int16_t topInset =
       BoardConfig::hasTouch() ? static_cast<int16_t>(theme.spaceLg) : static_cast<int16_t>(theme.spaceSm + 4);
   screen.insetContent(fui::Insets{topInset, hInset, theme.spaceSm, hInset});
-  const bool landscape = renderer.getScreenWidth() > renderer.getScreenHeight();
-  // Reserve the band's slot in the flow (its content draws at a fixed screen
-  // position in drawHeaderBand); the slot doubles as padding above the heading.
+  const int16_t navRowHeight = std::max<int16_t>(48, 2 * screen.target().lineHeight(theme.smallText.font) + 8);
   screen.takeTop(UITheme::getInstance().getMetrics().batteryBarHeight, theme.spaceSm);
-  // Button boards run tighter above the tabs to make room for the top step.
-  const int16_t tabGap = BoardConfig::hasTouch() ? theme.spaceSm : static_cast<int16_t>(4);
-  auto tabRect = screen.takeBottom(UITheme::getInstance().getMetrics().coverGridTabBarHeight, tabGap);
   if (books->empty()) {
-    drawTabs(screen, tabRect.inset(fui::Insets{0, COVER_CELL_INSET, 0, COVER_CELL_INSET}));
     drawEmpty(screen);
+    screen.spacer(16);
+    drawTabs(screen, screen.takeTop(static_cast<int16_t>(navRowHeight * 2)));
     drawHeaderBand();
     return;
   }
+  auto tabRect = screen.takeBottom(static_cast<int16_t>(navRowHeight * 2), theme.spaceSm);
   // Hero cover matches the grid covers: the body splits into three equal
   // cover rows (hero + two grid rows), so the featured section is one row
   // tall and every cover on screen shares one size. The metadata floor still
@@ -125,10 +112,12 @@ void CoverGridHomeUi::draw(UiScreen& screen) {
   const fui::Rect body = screen.body();
   const int rowGap = std::max<int>(4, body.width / 100);
   grid.gap = grid.rowGap = rowGap;
-  const int coverRowHeight = std::max(1, (body.height - theme.spaceSm - 2 * rowGap) / 3 + COVER_ROW_EXTRA_HEIGHT);
+  const int nominalRowHeight = std::max(1, (body.height - theme.spaceSm - 2 * rowGap) / 3);
   const int16_t featuredHeight = std::min<int>(
-      body.height, std::max<int>(coverRowHeight, screen.target().lineHeight(theme.bodyText.font) * (landscape ? 1 : 2) +
+      body.height, std::max<int>(nominalRowHeight, screen.target().lineHeight(theme.bodyText.font) * 2 +
                                                      screen.target().lineHeight(theme.smallText.font) * 2 + 32));
+  const int coverRowHeight = std::max(1, std::min(nominalRowHeight,
+                                                (body.height - featuredHeight - theme.spaceSm - rowGap) / GRID_ROWS));
   drawCurrent(screen, screen.takeTop(featuredHeight, theme.spaceSm), coverRowHeight);
   drawGrid(screen);
   tabRect.x = gridBounds.x + grid.cellInset.left;
@@ -147,34 +136,30 @@ void CoverGridHomeUi::drawHeaderBand() {
 
 void CoverGridHomeUi::drawEmpty(UiScreen& screen) {
   const auto& theme = screen.theme();
-  const auto body = screen.body();
+  const auto body = screen.takeTop(144);
   auto title = theme.titleText;
-  title.bold = true;
-  title.align = fui::TextAlign::Center;
+  title.bold = false;
+  title.maxLines = 2;
   auto message = theme.bodyText;
-  message.align = fui::TextAlign::Center;
-  constexpr int16_t ICON_SIZE = 32;
-  const int16_t titleHeight = screen.target().lineHeight(title.font);
-  const int16_t messageHeight = screen.target().lineHeight(message.font);
-  const int16_t contentHeight = ICON_SIZE + theme.spaceLg + titleHeight + theme.spaceSm + messageHeight;
-  int16_t y = body.y + std::max(0, (body.height - contentHeight) / 2);
-  renderer.drawIcon(BookIcon, body.x + (body.width - ICON_SIZE) / 2, y, ICON_SIZE);
-  y += ICON_SIZE + theme.spaceLg;
+  message.maxLines = 2;
+  const int16_t titleHeight = fui::measureWrappedText(screen.target(), tr(STR_NO_OPEN_BOOK), title, body.width).height;
+  const int16_t messageHeight = fui::measureWrappedText(screen.target(), tr(STR_START_READING), message,
+                                                       body.width).height;
+  const int16_t y = body.y + std::max(0, (body.height - titleHeight - messageHeight - 8) / 2);
   screen.target().text(fui::Rect{body.x, y, body.width, titleHeight}, tr(STR_NO_OPEN_BOOK), title);
-  y += titleHeight + theme.spaceSm;
-  screen.target().text(fui::Rect{body.x, y, body.width, messageHeight}, tr(STR_START_READING), message);
+  screen.target().text(fui::Rect{body.x, static_cast<int16_t>(y + titleHeight + 8), body.width, messageHeight},
+                       tr(STR_START_READING), message);
 }
 
 void CoverGridHomeUi::drawCurrent(UiScreen& screen, fui::Rect rect, const int coverRowHeight) {
   const auto& theme = screen.theme();
   const auto& book = books->front();
   card.title = book.title.c_str();
-  card.author = book.author.empty() ? nullptr : book.author.c_str();
+  card.author = nullptr;
   card.meta = nullptr;
-  card.progressLabel = progress >= 0 ? progressText : nullptr;
-  card.centerTextOnCover = true;
-  card.progress = std::max(0, progress);
-  card.progressMax = progress >= 0 ? 100 : 0;
+  card.progressLabel = nullptr;
+  card.centerTextOnCover = false;
+  card.progressMax = 0;
   card.action = SELECT;
   // The featured card's selected state is a slim accent bar drawn after the
   // card (see below), not a bookCard indicator: every ring/outline treatment
@@ -182,18 +167,12 @@ void CoverGridHomeUi::drawCurrent(UiScreen& screen, fui::Rect rect, const int co
   // read as misaligned.
   card.state = fui::StateNormal;
   card.styles = theme.listRow;
-  card.styles.selected.background = fui::Paint::dither(fui::Color::LightGray);
-  // The grid thumbs' selection ring draws with this border: gray like Lyra's
-  // selection box, not solid black.
-  card.styles.selected.border = fui::Paint::dither(fui::Color::LightGray);
-  card.styles.selected.foreground = fui::Paint::solid(fui::Color::Black);
-  card.styles.selected.radius = theme.listRowRadius;
+  card.styles.selected = card.styles.normal;
+  card.styles.selected.border = fui::Paint::solid(fui::Color::Black);
+  card.styles.selected.radius = 0;
   card.styles.active = card.styles.selected;
   card.titleText = theme.bodyText;
-  card.titleText.maxLines = renderer.getScreenWidth() > renderer.getScreenHeight() ? 1 : 2;
-  card.authorText = theme.smallText;
-  card.progressText = theme.smallText;
-  card.progressHeight = 6;
+  card.titleText.maxLines = 2;
   card.padding = fui::Insets{6, 6, 6, 6};
   card.gap = theme.spaceLg + theme.spaceSm;
   // Fit the shared 2:3 cover box within both the row and a grid column. No
@@ -211,6 +190,27 @@ void CoverGridHomeUi::drawCurrent(UiScreen& screen, fui::Rect rect, const int co
     return static_cast<CoverGridHomeUi*>(user)->paintFramedCover(target, cover, 0);
   };
   fui::bookCard(screen.frame(), rect, card);
+  const int16_t textX = rect.x + card.padding.left + card.coverSize.width + card.gap;
+  const int16_t textWidth = std::max(0, rect.right() - card.padding.right - textX);
+  if (!book.author.empty()) {
+    const int16_t titleHeight = fui::measureWrappedText(screen.target(), book.title.c_str(), card.titleText,
+                                                        textWidth).height;
+    screen.target().text({textX, static_cast<int16_t>(rect.y + card.padding.top + titleHeight + 4), textWidth,
+                          screen.target().lineHeight(theme.smallText.font)}, book.author.c_str(), theme.smallText);
+  }
+  if (progress >= 0) {
+    const int16_t x = textX;
+    const int16_t height = screen.target().lineHeight(theme.smallText.font);
+    const int16_t y = rect.bottom() - card.padding.bottom - height;
+    const int16_t labelWidth = screen.target().measureText(theme.smallText.font, progressText, theme.smallText).width;
+    screen.target().text({x, y, labelWidth, height}, progressText, theme.smallText);
+    const int16_t barX = x + labelWidth + 8;
+    const int16_t barWidth = std::max(0, rect.right() - card.padding.right - barX);
+    const fui::Rect track{barX, static_cast<int16_t>(y + height / 2 - 2), barWidth, 4};
+    screen.target().stroke(track, fui::Paint::solid(fui::Color::Black), 1);
+    screen.target().fill({track.x, track.y, static_cast<int16_t>(barWidth * std::clamp(progress, 0, 100) / 100), track.height},
+                         fui::Paint::solid(fui::Color::Black));
+  }
 
   if (selected == 0 && !BoardConfig::hasTouch()) {
     // Button boards only: a vertical accent bar left of the card, cover-height
@@ -220,7 +220,7 @@ void CoverGridHomeUi::drawCurrent(UiScreen& screen, fui::Rect rect, const int co
     const int16_t barH = card.coverSize.height;
     screen.target().fill(
         fui::Rect{static_cast<int16_t>(rect.x - 5), static_cast<int16_t>(rect.y + (rect.height - barH) / 2), 3, barH},
-        fui::Paint::dither(fui::Color::LightGray));
+        fui::Paint::solid(fui::Color::Black));
   }
 }
 
@@ -245,13 +245,9 @@ void CoverGridHomeUi::drawGrid(UiScreen& screen) {
   grid.action = SELECT;
   grid.inputMask = fui::InputTouch;
   grid.selectedIndex = selected > 0 && selected < static_cast<int>(books->size()) ? selected - 1 : -1;
-  // Same thick cover ring as the featured card; the dithered Cell background
-  // was easy to miss behind a dark cover.
   grid.selectionIndicator = fui::CoverGridSelectionIndicator::CoverFrame;
-  // Thick dithered ring sized for the small thumbs: 6px outside the cover,
-  // 2px over its edge.
-  grid.selectedCoverFrameGap = 6;
-  grid.selectedCoverFrameWidth = 8;
+  grid.selectedCoverFrameGap = 2;
+  grid.selectedCoverFrameWidth = 2;
   grid.cellStyles = card.styles;
   grid.labelHeight = 0;
   grid.labelGap = 0;
@@ -266,44 +262,42 @@ void CoverGridHomeUi::drawGrid(UiScreen& screen) {
 }
 
 void CoverGridHomeUi::drawTabs(UiScreen& screen, fui::Rect rect) {
-  static constexpr const uint8_t* ICONS[] = {FolderIcon, LibraryIcon, BookIcon, BlocksIcon, TransferIcon, Settings2Icon};
+  static constexpr StrId LABELS[] = {StrId::STR_BROWSE_FILES, StrId::STR_LIBRARY, StrId::STR_READING_INBOX,
+                                     StrId::STR_OPDS_BROWSER, StrId::STR_FILE_TRANSFER, StrId::STR_SETTINGS_TITLE};
   int count = 0;
   for (int i = 0; i < 6; ++i) {
     if (i == 3 && !hasOpds) continue;
     auto& tab = tabItems[count];
     tab.value = books->size() + count;
     tab.selected = selected == tab.value;
-    tab.label = nullptr;
+    tab.label = I18N.get(LABELS[i]);
     ++count;
   }
   tabs.tabs = tabItems.data();
   tabs.count = count;
-  tabs.layout = fui::TabBarLayout::SpaceBetween;
+  tabs.layout = fui::TabBarLayout::EqualWidth;
   tabs.action = SELECT;
   tabs.inputMask = fui::InputTouch;
-  tabs.iconSize = 32;
-  tabs.iconPainterUserData = this;
-  tabs.iconPainter = [](fui::DrawTarget&, fui::Rect iconRect, const fui::TabItem& tab, uint8_t, void* user) {
-    const auto& self = *static_cast<CoverGridHomeUi*>(user);
-    const int index = tab.value - static_cast<int>(self.books->size());
-    const int icon = !self.hasOpds && index >= 3 ? index + 1 : index;
-    self.renderer.drawIcon(ICONS[icon], iconRect.x, iconRect.y, iconRect.width);
-    return true;
-  };
+  tabs.text = screen.theme().smallText;
+  tabs.text.maxLines = 2;
+  tabs.minTouchSize = 48;
+  tabs.tabInset = fui::Insets{2, 4, 2, 4};
+  tabs.contentInset = fui::Insets{2, 4, 2, 4};
   tabs.tabStyles.normal.background = fui::Paint::solid(fui::Color::White);
   tabs.tabStyles.selected.background = fui::Paint::solid(fui::Color::White);
   tabs.selectedUnderline = 2;
   tabs.distributedSlotWidth = 0;
-  fui::tabBar(screen.frame(), rect, tabs);
+  for (int row = 0; row < 2; ++row) {
+    tabs.tabs = tabItems.data() + row * 3;
+    tabs.count = std::min(3, count - row * 3);
+    fui::tabBar(screen.frame(),
+                {rect.x, static_cast<int16_t>(rect.y + row * rect.height / 2), rect.width,
+                 static_cast<int16_t>(rect.height / 2)}, tabs);
+  }
 }
 
-bool CoverGridHomeUi::paintFramedCover(fui::DrawTarget& target, fui::Rect rect, size_t index) {
-  constexpr int16_t SHADOW_OFFSET = 2;
-  const auto ink = fui::Paint::solid(fui::Color::Black);
-  target.fill(fui::Rect{rect.right(), static_cast<int16_t>(rect.y + SHADOW_OFFSET), SHADOW_OFFSET, rect.height}, ink);
-  target.fill(fui::Rect{static_cast<int16_t>(rect.x + SHADOW_OFFSET), rect.bottom(), rect.width, SHADOW_OFFSET}, ink);
-  // The false spine draws inside the cover paint (HomeCoverCache), glued to
-  // the art's left edge, so it stays aligned whatever each cover's margin is.
-  const bool drawn = index < coverPaths.size() && coverCache.paint(rect, index, coverPaths[index]);
-  return drawn;
+bool CoverGridHomeUi::paintFramedCover(fui::DrawTarget&, fui::Rect rect, size_t index) {
+  if (index < coverPaths.size() && coverCache.paint(rect, index, coverPaths[index])) return true;
+  GUI.drawCoverPlaceholder(renderer, Rect{rect.x, rect.y, rect.width, rect.height});
+  return true;
 }

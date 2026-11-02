@@ -27,8 +27,8 @@ class DictionaryWordSelectActivity final : public Activity {
   void render(RenderLock&&) override;
 
  private:
-  // Screen box of one selectable word. `text` points into the owned Page's
-  // TextBlock arena (NUL-terminated), valid for this activity's lifetime.
+  // Text points into the owned Page. CJK boxes select one UTF-8 character;
+  // Latin boxes retain the original NUL-terminated token.
   struct WordBox {
     int16_t x;
     int16_t y;
@@ -36,6 +36,8 @@ class DictionaryWordSelectActivity final : public Activity {
     uint16_t row;
     const char* text;
     EpdFontFamily::Style style;
+    uint8_t cjkBytes = 0;
+    uint16_t run = 0;
   };
 
   enum class Popup : uint8_t { None, Busy, NotFound, Error };

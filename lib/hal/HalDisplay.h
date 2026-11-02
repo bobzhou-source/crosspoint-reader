@@ -12,8 +12,13 @@ class HalDisplay {
   using GrayscaleCapabilities = freeink::GrayscaleCapabilities;
   using GrayscaleBase = freeink::GrayscaleBase;
   using GrayscaleEncoding = freeink::GrayscaleEncoding;
+  using FrameChangeMetrics = freeink::FrameChangeMetrics;
 
   GrayscaleCapabilities grayscaleCapabilities(GrayscaleMode mode = GrayscaleMode::Overlay) const;
+
+  // Read-only change/ink counts for the frame in the framebuffer versus the last
+  // displayed frame; allocation-free, no bus traffic. See freeink::FrameChangeMetrics.
+  FrameChangeMetrics measureFrameChange() const;
 
   // Constructor with pin configuration
   HalDisplay();

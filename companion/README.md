@@ -1,6 +1,6 @@
 # Reader Workbench companion
 
-`reader-send` turns public Substack/generic web articles or locally saved HTML into EPUB, then optionally sends the EPUB to the reader with LocalSend v2. Conversion and LocalSend run on your computer and require no cloud account, firmware web fetching, browser automation, cookies, or passwords. A separate, explicitly selected `cloud` command can sync already-converted EPUBs and annotations to a private reader API; it is never enabled by fetch/convert/send or subscription collection.
+`reader-send` turns public Substack/generic web articles or locally saved HTML into EPUB, then optionally sends the EPUB to the reader with LocalSend v2. Standard public-article conversion and LocalSend run on your computer and require no cloud account, firmware web fetching, browser automation, cookies, or passwords. A separate, explicitly selected `cloud` command can sync already-converted EPUBs and annotations to a private reader API; the user-authorized scheduled `collect` pipeline also uses that API automatically, but manual fetch/convert/send and subscription collection alone do not.
 
 ## Install
 
@@ -13,7 +13,17 @@ python -m pip install ./companion
 reader-send --help
 ```
 
-On Windows, activate with `.venv\Scripts\Activate.ps1`. If already inside `companion/`, install with `python -m pip install .`. Pillow is the only runtime dependency; parsing, HTTP, caching, EPUB and LocalSend use the standard library. HTTPS still needs a CA trust store: on a python.org macOS installation run its **Install Certificates.command**, or `python -m pip install certifi` and set `SSL_CERT_FILE=$(python -m certifi)` before using `cloud` or `assist`. Never disable certificate or hostname validation.
+On Windows, activate with `.venv\Scripts\Activate.ps1`. If already inside `companion/`, install with `python -m pip install .`. Pillow is the only runtime dependency for standard article conversion and the card/cloud commands; parsing, HTTP, caching, EPUB and LocalSend use the standard library. `reader-send x --browser`, `x-following`, `subscriptions` sources added with `--browser-url`, and a pre-existing **Send X thread.command** additionally need the optional browser extra: `python -m pip install './companion[browser]'` (or `.[browser]` inside `companion/`), which installs `websockets` for Chrome DevTools capture. HTTPS still needs a CA trust store: on a python.org macOS installation run its **Install Certificates.command**, or `python -m pip install certifi` and set `SSL_CERT_FILE=$(python -m certifi)` before using `cloud` or `assist`. Never disable certificate or hostname validation.
+
+## Chinese-English offline dictionary
+
+From the repository root, `python3 companion/scripts/build_cedict.py OUTPUT/cedict` downloads the official [MDBG CC-CEDICT release](https://www.mdbg.net/chinese/dictionary?page=cc-cedict) and the [CC BY-SA 4.0 license](https://creativecommons.org/licenses/by-sa/4.0/), then creates uncompressed `cedict.ifo`, `cedict.idx` and `cedict.dict`. Copy the entire `cedict` folder under the reader's `/dictionaries/` and select it in **Settings → Reader → Dictionary**. The generator never writes to a card itself.
+
+Definitions contain tone-mark pinyin and English glosses. Simplified and traditional forms share all their senses; ASCII-case-equivalent headwords are merged. Index ordering folds only ASCII bytes, matching firmware `StringUtils::asciiCaseCmp` with UTF-8 bytes in the C locale (not Python Unicode `casefold`). The reader matches up to eight CJK characters from the selected start, bounded by punctuation and the visible line.
+
+`LICENSE.txt`, `ATTRIBUTION.txt`, the original `cedict-source.txt.gz`, `manifest.json` and `SHA256SUMS` accompany the output. Keep the license and attribution alongside redistributed files. Conversion changes are identified in attribution; the converted data remains CC BY-SA 4.0. To reproduce a pinned release offline, use `--source PATH/cedict-source.txt.gz --license PATH/LICENSE.txt`. If a download is blocked, download those two official files manually and pass those options; never disable HTTPS certificate checks. On python.org macOS, configure its certificate store (or `SSL_CERT_FILE=/etc/ssl/cert.pem`) as described above.
+
+Behavioral tests: `python3 -m pytest companion/tests/test_cedict.py`. Production C++ longest-prefix/UTF-8-ordering tests are registered under `test/cjk_dictionary`; its executable optionally accepts an extensionless generated dictionary path to validate every index entry with the actual firmware comparator.
 
 ## Fetch, convert, inspect, send
 
@@ -43,8 +53,11 @@ reader-send send ./saved-post.epub                         # discover one HTTP r
 reader-send send FULL_24_CHARACTER_CACHE_ID --reader 192.168.1.42:53317
 reader-send fetch 'https://example.com/article' --send --reader 192.168.1.42:53317
 
-# Manual SD delivery: copy the exported EPUB to your SD card's books folder.
-reader-send convert ./saved-post.html --output /Volumes/READER/books/
+# After the one-time card setup below, deliver every verified cached article.
+reader-send card sync
+
+# Manual fallback: copy an exported EPUB to the reader's inbox.
+reader-send convert ./saved-post.html --output /Volumes/READER/books/Inbox/
 ```
 
 `--title`, `--author`, and `--date` override extracted metadata. `--output` is an EPUB filename or directory; directory/ZIP inputs need a directory. Explicit output files are not overwritten without `--force`. Names are ASCII slugs plus deterministic hash suffixes, at most 90 bytes. `--reader` requires `--send` on fetch/convert, so a target flag alone cannot silently initiate delivery. Multiple discovered receivers require explicit selection.
@@ -57,7 +70,7 @@ Metadata comes from Open Graph, HTML headings/bylines/time tags and Article JSON
 
 Local conversion is **offline by default**. Relative images must stay inside the HTML's containing folder, the supplied directory, or the ZIP; embedded image data is supported. Absolute local paths and symlink escapes are rejected. Remote image URLs in saved HTML are omitted with alt text unless `--remote-images` is supplied. With remote article fetching, images are fetched normally; `--no-images` keeps just text/alt text. Image failures warn without losing the prose.
 
-Limits: 8 MiB per HTML/image download, 100,000 HTML nodes / 128 nesting levels, 32 article images, 20 megapixels per decoded image. Images are normalized to metadata-free JPEGs, no longer than 1,200 pixels on either edge and no larger than 512 KiB each; animation uses the first frame. Export ZIPs are limited to 10,000 entries / 256 MiB uncompressed. Directory imports are limited to 1,000 HTML posts. EPUB 2 includes a proper first/uncompressed mimetype, OPF manifest, NCX and well-formed XHTML.
+Limits: 8 MiB per HTML/image/feed download, 100,000 HTML nodes / 128 nesting levels, 32 article images, 20 megapixels per decoded image. Images are normalized to metadata-free JPEGs, no longer than 1,200 pixels on either edge and no larger than 512 KiB each; animation uses the first frame. Export ZIPs are limited to 10,000 entries / 256 MiB uncompressed. Directory imports are limited to 1,000 HTML posts. EPUB 2 includes a proper first/uncompressed mimetype, OPF manifest, NCX and well-formed XHTML.
 
 ### Cache, dry runs and network behavior
 
@@ -93,14 +106,23 @@ reader-send subscriptions add essays --feed 'https://publication.substack.com/fe
 # Optional paid/full-text source: HTML saved using your existing authorized Mac session,
 # or an unzipped Substack export. Credentials remain in your browser, never this tool.
 reader-send subscriptions add essays --feed 'https://publication.substack.com/feed' --export-dir "$HOME/Documents/saved-essays"
+# Private/browser-only publication: read its rendered archive through the Chrome session
+# that is already signed in. No cookies, headers or passwords are extracted.
+reader-send subscriptions add already-dawn --browser-url 'https://publication.substack.com/archive'
 reader-send subscriptions list
-reader-send subscriptions sync --dry-run
-reader-send subscriptions sync
-reader-send subscriptions sync --watch --interval 900
+reader-send subscriptions sync --dry-run --since-days 7
+reader-send subscriptions sync --since-days 7
+reader-send subscriptions sync --watch --interval 900 --since-days 7
+# Recent posts from the X Following timeline through signed-in Chrome:
+reader-send x-following sync --since-hours 24 --limit 50
 reader-send subscriptions remove essays
 ```
 
-`sync` is also suitable for your own cron/launchd schedule; `--watch` runs until Ctrl-C and does not install a background service. The Mac must remain running. Each pass checks RSS/Atom and imports up to ten new public posts per publication (`--limit 1–100`). It fetches actual article pages rather than mistaking feed excerpts for complete posts. Feed GUIDs and canonical source IDs deduplicate imports; locally supplied full text takes priority over public previews. Changed local HTML regenerates the same source item. An empty/malformed export folder or blocked feed appears in the structured `errors` array; one-shot sync exits 2 on errors, while watch mode reports them and tries again next pass. Overlapping subscription commands are locked.
+A `--browser-url` source reads the publication's rendered archive through Chrome's loopback DevTools endpoint (`--browser-endpoint`, default `http://127.0.0.1:9333`); it requires the optional browser extra and an already-running signed-in Chrome. It never launches Chrome, extracts cookies or headers, signs in, or mutates the publication. Each pass processes sources in the fixed order local export folder, then browser archive, then RSS/Atom feed; a record with no feed does not fall back to HTTP RSS. Browser failures are reported per archive page or post, including the failing URL, and are never silently retried; `--retries` applies only to HTTP feeds/pages. Cached items use `source_type` `substack-browser` or `browser` and keep both the archive URL and final post URL in provenance. `subscriptions add` replaces the whole record, so when one publication needs several sources, pass them in one command (for example `--feed URL --export-dir DIR`). For `--watch` or the scheduled launchd job, Chrome must remain running on that endpoint; otherwise the pass records the browser error and exits 2.
+
+`--since-days` restricts RSS/Atom and browser sources to posts published inside that window; local export folders are never date-filtered, because those are user-authorized files. Undated items are skipped with warnings and are never assumed to be recent. The scheduled collector uses a 7-day subscription window. `x-following sync` reads the already signed-in Chrome `Following` timeline, keeps a seen list and a 24-hour window in the cache, and stores EPUBs only; the scheduled collector runs it with `--limit 50`. Both collectors require the optional browser extra only when a browser source/X Following is configured. A scheduled or explicit recency pass (`subscriptions sync --since-days …`) first checks account-managed sources; a bare `subscriptions sync` without `--since-days` does not. Account-managed sources are refreshed at most once per 24 hours from the signed-in Substack settings page (`https://substack.com/settings`) through the configured DevTools Chrome endpoint. The list is accepted only when the page's “Show N more” disclosure settles to the announced total; otherwise the pass reports a `managed-refresh` error and changes nothing. Matching records get `managed_origin: substack-account` and `managed_enabled: true|false`; unsubscribed account-managed records are disabled (configuration and cached EPUBs kept, never deleted), re-listed ones are re-enabled, and genuinely new public publications are added as `https://<origin>/feed`. Private/invite-only additions use a browser source only when that settings row says so. Export-only/manual records and their cached books are never disabled or deleted by this refresh. A refresh failure is reported in that collector's errors while article sync continues from the last proven configurations.
+
+`sync` can run once, under your own cron/launchd job, or through the explicit install hook documented below. `--watch` runs until Ctrl-C and does not install a background service. The Mac must remain running. Each pass checks the selected local/browser/RSS sources and imports up to ten new posts per publication (`--limit 1–100`). Publication feeds are read under the same **8 MiB per-download limit** as HTML and images; the DTD/ENTITY feed rejection and robots checks still apply. It fetches actual article pages rather than mistaking feed excerpts for complete posts. Feed GUIDs and canonical source IDs deduplicate imports; locally supplied full text takes priority over public previews. Changed local HTML regenerates the same source item. An empty/malformed export folder or blocked feed appears in the structured `errors` array; one-shot sync exits 2 on errors, while watch mode reports them and tries again next pass. Overlapping…
 
 All sources share `ReadingItem` in `reader_send.model`; `reader_send.extract.Article` remains the same type for existing callers. Metadata includes `source_type`, stable `source_id`, canonical `source_url`, title/author/date, `fetched_at`, warnings, source provenance, `read_state` and fractional `progress`. Source IDs survive content updates; read/progress is stored separately from generated EPUBs and shared by cache variants:
 
@@ -113,12 +135,203 @@ reader-send inbox FULL_CACHE_ID --state unread
 
 This is local inbox state, not automatic firmware reading-position synchronization. The opt-in cloud client consumes `Cache.get()` metadata and EPUB bytes without source-specific firmware; it does not change local read/progress state.
 
+## Reader delivery, SD fallback and reviewed firmware
+
+The card workflow is deliberately separate from LocalSend and from the optional cloud. It is available on macOS only, binds **one exact removable volume UUID**, and never guesses a disk number or `/Volumes` name.
+
+### One-time setup
+
+Insert the reader's SD card, then bind it explicitly. Setup verifies that the UUID is currently mounted, external/removable and writable, verifies the reviewed firmware SHA-256 before writing anything, creates the annotation output and launcher folders, stores the card configuration, and regenerates one Finder launcher:
+
+```sh
+reader-send card setup \
+  --volume-uuid '6A4B4C73-B747-33DA-BF3D-455A3C03D0CB' \
+  --annotations-dir "$HOME/papyrix/annotations" \
+  --firmware "$HOME/papyrix/verification/reader-workbench-rollback-reviewed.bin" \
+  --sha256 '2383850eeb9d33447c418ba9ea524f4750aae832a5319754efbc4725bc3deac6' \
+  --launchers-dir "$HOME/papyrix/Reader Workbench"
+```
+
+The default configuration is `~/Library/Application Support/reader-send/card.json`; pass `--config PATH` to `setup`, `sync`, `status` or `update` to use another file. It contains exactly:
+
+```json
+{
+  "version": 1,
+  "volume_uuid": "6A4B4C73-B747-33DA-BF3D-455A3C03D0CB",
+  "annotations_dir": "/Users/you/papyrix/annotations",
+  "firmware_path": "/Users/you/papyrix/verification/reader-workbench-rollback-reviewed.bin",
+  "firmware_sha256": "2383850eeb9d33447c418ba9ea524f4750aae832a5319754efbc4725bc3deac6",
+  "launchers_dir": "/Users/you/papyrix/Reader Workbench"
+}
+```
+
+Re-running setup is explicitly allowed and replaces only `Reader Workbench.command` and this configuration. Other files already in the launcher folder are left untouched. The exact UUID is required, so do not substitute a disk number or `/Volumes/NAME`.
+
+The generated launcher is an ordinary executable `.command` file in the folder you chose:
+
+- **Reader Workbench.command** — opens a menu:
+  - **Sync now (collect)** — runs `reader-send collect --annotations-out <annotations-dir>/cloud-annotations.ndjson` (the configured annotation folder is pinned in the generated script); it fetches recent publications and the X Following timeline, drains shared links, and syncs the private site as configured.
+  - **Send a link** — prompts for one URL and runs the installed **Send to Reader** Apple Shortcut through `/usr/bin/shortcuts run`. The URL is written to a temporary input file, never interpolated into a shell command. The launcher waits for the Shortcut result sheet's **Done** action before returning. If the Shortcut is not installed or no URL is entered, it reports that and sends nothing; it never adds a source URL.
+  - **Update firmware (verified card update)** — runs `reader-send card update` against the configured card and reviewed image.
+  - **Status** — reports `card status`, whether the **Send to Reader** Shortcut is installed, and the cache, launcher and annotation paths.
+  - **Open files** — opens the launcher folder and cache, and the annotation folder when it exists.
+  - **Quit**.
+
+The menu waits for Return between actions when it has a terminal; bare `reader-send` commands do not prompt or pause. Pre-existing `Sync website.command`, `Send X thread.command` or other wrappers are not regenerated or modified by setup. There is no assist launcher and no implicit upload from bare `reader-send` commands.
+
+### Deliver books and import annotations
+
+```sh
+reader-send card status   # read-only: is the exact configured card mounted?
+reader-send card sync
+```
+
+`card status` exits zero only when the configured UUID resolves to the mounted external card; it writes nothing. `card sync` resolves the configured UUID again and fails before any write when the card is absent, unmounted, internal, not removable, read-only, or a different volume. It copies only existing cache entries whose EPUB checksum verifies, into `books/Inbox/` on the card. A destination that already contains identical bytes is counted as unchanged; different existing bytes are never overwritten: sync installs the same stem with `-<sha256[0:8]>` under `books/Inbox/`, so user books and same-named files are preserved. If a book is newly installed or an interrupted delivery is recovered from its pending ledger, the empty firmware marker `/.crosspoint/library.dirty` is created; the reader rebuilds its library on the next Library entry. Repeating sync is idempotent and reports exact copied/unchanged counts and paths.
+
+Reader annotations are read from `/.crosspoint/annotations/` using the existing native annotation loader. They are written on the Mac as `reading-inbox-<volume-uuid>.md` under the configured annotation folder, preserving every source anchor and the native source path/chapter/XPath/location fields. When at least one real native record exists, sync also writes a managed `reading-inbox-<volume-uuid>.json` wrapper containing the exact native records (`format: reader-workbench-native-v1`, `device_id`, `annotations`); that is the input for the explicit website launcher. A zero-note card creates no native JSON input, and existing managed exports are not deleted. Existing files are only rewritten when content changes; a non-managed file at either path is refused. Sync does not delete card books, create a missing card without cause, or run any firmware action.
+
+The site route and card route use the same `/books/Inbox/<basename(source_path)>` convention and the same deterministic collision names. Identical bytes at the canonical path are already delivered. If the canonical path holds different bytes, card sync uses `<stem>-<sha256[0:8]>.epub`; if that also differs, it uses `<uuid>.epub`, and only an exhausted ladder stops without overwriting anything. An identical file at any rung is treated as delivered. A small local ledger under the cache records each cache item's installed filename and a `pending`/`complete` state. Pending entries are persisted before `library.dirty`; the marker is made durable next, and only then are entries marked complete. A retry after interruption therefore marks the library dirty even though the bytes already match. Repeated completed entries skip the marker, so a book delivered through both routes is not duplicated.
+
+Use exactly one annotation uploader per deployment. If the card's `/.crosspoint/reader-sync.json` has direct device sync enabled, the firmware uploads annotations; do not also run `cloud sync --annotations-in` against that card. A pre-existing `Sync website.command` is for the companion-managed upload path, not a second uploader for a direct-sync card.
+
+### Automatic delivery when the card is plugged in
+
+```sh
+reader-send card autosync            # what the LaunchAgent runs; safe to run by hand
+reader-send card autosync --no-notify --batch 8 --passes 1
+```
+
+`card autosync` is the SD-card fallback while Wi-Fi sync is unavailable. It resolves the configured volume UUID first; when that exact card is not mounted (any other volume, or none) it logs one `skip:` line and does nothing else — no key read, no request, no write, no notification. For the configured card it takes a non-blocking lock in the cache directory (a concurrent run exits as `busy`) and then, in order:
+
+1. lists the ready cloud items and plans the pass inside the server's 60-requests-per-minute allowance (minus a 4-request margin): listing pages, downloads and acknowledgements all count. Books already in the cache cost one acknowledgement each and are handled first; the requests that remain pay for up to `--batch` new downloads (1–27, default 27; a download plus its acknowledgement costs two) into the cache; each download is already SHA-256/size/mimetype checked by the cloud client;
+2. copies **only those books** (not the rest of the cache) into `/books/Inbox` with the ordinary `card sync` rules — no overwriting, deterministic collision names, `library.dirty` marker — and imports card annotations into the annotation folder from `card.json`;
+3. re-reads every card copy it is about to acknowledge from the medium (uncached, symlinks refused) and compares its SHA-256 with the cloud item's checksum; a copy whose SHA-256 matched on an earlier run is not re-read while its size and modification time are unchanged (a changed size or time always re-reads it, and a fresh copy is always read back);
+4. acknowledges, one request each, **only the items whose card copy matched**, until the pass's request budget is spent; an item that failed verification stays `ready` on the server and is reported as held back, and items beyond the budget are acknowledged on the next pass or mount;
+5. if more ready items remain it waits 60 seconds and repeats, up to `--passes` (1–10, default 3), which keeps every minute under the server's 60-request budget.
+
+HTTP 429 stops the run immediately with no retry: acknowledgements already made stand, everything else is retried by the next mount (a card copy that is already verified is acknowledged without downloading again, ahead of any new download). Annotations are imported even when the cloud step fails or the key is missing. The run never ejects, never stages firmware, never writes `/books/Novels` or `/books/Books`, and deletes no book. It appends a few lines per run to `~/Library/Logs/reader-card-autosync.log` (rotated at 512 KiB; never contains the key) and posts one macOS notification with the number of books delivered. Exit status is 0 for success, skipped or busy, and 2 for an error or rate limit.
+
+The management key is **not** stored in a plist, script or log. `READER_SYNC_KEY` is used when it is in the environment; otherwise the run reads the dedicated Keychain item `reader-workbench:sync-key`, account `b` (the same item `collect` uses) at run time and holds the value only in the process, restoring the environment afterwards. To (re)store it, paste the 64-hex key at the prompt (no key on the command line):
+
+```sh
+security add-generic-password -U -a b -s reader-workbench:sync-key -w
+```
+
+The LaunchAgent is `~/Library/LaunchAgents/dev.reader-workbench.card-autosync.plist` (label `dev.reader-workbench.card-autosync`). It has `StartOnMount` and `RunAtLoad` and runs `<repo>/companion/.venv/bin/python -m reader_send --cache-dir ~/.cache/reader-send card autosync`, with no secrets and no schedule: launchd starts it on every volume mount and the UUID check makes every other volume a no-op. Load it with `launchctl bootstrap gui/$(id -u) <plist>`; `launchctl bootout gui/$(id -u)/dev.reader-workbench.card-autosync` removes it. It is independent of the (disabled) `reader-send-subscriptions` agent. macOS may ask once to allow Python to access removable volumes; allow it.
+
+### Convert Chinese TXT novels for the reader
+
+```sh
+reader-send novels convert SRC_DIR OUT_DIR [--jobs N] [--force] [--json]
+reader-send card sync --novels OUT_DIR
+```
+
+The reader builds a book's page index one spine file at a time, so a multi-megabyte `.txt` takes tens of seconds to open while the same text split into chapter files opens in seconds. `novels convert` walks `SRC_DIR` recursively (hidden files and folders are skipped; `.txt` only, case-insensitive), writes a mirrored `.epub` tree below `OUT_DIR`, and **only ever reads `SRC_DIR`**: an `OUT_DIR` equal to or inside `SRC_DIR` is refused before anything is created.
+
+- **Decoding.** UTF-8 with or without BOM, UTF-16 with a BOM (either byte order), then strict GB18030. GB18030 text with embedded UTF-8 punctuation (bullets from some exporters) is recovered and flagged in the report's `warnings`. A file that decodes in none of these, or that is NUL-heavy (binary data, or UTF-16/32 without a BOM), is **refused with a reason**; replacement characters are never inserted. Isolated stray NUL bytes (extraction debris, under 0.1% of the text) cannot be stored in XML, so they are removed and counted like other illegal control characters.
+- **Chapters.** Headings are `第…章/节/回/卷/集/部/篇/话` with Chinese, Arabic or fullwidth numerals; `序章 楔子 引子 前言 尾声 番外 后记 完本感言 Prologue Epilogue`; `Chapter N` / `1、Chapter 1`; `###第1章，…###` and `###《…》###` wrappers; Jinjiang `☆、…` lines; Markdown `##`/`#` lines when the file clearly uses them (three or more `##` lines); and bare `一 标题` / `077，标题` / `836标题` lines when they form a 1, 2, 3… chain of at least ten entries that starts at 1–3, tolerates up to nine missing numbers in a row, and is not a crowded list (forum floors, outlines); a contents block at the top never wins over the real chapters. A heading directly followed by another heading (a table of contents at the top of the file) stays plain text instead of becoming empty chapters. Volumes (`卷/部/集`) nest their chapters in both the EPUB 3 nav and the NCX; text before the first heading becomes its own `卷首` file.
+- **Fallback.** Fewer than five headings → the book is cut into size-bounded files labelled `第N部分`. A chapter larger than 56 KB is cut at paragraph boundaries into continuation files (spine only, one TOC entry; a chapter cut into eight or more files gets a TOC entry `标题（N）` per file so it stays navigable); a single paragraph over 56 KB is cut at sentence ends. Every XHTML file stays under 60,000 bytes; the aim is ~40 KB.
+- **Paragraph style.** Leading ASCII spaces, tabs and U+3000 are stripped from every paragraph and blank-only lines are dropped; each remaining source line is one `<p>`, indented by the stylesheet (`p{text-indent:2em;margin:0}`), with volume/chapter headings unindented (`h1`/`h2`) and shown without decoration (see below); number echoes (see below) are `h3`. On the reader, turn extra paragraph spacing off to show the positive first-line indent; spacing on intentionally uses flush-left paragraphs with space between them.
+- **Metadata.** `dc:language` is `zh-CN`; title and author come from `[作者]书名.txt`, `《书名》作者：X.txt`, `书名_作者.txt`, `书名（作者：X）.txt` and similar, falling back to the stem and to an `作者：` line in the file's first paragraphs. Output names are NFC, FAT-legal and short enough for the reader's library index. The EPUBs are byte-for-byte reproducible.
+- **ZIP startup layout.** Package metadata, navigation documents and the stylesheet precede chapter members. Readers that scan the ZIP central directory avoid walking thousands of chapter entries for each startup metadata lookup. This does not eliminate whole-book indexing or late-chapter ZIP lookups.
+- **Large-book grouping (converter v10).** Books with more than 3,000 detected chapters pack consecutive whole chapters into size-bounded XHTML files, keeping the 60,000-byte ceiling. Only chapters already too large for a file use the existing continuation splitting. Each chapter heading has a unique fragment id, and both nav and NCX retain one entry per chapter targeting `file.xhtml#id`; volume nesting and long-chapter continuation entries remain intact. Fragment targets give the reader fresh chapter-start pages while fewer spine items reduce book-cache heap pressure. Books with at most 3,000 chapters remain byte-identical to v9, including their EPUB identity, and unchanged v9 manifest entries for those books are skipped rather than reconverted.
+- **Nothing is lost silently.** Each EPUB is re-read before it is written: every non-whitespace character of the spine, in order, must equal the normalized source text with only the documented removals applied (newlines unified; the removals are XML-illegal control characters, which are counted, and the decoration below). Zip layout, XHTML well-formedness, the 60 KB file ceiling and nav/NCX targets are checked too. A book that fails is not written and is reported as failed.
+- **Decoration.** On heading lines the leading and trailing `#`, `=`, `-`, `*`, `☆`, `★`, `※` and spaces are not displayed (`## 第1章 标题 ##` → `第1章 标题`; the comma of a Jinjiang `☆、` marker goes with its star), and lines made only of those characters (`====`, `----`, `****`, `☆☆☆`, `* * *`) are dropped. The same characters inside a heading or in an ordinary paragraph are kept. The check derives the expected text from the source by that same rule and requires each removed character to be a decoration character at the edge of a detected heading or part of a decoration-only line; anything else missing fails the book. Per book, `removed_decoration_chars`, `decoration_lines_dropped` and `headings_cleaned` are recorded in the manifest and report, with totals in the report summary. Books without detected headings (size mode) keep marker characters in their text but still lose decoration-only lines.
+- **Echoes.** Some sources print a chapter's number again right under its title (`## 第二章 灭世重生` / `====` / `第002章`). A heading that repeats the chapter number (same unit, same value; Chinese, Arabic and fullwidth numerals and zero padding are equal; a short prefix such as `正文_` is ignored) of the heading before it, with only blank or decoration-only lines between them, is not a chapter of its own: the titled heading stays the chapter and its TOC entry, and the repeat is shown as a heading-styled `<h3>` line at the top of the same file. The text is kept, so the preservation check is unchanged. A repeat separated from its title by any body text (a `PS：` note, a site advertisement) is not an echo. A heading that has nothing but echoes after it is still a bodiless heading and stays plain text.
+- **Idempotent.** `OUT_DIR/.novels-manifest.json` records each source's SHA-256 and the converter version; unchanged books with an existing output are skipped, failed books are retried, `--force` rebuilds everything, and manifest entries whose source disappeared are reported as `orphaned` but their EPUBs are never deleted. `OUT_DIR/.novels-report.json` holds the full per-book report (status, encoding, mode, volumes/chapters/files, warnings, errors); `--json` prints it, and per-book progress goes to stderr. The exit status is 2 when any book failed.
+
+`card sync --novels OUT_DIR` additionally copies the manifest-tracked EPUBs into `/books/Novels/` on the card (subfolders are mirrored) and asks for a library rescan with the usual `/.crosspoint/library.dirty` marker. It validates the whole plan before the first card write: a missing manifest or a symlinked card folder aborts with nothing written, and an EPUB that no longer matches its recorded SHA-256 (or whose card path is too long for the reader) is skipped and reported. Copies are fsynced, never overwrite, and are read back and compared with the manifest hash; a bad copy is removed and reported (exit status 2) while the other books still land. Existing card files are never deleted; if the same name already holds different bytes, the new EPUB is installed as `<stem>-<sha256[0:8]>.epub`. Reconverting a changed source therefore adds a hashed copy and leaves the old one for you to remove. Without `--novels`, `card sync` behaves exactly as before.
+
+### Stage reviewed firmware only
+
+```sh
+reader-send card update
+# Or explicitly choose both an image and its expected hash:
+reader-send card update --image ./other-reviewed.bin --expected-sha256 'FULL_64_HEX_SHA256'
+```
+
+`card update` verifies the local image's SHA-256 **before** touching the card, stages exactly one file at the card root as `reader-workbench-rollback-reviewed.bin` (the reviewed basename; an explicitly supplied image is also staged under this name after its hash matches), flushes/atomically replaces it, and re-hashes the card readback. The picker accepts any `.bin`, so this keeps one current reviewed candidate and its source hash pinned without adding a second candidate. An identical already-staged image reports `staged: false`; no builder, release downloader or automatic firmware update is provided.
+
+The picker lists every visible `.bin`, so select `reader-workbench-rollback-reviewed.bin` explicitly rather than assuming the first entry. On the reader use:
+
+**Settings → System → SD card firmware update** → **Select firmware file (.bin)** → choose `reader-workbench-rollback-reviewed.bin` → confirm **Update firmware?** → **Do not power off** while it validates or writes.
+
+The updater writes the inactive application slot. This can replace stock; after updating, fallback is the previous custom firmware version, not perpetual stock. It does not rewrite the bootloader or partition table. `reader-send` never flashes, reboots, ejects, or selects a slot automatically. Keep the card mounted on the Mac while staging, then eject it yourself before inserting it in the reader.
+
+### Optional firmware direct sync
+
+`card provision` writes only the firmware's explicit direct-sync config at `/.crosspoint/reader-sync.json`; it never stages firmware or touches books/annotations. It reads the dedicated device key from the Keychain service `reader-workbench:device-key` / account `b` and never prints it. An existing valid config is preserved, including its key, unless you explicitly use `--rotate-key`; use `--enabled` or `--disabled` to change only the enabled state. A fresh card gets the six original fields (the reader then defaults to its event-driven schedule); an optional `"schedule": "events"|"interval"` that the reader wrote from Settings → Reader sync → Schedule is validated and preserved. Firmware from before the event-driven schedule rejects a file that has a `schedule` key, so delete that key before rolling back.
+
+```sh
+reader-send card provision --enabled
+reader-send card provision --disabled
+reader-send card provision --rotate-key --enabled
+```
+
+If an existing config is invalid, provision refuses to replace it without `--force`. Use only one annotation uploader: if this direct-sync config is enabled, do not also feed the card's native records into `cloud sync --annotations-in`.
+
+### Schedule recent collection and private site sync
+
+After adding chosen publications and starting X Following:
+
+```sh
+reader-send subscriptions add essays --feed 'https://publication.substack.com/feed'
+reader-send subscriptions schedule install   # optional --config PATH for the card configuration
+# One manual pass with the same pipeline; no card configuration is read:
+reader-send collect
+# Or pin the annotation destination explicitly:
+reader-send collect --annotations-out "$HOME/papyrix/annotations/cloud-annotations.ndjson"
+```
+
+`subscriptions schedule install` reads the card configuration **once, at installation time** (`--config`, default `~/Library/Application Support/reader-send/card.json`) and writes the resulting destination into the plist as explicit `collect --annotations-out <annotations-dir>/cloud-annotations.ndjson` arguments, so the current intended destination keeps working without the collector depending on the card. If that configuration does not exist, the pinned destination is `<cache-dir>/annotations/cloud-annotations.ndjson`. A manual `collect` without `--annotations-out` uses that same cache-root default and never reads card configuration.
+
+The install hook writes and loads `~/Library/LaunchAgents/dev.reader-workbench.reader-send-subscriptions.plist` with `StartInterval` 900 seconds and `RunAtLoad` true. Each pass runs `subscriptions sync --since-days 7` and `x-following sync --since-hours 24 --limit 50`, drains up to 8 pending shared links through the normal public fetch or authorized X browser adapter plus verified push flow, then runs `cloud sync --drain --annotations-out <pinned path>`: it pushes newly collected cache entries through the private site, pulls ready books into the cache, and pulls reader annotations to that managed NDJSON file. The admin key is read from the `READER_SYNC_KEY` environment variable first; only when that variable is **absent** may macOS fall back to the dedicated Keychain item `reader-workbench:sync-key` / account `b`. A present-but-invalid `READER_SYNC_KEY` fails that collector with an explicit error and is never replaced by the Keychain value, and on hosts without Keychain it must be supplied. The reader's restricted device key is separate and never stored on the Mac. A nonblocking collection lock prevents overlapping launchd passes; the manual `collect` command uses the same pipeline. If a scheduled publication uses `--browser-url` or X Following, the already-running Chrome DevTools session must remain available; otherwise that collector reports the browser error and the job exits 2 without silently falling back to RSS. The job does not stage firmware, flash, reboot, or run assist, and it does not install itself during setup. SD delivery remains the manual `card sync` fallback and reviewed firmware staging remains the manual `card update` path; neither is run automatically by `collect`. Logs are under `~/Library/Logs/reader-send-collect*.log`. Remove the plist (and boot it out with `launchctl bootout gui/$(id -u)/dev.reader-workbench.reader-send-subscriptions`) to stop scheduling.
+
+### Independent collector on the always-on Windows laptop (WSL)
+
+The same `collect` pipeline also runs without the Mac, on Robert's existing always-on Windows laptop inside WSL Ubuntu (`ssh windows`, user `bob`). This is **not** an independent cloud service: it runs only while that laptop has AC power, is awake, connected to the network and has WSL running. When the laptop or WSL is down nothing is collected; the timer's `OnCalendar` with `Persistent=true` (which, per `systemd.timer`, only applies to calendar triggers) starts one catch-up pass when the timer is next loaded, and the 7-day / 24-hour collection windows (with `window_gap` reporting for X) bound what can be recovered. No Windows wake, power or startup policy was changed.
+
+- Units (system, `User=bob`, installed with `wsl -d Ubuntu -u root`): `/etc/systemd/system/ops-reader-collect.service` (oneshot, `WorkingDirectory=/home/bob/reader-collector`, `ExecStart=/home/bob/reader-collector/bin/run-collect`, `TimeoutStartSec=1800`) and `/etc/systemd/system/ops-reader-collect.timer` (`OnBootSec=3min`, `OnCalendar=*:0/15` i.e. every quarter hour, `AccuracySec=1min`, `Persistent=true`; a tick that arrives while a pass is still running does not start a second one). Verified with `systemd-analyze calendar '*:0/15'` and `systemd-analyze verify`.
+- Layout under `/home/bob/reader-collector/`: `app/` (source snapshot), `venv/` (`uv sync --frozen --extra browser --no-dev --no-editable`), `state/cache/` (its own cache; the 39 subscription definitions were copied from the Mac, no EPUBs, X seen-list or refresh state), `annotations/cloud-annotations.ndjson`, `chrome-profile/` (dedicated), `logs/collect.log` (rotated at 8 MiB), `bin/run-collect` and `bin/login-profile`.
+- Key: `/home/bob/.config/reader-collector/sync-key` (mode 600, owner `bob`, one 64-lowercase-hex line) was written by piping the Mac Keychain item `reader-workbench:sync-key` over ssh stdin; it was never put in argv or printed. `run-collect` exports it as `READER_SYNC_KEY` only to the `reader-send collect` child. Rotate it the same way.
+- Browser: each pass `run-collect` starts a headless Chrome on `127.0.0.1:9333` over the dedicated profile and stops it afterwards. The port is loopback inside WSL (NAT) and is not exposed to Windows, the Mac or the network. Chrome runs with a normal desktop user agent because x.com answers `HeadlessChrome` with HTTP 403; sign-in state still comes only from the profile. A `flock` on `chrome-profile.lock` makes the pass skip (exit 0, `skipped` JSON) while the login window below is open.
+- One-time sign-in, on the laptop's desktop: `wsl -d Ubuntu -- /home/bob/reader-collector/bin/login-profile`. It opens headed Chrome (WSLg) on the dedicated profile at `https://x.com/i/flow/login` and `https://substack.com/sign-in`; sign in by hand, then close the window. Nothing is copied from the Mac or from any other Chrome profile.
+- Until that sign-in exists, X Following and the Substack-only sources (`alreadydawn`, the Substack settings refresh) fail with explicit sign-in errors, `collect` exits 2 and the unit shows `failed`. Public RSS, shared links, push/pull and annotations still run. **Remote X Following and Substack-only collection are not proven**, so the Mac LaunchAgent stays loaded as the fallback. Both collectors can run together: article IDs are deterministic and the cloud deduplicates.
+- Operate from a Windows shell: `wsl -d Ubuntu -u root -- systemctl list-timers ops-reader-collect.timer --no-pager`; `wsl -d Ubuntu -u root -- systemctl start ops-reader-collect.service`; `wsl -d Ubuntu -u bob -- tail -n 80 /home/bob/reader-collector/logs/collect.log`. Each run is one JSON document between the `run-collect start` and `run-collect end exit=N` lines. To update, replace `app/` from a fresh `src`/`pyproject.toml`/`uv.lock` snapshot and rerun `uv sync` with `--reinstall-package reader-workbench-companion`.
+- Observed on 2026-10-31: the Mac agent was booted out 17:40:40Z–17:48:18Z and restored. A remote `cloud sync --max-push 8 --max-pull 1` pushed 8 / already synced 23 / conflicts 0 and pulled 1 plus annotations, and a separate signed `cloud list --all` from the Mac listed all 8 item IDs, one of them newly created by the remote at 17:47:31Z. The first enabled timer pass (13:48 EDT, 4 min 21 s) collected public RSS and shared links without errors and pushed 2 / pulled 24 books before a drain batch stopped on HTTP 410 for a book another client had just acknowledged; X and Substack-only sources reported the missing sign-in.
+- Current-tree deployment, 2026-10-31 (finished before the 18:44Z smoke): `app/` was replaced from a checked staged copy (extracted to `app.new`, required files verified, no suppressed failures, refused while a pass was running) and reinstalled with `uv sync --reinstall-package reader-workbench-companion`; the manifest hash of every installed `reader_send/*.py` equals the local tree (`73dd8f4848bb…a8bacab`). A read-only production smoke on that WSL venv (no ACK, push or delete) listed 506 items (256 consumed / 250 ready): pulling a consumed item raised `CloudContentReleased` and left no file, and pulling a ready item verified its size and SHA. Consumed stayed 256; ready rose to 251 because another client uploaded meanwhile. The 14:30 EDT pass (13 min 53 s, exit 2 for the missing X/Substack sign-in) still ran on the previous build.
+- First pass on the current build, 14:45 EDT (1 min 16 s, exit 2 for the missing X/Substack sign-in): public RSS and shared links ran without errors, and the cloud drain finished in one batch (pulled 7, 0 released, no conflicts). Its active-only listing reached the existing 256-ready-item ceiling; it did not count consumed receipts. A later UUID-bound SD delivery verified each file's size/SHA-256 and flushed it before acknowledging 345 more items, without DELETE calls or annotation uploads. At 19:18Z the card held 601 verified books and the include-all cloud listing held 601 consumed receipts plus one newly arrived ready item. This relieved the backlog; it does not claim that future uploads are already on the card. Evidence: `verification/adaptive-perf-nxtmx4fe/card-backlog-followup.jsonl`.
+
+### Card tests
+
+```sh
+PYTHONPATH=companion/src companion/.venv/bin/python -m unittest discover -s companion/tests -p 'test_card.py' -v
+```
+
+The permanent card tests cover absent/wrong/internal/read-only volume refusal with no writes, verified EPUB delivery and repeat idempotency, interrupted delivery with a pending ledger that must still create `library.dirty`, hashed collision naming without overwriting different card bytes, annotation anchor preservation and unchanged-file handling, and firmware hash rejection before staging plus same-image idempotency. They use temporary files and a fake `diskutil` result; they never touch the real card.
+
+```sh
+PYTHONPATH=companion/src companion/.venv/bin/python -m unittest discover -s companion/tests -p 'test_card_autosync.py' -v
+```
+
+`test_card_autosync.py` drives the real cloud client against a fake HTTP transport and a plain folder as the card: delivery of only the cloud books with byte-identical copies, ack only after the card copy verifies (a corrupted copy stays unacknowledged), idempotent rerun, wrong/absent volume doing nothing at all, HTTP 429 on the listing, during a pull and during an ack with clean recovery on the next run, annotation import with no key, the concurrency lock, multi-pass backlog and the command line end to end.
+
+`companion/tests/test_novels.py` covers the novel converter and its card delivery the same way (temporary directories only; the card is a plain folder):
+
+```sh
+PYTHONPATH=companion/src companion/.venv/bin/python -m unittest discover -s companion/tests -p 'test_novels.py' -v
+```
+
 ## One-action X/Twitter post or thread
 
 ```sh
 # Offline authorized export → reading inbox (+ optional one-action delivery).
 reader-send x 'https://x.com/writer/status/123' --export thread.json
 reader-send x 'https://x.com/writer/status/123' --export thread.json --send --reader 192.168.1.42:53317
+
+# Your already signed-in Chrome → reading inbox (no API key, no export).
+reader-send x 'https://x.com/writer/status/123' --browser
+reader-send x 'https://x.com/writer/status/123' --browser --send --reader 192.168.1.42:53317
 
 # Explicit official API access using your existing token in the process environment:
 reader-send x 'https://x.com/writer/status/123' --api --output ./thread.epub
@@ -128,7 +341,19 @@ reader-send x 'https://x.com/writer/status/123' --api --output ./thread.epub
 
 The adapter follows connected replies by the original author, orders them by post ID, preserves quoted context, expanded links, authors/dates, accessible pictures and video thumbnails. Other users' replies and disconnected author posts are excluded. Video/Spaces audio is not embedded: an original URL and preview notice remain in the EPUB; metadata contains `media_links` and a `qr_payload` URL for downstream QR rendering (no QR bitmap is generated). Missing/deleted/private posts cannot be reconstructed, and incomplete access is explicitly warned.
 
-`--api` reads `X_BEARER_TOKEN` from the environment without saving it, calls only `api.x.com`, and refuses redirects that could expose the token. It uses one post lookup and at most three 100-result recent-search pages; X's access tier, recent-search window and possible API charges apply. It is opt-in, not a free/public endpoint promise. No automatic API retries, live browser-session extraction or always-on X scraper are provided. On access/quota failure, supply an authorized JSON export instead. Browser accounts/sessions remain Mac-side.
+`--api` reads `X_BEARER_TOKEN` from the environment without saving it, calls only `api.x.com`, and refuses redirects that could expose the token. It uses one post lookup and at most three 100-result recent-search pages; X's access tier, recent-search window and possible API charges apply. It is opt-in, not a free/public endpoint promise. No automatic API retries are provided, and nothing runs on a timer or in the background. On access/quota failure, supply an authorized JSON export instead. Browser accounts/sessions remain Mac-side.
+
+`--browser` reads the post from the Chrome window that is already signed in to X, through its local DevTools endpoint (`--browser-endpoint`, default `http://127.0.0.1:9333`; only loopback endpoints are accepted). Start Chrome once with the agent profile and keep it open:
+
+```sh
+open -na "Google Chrome" --args --user-data-dir=$HOME/.job-app-chrome --remote-debugging-port=9333 https://x.com/home
+```
+
+Sign in to X in that window, then pass one post/thread URL. The command creates one tab of its own, waits for the post page X renders, reads only the post data and rendered text that page loaded, and closes that tab again. Cookies, Authorization headers, other tabs and the rest of the session are never read, stored or forwarded, and no API key, export or paid API plan is involved. The result goes through the same conversion/cache/EPUB path as the other modes, with the same exclusions (connected author posts and quoted posts only, other people's replies dropped), the same long-form `note_tweet` full text, expanded links, dates, pictures and video thumbnails. When X renders only the first batch of replies, or when only the rendered page text is usable, the EPUB is still created with an explicit warning instead of claiming a complete thread. A signed-out Chrome window, a used-up thread, or an unreadable post fails with an actionable message and no cache write. This mode needs the optional DevTools dependency:
+
+```sh
+uv pip install -e '.[browser]'     # or: pip install 'reader-workbench-companion[browser]'
+```
 
 ## Optional Mac passage assistance: Explain, Example, Quiz
 
@@ -187,13 +412,13 @@ PYTHONPATH=companion/src python3 -m unittest discover -s companion/tests -p 'tes
 
 ## Optional private cloud sync
 
-LocalSend/USB remain the default. `reader-send cloud …` is the **only** private reader-storage cloud opt-in; there is no background cloud service, automatic upload, URL fetching, conversion, or firmware cloud implementation. The protocol is documented in the portfolio repository's README under **Optional private reader sync**. This implementation and its tests are local only: no deployment, remote migration, installed production secret, live endpoint/WAF test or device cloud test is claimed.
+Manual LocalSend/SD remain the fallbacks; the explicit user-installed `collect` schedule is the automatic private-site path. `reader-send cloud …` and that `collect` schedule are the **only** private reader-storage cloud opt-ins. There is no hidden background service: `collect` runs only from a timer you install (the Mac launchd job, or the WSL systemd timer above) or when you invoke it. It may fetch/convert recent sources, push/pull the private site, and pull annotations, but it never stages firmware, flashes, reboots, or runs assist. The protocol is documented in the portfolio repository's README under **Optional private reader sync**. The production backend is live at `https://robertzhou.dev` (verified deployment `https://3cae2cd2.robertzhou.pages.dev`, project `robertzhou`, branch `main`, source `601a2c5`): additive migration `0008_reader_sync.sql` is applied, the Pages `READER_SYNC_KEY` secret is installed, and the companion's dedicated Mac Keychain item is `reader-workbench:sync-key` / account `b` (legacy `omp:reader-sync-key` retained in sync). A live signed API smoke on 2026-10-30 passed 15/15 checks with `User-Agent: ReaderSend/1`, including unsigned/wrong-key 401 JSON, signed list/reserve/upload/list/download with byte-identical EPUB and matching `X-Reader-Sha256`, ack, annotation create/list/NDJSON export, delete, and private/no-index headers; exact smoke rows were removed and pre-existing data was preserved. The companion client and `cloud sync` orchestration tests use in-memory transports, and no physical reader cloud transfer is claimed.
 
 ### Setup and security
 
-- An approved deployment owner must first configure the backend and its separate `READER_SYNC_KEY`. The companion only reads that exact environment variable: **64 lowercase hex characters**, representing 32 random bytes. HMAC uses those 64 characters as UTF-8 key bytes, **not decoded hex**. Do not reuse `OWNER_KEY`, `SIGNING_KEY`, browser credentials, or any other token.
-- No `--key`/secret CLI argument, secret file, `.env` loading, browser cookie, keychain extraction, or persisted secret is supported. Inject the existing key into the process environment with a secure prompt or your secret manager; do not paste it into shell history. For example, in **Bash** (not zsh), `read -r -s -p 'Reader sync key: ' READER_SYNC_KEY; printf '\n'; export READER_SYNC_KEY` prompts without echo. Use `unset READER_SYNC_KEY` afterward. Dry runs need no key.
-- The default explicit origin is `https://robertzhou.dev`. `--origin https://YOUR-HOST[:PORT]` intentionally authorizes that origin to receive both credentials and content; only use a trusted backend you control. HTTP, credentials-in-URL, paths, queries and fragments are refused. TLS certificate and hostname verification are mandatory, with no insecure switch. Standard-library HTTPS does not follow **any** redirects, send/store cookies, or consult proxy environment variables. There is no public-site robots/telemetry request. Requests identify as `ReaderSend/1`; WAF compatibility still requires an approved integration test, not a WAF bypass.
+- The production deployment already has the separate `READER_SYNC_KEY`: the encrypted Pages secret is installed, and this Mac's dedicated Keychain item is `reader-workbench:sync-key` / account `b` (the legacy `omp:reader-sync-key` value is retained and matches). The cloud client reads only the exact `READER_SYNC_KEY` environment variable: **64 lowercase hex characters**, representing 32 random bytes. HMAC uses those 64 characters as UTF-8 key bytes, **not decoded hex**. Do not reuse `OWNER_KEY`, `SIGNING_KEY`, browser credentials, or any other token.
+- Bare `reader-send cloud` accepts no `--key`/secret CLI argument, secret file, `.env` loading, browser cookie, generic keychain lookup, or persisted secret. The exceptions are a pre-existing Finder **Sync website.command** and the scheduled `reader-send collect`. `collect` uses `READER_SYNC_KEY` from its own environment whenever that variable is present — as given, or failing clearly when it is not 64 lowercase hex characters — and only when it is absent on macOS reads the exact dedicated admin Keychain item `reader-workbench:sync-key` / account `b`. On hosts without Keychain the variable must be supplied. Either way the key reaches only the child process as `READER_SYNC_KEY`, is cleared after the call, and is never printed or persisted. The reader's dedicated restricted device key is separate and is not read by the Mac. For bare CLI use, inject the existing key into the process environment with a secure prompt or your secret manager; do not paste it into shell history. For example, in **Bash** (not zsh), `read -r -s -p 'Reader sync key: ' READER_SYNC_KEY; printf '\n'; export READER_SYNC_KEY` prompts without echo. Use `unset READER_SYNC_KEY` afterward. `cloud push --dry-run` needs no key; `cloud sync --dry-run` still needs it for its one listing.
+- The default explicit origin is `https://robertzhou.dev`. `--origin https://YOUR-HOST[:PORT]` intentionally authorizes that origin to receive both credentials and content; only use a trusted backend you control. HTTP, credentials-in-URL, paths, queries and fragments are refused. TLS certificate and hostname verification are mandatory, with no insecure switch. Standard-library HTTPS does not follow **any** redirects, send/store cookies, or consult proxy environment variables. There is no public-site robots/telemetry request. Requests identify as `ReaderSend/1`; live WAF compatibility with that exact UA was verified (JSON 401, not a challenge page), with no WAF bypass used or claimed.
 - Each request signs `reader-sync-v1`, uppercase method, exact path/query, SHA-256 of exact body bytes, Unix timestamp and a fresh random 16-byte nonce, LF-separated with no final newline. JSON is serialized once and those same UTF-8 bytes are signed and sent. GET, DELETE and ack have empty bodies.
 - System time must be within 300 seconds of the server. **No cloud request is automatically retried.** Rerunning a command creates fresh timestamps/nonces/signatures while preserving item/annotation identity. An ambiguous network failure may have stored content: rerun the unchanged input, not a manually reused signed request.
 - This is private authenticated storage in the owner's Cloudflare account, **not end-to-end encryption**. The owner/provider can read EPUBs, source metadata and annotations. Protect local input, cache, downloaded EPUBs, metadata sidecars and exports. File outputs use private temporary files and atomic replacement; stdout can also contain private material. Rotating the dedicated key revokes all clients; removing it disables sync without deleting stored content.
@@ -206,14 +431,14 @@ reader-send inspect --json
 reader-send cloud push FULL_24_CHARACTER_CACHE_ID --dry-run
 reader-send cloud push FULL_24_CHARACTER_CACHE_ID --source-path /books/article.epub
 
-# Ready entries only; --all also shows unfinished reservations and consumed books.
+# Ready entries only; --all also shows unfinished reservations and consumed entries.
 reader-send cloud list
 reader-send cloud list --all
 reader-send cloud pull CLOUD_ITEM_UUID --output-dir ./private-reader-downloads
 
 # After successful installation/reading; pull never acknowledges automatically.
 reader-send cloud ack CLOUD_ITEM_UUID
-# Explicit deletion is the only way to free completed EPUB storage.
+# ACK frees all server EPUB bytes; delete removes the metadata receipt (annotations survive).
 reader-send cloud delete CLOUD_ITEM_UUID
 ```
 
@@ -221,9 +446,9 @@ reader-send cloud delete CLOUD_ITEM_UUID
 
 Item UUIDs deterministically include stable source identity, EPUB SHA-256 and immutable wire metadata, not cache directory, fetched time or read/progress state. Unchanged reruns reuse the UUID; changed bytes/title/source-path produce a new UUID, leaving the prior version until explicitly deleted. `original_url` is preserved exactly from cached source metadata. `source_path` defaults to the stable cached EPUB filename, **not** an absolute computer cache path; use `--source-path` consistently for an intended reader location. The API has no separate author/date/provenance fields: existing local metadata and embedded EPUB metadata are untouched, not squeezed into unrelated fields.
 
-Pull writes `UUID.epub` and `UUID.json` (full server metadata, including original URL/path) in the chosen directory. It checks both listed and returned SHA-256, exact byte size and the EPUB mimetype header **before writing**; server attachment names and source paths never become local filenames. Existing output files are refused unless `--force` is supplied. A filesystem failure can leave one of the two individually atomic outputs; rerun with `--force` after fixing the filesystem. Ready and already-consumed items can be downloaded; unfinished items cannot. Ack is idempotent and retains the first consumed timestamp; delete is idempotent and leaves annotations intact.
+Pull writes `UUID.epub` and `UUID.json` (full server metadata, including original URL/path) in the chosen directory. It checks both listed and returned SHA-256, exact byte size and the EPUB mimetype header **before writing**; server attachment names and source paths never become local filenames. Existing output files are refused unless `--force` is supplied. A filesystem failure can leave one of the two individually atomic outputs; rerun with `--force` after fixing the filesystem. Ready items can be downloaded; after ACK the server EPUB bytes are freed, so a consumed item cannot be downloaded again, though its metadata receipt remains. Unfinished items cannot be downloaded. Ack is idempotent and retains the first consumed timestamp; delete is idempotent and leaves annotations intact.
 
-Cloud limits are **1 MiB per EPUB**, **32 MiB total reserved bytes**, **64 items** including consumed items, and **16 KiB metadata per create request**. Oversized content is rejected locally with a LocalSend/USB recommendation; it is never truncated, stripped or recompressed to fit. Reservations older than 24 hours may expire if unfinished; completed content persists until deletion.
+Cloud limits are **8 MiB per EPUB**, **32 MiB total reserved bytes**, **64 items** including consumed items, and **16 KiB metadata per create request**. Oversized content is rejected locally with a LocalSend/USB recommendation; it is never truncated, stripped or recompressed to fit. Reservations older than 24 hours may expire if unfinished. ACK frees all server EPUB bytes and retains an immutable metadata receipt; deleting the item removes that receipt. Local cached EPUBs and card-delivered books are unaffected.
 
 ### Annotation upload, download and full export
 
@@ -257,6 +482,44 @@ All input records are validated before upload and split into at most **32 record
 
 Server annotation capacity is **4,096 records / 8 MiB canonical JSON**, with no automatic cleanup. Client import/downloads are bounded to 4,096 records / 12 MiB raw JSON (including wrapper/sequence overhead); no partial export is written if pagination, limits or validation fail. All authenticated requests share **60/minute and 1,000/UTC day**, including retries; 429 means wait at least 60 seconds, or until next UTC day for the daily cap. HTTP 401 directs you to the dedicated key/clock, 409 to immutable identity/state, 413 to local delivery, 422 to integrity, 503 to backend setup/availability, and 507 to storage capacity. Errors never echo server bodies, private annotations or credentials.
 
+### One explicit website sync
+
+```sh
+# Validate locally and make one read-only remote listing; no writes or uploads.
+reader-send cloud sync --dry-run
+
+# One bounded foreground pass: push unpushed cache entries, pull ready books into cache.
+reader-send cloud sync
+
+# Direction/limit and annotation controls:
+reader-send cloud sync --no-push
+reader-send cloud sync --no-pull --max-push 4
+reader-send cloud sync --annotations-in "$HOME/papyrix/annotations/reading-inbox-<uuid>.json" --device-id '<uuid>'
+reader-send cloud sync --annotations-out "$HOME/papyrix/annotations/cloud-annotations.ndjson"
+reader-send cloud sync --incoming-dir ./cloud-incoming
+
+# Finish a large backlog automatically, keeping each batch inside the API budget:
+reader-send cloud sync --drain
+reader-send cloud sync --drain --annotations-in "$HOME/papyrix/annotations/reading-inbox-<uuid>.json" --device-id '<uuid>' --annotations-out "$HOME/papyrix/annotations/cloud-annotations.ndjson"
+```
+
+`cloud sync` opens with one `GET /reader/items` listing, then delegates to the existing verified push/pull and annotation helpers. Each push costs two requests (reserve + upload); each pull costs two (its own audited re-list + content GET). A default run is therefore at most 33 authenticated requests, inside the 60/minute budget. Default caps are 8 pushes and 8 pulls per run; leftovers are reported as deferred. `--drain` keeps the same bounded batch, waits at least 60 seconds between batches so consecutive passes stay inside the 60/minute budget, and repeats until nothing is deferred. It validates the annotation output path before uploading, uploads annotations once before the first batch, and writes the annotation export once after the last; if the upload or a batch stops/raises, the export is still attempted in a `finally` so accepted notes can be inspected. An export failure is reported as `annotations_error` without masking the original batch error. It never retries a failed/ambiguous batch: a network or validation error stops the command. Conflicts, or a batch that leaves both deferred buckets unchanged without moving a new item, stop the loop and report `complete: false`, `stopped`, the conflict details and the remaining deferred count instead of looping. It never deletes or acknowledges items, never starts a background thread, and never runs from fetch/convert/subscriptions/card commands. Pulled books become normal cache entries (unless `--incoming-dir` is chosen), so a following `card sync` copies them. Conflicts and already-synced/already-cached items are reported, not rewritten. If another client acknowledges a listed ready book before this client downloads it, the server answers the content GET with exactly `410 {"error":"content released"}`; that one confirmed response is reported under `pull.released` (item IDs in `cloud sync`, a count in `--drain`), nothing is installed or acknowledged for that book, and the pass continues with the remaining items. Any other 410 (different or unparseable body), a 404, authentication/TLS errors, size/SHA-256/mimetype failures and network errors still stop the command, and `cloud pull <id>` of a consumed item still fails. `--dry-run` still performs that one read-only listing, so it requires `READER_SYNC_KEY` even when annotations are the only requested work; `--dry-run --annotations-out` writes and downloads nothing and returns a planned output.
+
+Shared links from the explicit **Send to Reader** shortcut enter the private `/reader/links` queue. The canonical source is the key-free pair `companion/scripts/send-to-reader.template.wflow` and `companion/scripts/generate_send_to_reader_shortcut.py`; the generator reads the dedicated send-only share key from the Keychain, injects it, and signs the workflow with Apple's `shortcuts sign`. The resulting private installer is `/Users/b/papyrix/Reader Workbench/Setup/Send to Reader.shortcut` (mode 0600). To send from the phone, share a URL from the browser's Share Sheet; the Mac launcher supplies the URL input. It POSTs only `{"url": <URL>}` with the scoped share key to `https://robertzhou.dev/reader/links`, and displays the returned job ID and status under the neutral heading **Reader inbox response**. Never publish or share the signed installer: it contains the send-only secret. The template and generator contain no key.
+
+The currently installed shortcut is the earlier build whose heading was runtime-proven with a valid URL and with invalid/whitespace input. The neutral-heading revision is signed but was not import-tested: replacing the installed copy was blocked while the Mac was locked. iPhone installation requires importing the signed file or receiving iCloud Shortcuts sync; neither was verified on the phone.
+
+The scheduled `collect` drains up to 8 pending links per pass; the manual equivalents are:
+
+```sh
+reader-send cloud links list
+reader-send cloud links drain --limit 8
+```
+
+Each link is converted through the normal public HTTPS fetcher (public Substack/generic articles) or the authorized signed-in Chrome adapter for X/Twitter posts, verified in the local cache, pushed through the existing item flow, and acknowledged only after the item exists. Conversion failures are recorded as explicit terminal job errors; push/ack failures stay pending for the next pass. The queue management key is `READER_SYNC_KEY`; the reader device key and shortcut share key cannot list or acknowledge links. The backend queue must be deployed before these commands can succeed.
+
+A pre-existing Finder **Sync website.command**, if present, is the convenient explicit wrapper. When the exact card is mounted it runs `card sync` **first** (before any cloud secret is read) to refresh `reading-inbox-<uuid>.md` and the managed `reading-inbox-<uuid>.json`. It then reads only the dedicated Keychain item (`security find-generic-password -s reader-workbench:sync-key -a b`) into a child-only `READER_SYNC_KEY`. If that JSON file exists and its `annotations` list is nonempty, it runs `cloud sync --drain --annotations-in <that-file> --device-id <uuid> --annotations-out <annotations-dir>/cloud-annotations.ndjson`; otherwise it runs `cloud sync --drain --annotations-out <annotations-dir>/cloud-annotations.ndjson` only, so a zero-note card never supplies a phantom input. The drain finishes the whole deferred backlog in bounded batches 60 seconds apart; it stops rather than retrying a failed batch and stops on conflicts/no progress with remaining counts in the JSON. It unsets `READER_SYNC_KEY` before the optional final card sync that delivers pulled books. When the card is absent, cloud sync still runs with any retained managed native export, or downloads the annotation export only. The key is never a CLI argument, printed, or written to a file. The bare CLI still requires the environment variable; there is no background cloud sync outside the explicit user-installed `collect` schedule. The current card has zero notes: only the zero-input and annotation-download path is available for verification, and a nonempty native upload has not been live-tested end to end.
+
 ## Entirely offline smoke path
 
 From the repository root after installation:
@@ -274,8 +537,8 @@ The sample bundles a small image as a data URL. These commands do not contact th
 Focused deterministic tests (no external network, no firmware build):
 
 ```sh
-python -m pip install -e ./companion
+python -m pip install -e './companion[browser]'
 python -m unittest discover -s companion/tests -v
 ```
 
-The suite covers article cleanup/metadata/footnotes, hostile paths, ZIP export metadata, bounded images, deterministic EPUB structure, offline CLI/cache flow, robots/retries, RSS/Atom collection and deduplication, source-stable read/progress, X connected-thread/quote/media adapters, and prepare-upload/upload/cancel wire payloads. Cloud tests use in-memory transports for exact HMAC/body/query identity, verified HTTPS/no redirects/cookies, cache/EPUB integrity, idempotent push/ack/delete and annotation batches, API failures without retries or secret leakage, native field/category mapping, receive-sequence JSON/NDJSON pagination, and no-network/no-secret dry runs. No live cloud/API, multicast delivery or physical reader transfer is claimed.
+The suite covers article cleanup/metadata/footnotes, hostile paths, ZIP export metadata, bounded images, deterministic EPUB structure, offline CLI/cache flow, robots/retries, RSS/Atom collection and deduplication, source-stable read/progress, X connected-thread/quote/media adapters, and prepare-upload/upload/cancel wire payloads. Collector tests cover environment-first `READER_SYNC_KEY` with a Keychain fallback limited to macOS and never used for a present-but-invalid value, a full card-free `collect` pass with the default `<cache-dir>/annotations/cloud-annotations.ndjson` output, explicit `--annotations-out` use, timeout visibility, and the launchd `ProgramArguments` pinned at install time. Cloud tests use in-memory transports for exact HMAC/body/query identity, verified HTTPS/no redirects/cookies, cache/EPUB integrity, idempotent push/ack/delete and annotation batches, API failures without retries or secret leakage, native field/category mapping, receive-sequence JSON/NDJSON pagination, and no-network/no-secret dry runs. The production API has separate live signed smoke evidence documented above; no multicast delivery, physical reader cloud transfer, or nonempty native-annotation upload from the real card is claimed.

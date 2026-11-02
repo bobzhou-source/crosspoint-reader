@@ -36,34 +36,25 @@ void HalPowerManager::setPowerSaving(bool enabled) {
     return;  // invalid state
   }
 
-  auto wifiMode = WiFi.getMode();
-  if (wifiMode != WIFI_MODE_NULL) {
-    // Wifi is active, force disabling power saving
-    enabled = false;
-  }
-
-  // Note: We don't use mutex here to avoid too much overhead,
-  // it's not very important if we read a slightly stale value for currentLockMode
-  const LockMode mode = currentLockMode;
-
-  if (mode == None && enabled && !isLowPower) {
+  const bool wifiActive = WiFi.getMode() != WIFI_MODE_NULL;
+  xSemaphoreTake(modeMutex, portMAX_DELAY);
+  const bool shouldSave = enabled && !wifiActive && normalSpeedLocks == 0;
+  if (shouldSave && !isLowPower) {
     LOG_DBG("PWR", "Going to low-power mode");
-    if (!setCpuFrequencyMhz(LOW_POWER_FREQ)) {
+    if (setCpuFrequencyMhz(LOW_POWER_FREQ)) {
+      isLowPower = true;
+    } else {
       LOG_DBG("PWR", "Failed to set CPU frequency = %d MHz", LOW_POWER_FREQ);
-      return;
     }
-    isLowPower = true;
-
-  } else if ((!enabled || mode != None) && isLowPower) {
+  } else if (!shouldSave && isLowPower) {
     LOG_DBG("PWR", "Restoring normal CPU frequency");
-    if (!setCpuFrequencyMhz(normalFreq)) {
+    if (setCpuFrequencyMhz(normalFreq)) {
+      isLowPower = false;
+    } else {
       LOG_DBG("PWR", "Failed to set CPU frequency = %d MHz", normalFreq);
-      return;
     }
-    isLowPower = false;
   }
-
-  // Otherwise, no change needed
+  xSemaphoreGive(modeMutex);
 }
 
 void HalPowerManager::startDeepSleep(HalGPIO& gpio) const {
@@ -161,25 +152,16 @@ uint16_t HalPowerManager::getBatteryPercentage() const {
 
 HalPowerManager::Lock::Lock() {
   xSemaphoreTake(powerManager.modeMutex, portMAX_DELAY);
-  // Current limitation: only one lock at a time
-  if (powerManager.currentLockMode != None) {
-    LOG_ERR("PWR", "Lock already held, ignore");
-    valid = false;
-  } else {
-    powerManager.currentLockMode = NormalSpeed;
-    valid = true;
-  }
+  ++powerManager.normalSpeedLocks;
   xSemaphoreGive(powerManager.modeMutex);
-  if (valid) {
-    // Immediately restore normal CPU frequency if currently in low-power mode
-    powerManager.setPowerSaving(false);
-  }
+  // Every owner acquires a lease. A renderer may outlive the background owner
+  // that overlapped it; releasing either one must not invalidate the other.
+  powerManager.setPowerSaving(false);
 }
 
 HalPowerManager::Lock::~Lock() {
   xSemaphoreTake(powerManager.modeMutex, portMAX_DELAY);
-  if (valid) {
-    powerManager.currentLockMode = None;
-  }
+  assert(powerManager.normalSpeedLocks != 0);
+  --powerManager.normalSpeedLocks;
   xSemaphoreGive(powerManager.modeMutex);
 }

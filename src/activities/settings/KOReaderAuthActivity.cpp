@@ -83,24 +83,27 @@ void KOReaderAuthActivity::render(RenderLock&&) {
 
   const auto& metrics = UITheme::getInstance().getMetrics();
   const auto pageWidth = renderer.getScreenWidth();
-  const auto pageHeight = renderer.getScreenHeight();
 
   GUI.drawHeader(renderer, Rect{0, metrics.topPadding, pageWidth, metrics.headerHeight},
                  mode == Mode::SIGN_UP ? tr(STR_SIGN_UP) : tr(STR_KOREADER_AUTH));
-  const auto height = renderer.getLineHeight(UI_10_FONT_ID);
-  const auto top = (pageHeight - height) / 2;
+  const Rect body = UITheme::getContentBounds(renderer);
+  const Rect title{body.x, body.y, body.width, body.height / 2 - 8};
+  const Rect detail{body.x, body.y + body.height / 2 + 8, body.width, body.height / 2 - 8};
 
   if (state == AUTHENTICATING) {
-    renderer.drawCenteredText(UI_10_FONT_ID, top, statusMessage.c_str());
+    UITheme::drawCenteredWrappedText(renderer, body, UI_10_FONT_ID, statusMessage.c_str(), 8);
   } else if (state == SUCCESS) {
-    renderer.drawCenteredText(UI_10_FONT_ID, top,
-                              mode == Mode::SIGN_UP ? tr(STR_ACCOUNT_CREATED) : tr(STR_AUTH_SUCCESS), true,
-                              EpdFontFamily::BOLD);
-    renderer.drawCenteredText(UI_10_FONT_ID, top + height + 10, tr(STR_SYNC_READY));
+    UITheme::drawCenteredWrappedText(renderer, title, UI_12_FONT_ID,
+                                     mode == Mode::SIGN_UP ? tr(STR_ACCOUNT_CREATED) : tr(STR_AUTH_SUCCESS), 4, true,
+                                     EpdFontFamily::BOLD, UITheme::TextVerticalAlignment::BOTTOM);
+    UITheme::drawCenteredWrappedText(renderer, detail, UI_10_FONT_ID, tr(STR_SYNC_READY), 6, true,
+                                     EpdFontFamily::REGULAR, UITheme::TextVerticalAlignment::TOP);
   } else if (state == FAILED) {
-    renderer.drawCenteredText(UI_10_FONT_ID, top, mode == Mode::SIGN_UP ? tr(STR_SIGNUP_FAILED) : tr(STR_AUTH_FAILED),
-                              true, EpdFontFamily::BOLD);
-    renderer.drawCenteredText(UI_10_FONT_ID, top + height + 10, errorMessage.c_str());
+    UITheme::drawCenteredWrappedText(renderer, title, UI_12_FONT_ID,
+                                     mode == Mode::SIGN_UP ? tr(STR_SIGNUP_FAILED) : tr(STR_AUTH_FAILED), 4, true,
+                                     EpdFontFamily::BOLD, UITheme::TextVerticalAlignment::BOTTOM);
+    UITheme::drawCenteredWrappedText(renderer, detail, UI_10_FONT_ID, errorMessage.c_str(), 8, true,
+                                     EpdFontFamily::REGULAR, UITheme::TextVerticalAlignment::TOP);
   }
 
   const auto labels = mappedInput.mapLabels(tr(STR_BACK), "", "", "");

@@ -45,4 +45,9 @@ bool switchTo(const esp_partition_t* dest);
 // Returns false when there is no alternate OTA slot or it has no app image.
 bool switchToOther();
 
+// Mark the running app valid only when IDF reports PENDING_VERIFY. The check is
+// attempted once per boot, so repeated UI renders cannot cause flash writes.
+// Call only after storage is ready and a normal Home/reader render completed.
+void acceptPendingUpdate();
+
 }  // namespace ota_boot

@@ -2,6 +2,7 @@
 
 #include <GfxRenderer.h>
 
+#include <algorithm>
 #include <cassert>
 
 #include "MappedInputManager.h"
@@ -10,7 +11,7 @@
 namespace fui = freeink::ui;
 
 namespace {
-constexpr int16_t TOUCH_TAB_BAR_HEIGHT = 50;
+constexpr int16_t TOUCH_TAB_BAR_HEIGHT = 48;
 }
 
 UiTabListActivity::UiTabListActivity(const char* name, GfxRenderer& renderer, MappedInputManager& mappedInput,
@@ -76,12 +77,10 @@ void UiTabListActivity::syncTabListViewport(UiScreen& screen, fui::ListProps& pr
 void UiTabListActivity::buildTabBar(UiScreen& screen) {
   const auto& metrics = UITheme::getInstance().getMetrics();
 
-  // Tabs. The selected pill dims to a dither when the selection is down in
-  // the list (the legacy focused/unfocused tab distinction).
-  // Stack array, not a heap vector: this runs on every render and the tab
-  // count is small and fixed.
+  // The fixed tab set lives on the stack; render never allocates a container.
   constexpr int MAX_TABS = 8;
   const int count = tabCount() < MAX_TABS ? tabCount() : MAX_TABS;
+  if (count <= 0) return;
   fui::TabItem tabs[MAX_TABS];
   for (int i = 0; i < count; i++) {
     tabs[i].label = tabLabel(i);
@@ -94,89 +93,64 @@ void UiTabListActivity::buildTabBar(UiScreen& screen) {
   tabProps.count = static_cast<uint16_t>(count);
   tabProps.action = ACTION_TAB;
   tabProps.inputMask = fui::InputTouch;
-  // Pill shape and label size are theme-driven. Lyra uses equal-width slots
-  // with small labels so wide text (e.g. "Controls") still fits at large UI scales.
-  // Full-slot (RoundedRaff): the pill fills its slot like the legacy layout
-  // (slot minus a 4px frame, 8px clearance above the divider) with
-  // body-size labels; zero horizontal contentInset disables the tabBar's
-  // label-width shrink.
-  const bool tabsFocused = ringPos() == 0;
-  if (metrics.tabPillFullSlot) {
-    tabProps.text = screen.theme().bodyText;
-    tabProps.tabInset = fui::Insets{4, 4, 7, 4};
-    tabProps.contentInset = fui::Insets{2, 0, 2, 0};
-  } else {
-    tabProps.text = screen.theme().smallText;
-    tabProps.gap = static_cast<int16_t>(metrics.tabSpacing);
-    // Unfocused state: no bottom inset, so the pill (and the 2px selected
-    // underline drawn along its bottom edge) reaches the band's 1px divider —
-    // legacy Lyra drew the underline sitting on that rule, not floating above.
-    tabProps.tabInset = tabsFocused ? fui::Insets{2, 4, 4, 4} : fui::Insets{2, 4, 0, 4};
-    tabProps.contentInset = fui::Insets{2, 0, 2, 0};
-  }
+  tabProps.minTouchSize = 48;
+  tabProps.text = screen.theme().smallText;
+  tabProps.gap = static_cast<int16_t>(metrics.tabSpacing);
+  tabProps.tabInset = fui::Insets{2, 0, 0, 0};
+  tabProps.contentInset = fui::Insets{2, 0, 4, 0};
   const int16_t tabLineHeight = screen.target().lineHeight(tabProps.text.font);
   const int16_t preferredTabHeight =
       mappedInput.hasTouch() ? TOUCH_TAB_BAR_HEIGHT : static_cast<int16_t>(metrics.tabBarHeight);
-  const int16_t tabBand = preferredTabHeight > tabLineHeight + 10 ? preferredTabHeight : tabLineHeight + 10;
-
-  if (tabPillMaxPad > 0) {
-    // Cap each pill at its label plus this padding: the equal-width slots (and
-    // so the tab positions) stay exactly where they were, only the pill stops
-    // stretching across the whole slot. The SDK shrinks the pill to content
-    // width and centers it in its slot when the horizontal contentInset is
-    // nonzero.
-    tabProps.contentInset.left = tabPillMaxPad;
-    tabProps.contentInset.right = tabPillMaxPad;
+  const int16_t side = static_cast<int16_t>(metrics.contentSidePadding);
+  const int availableWidth = screen.body().width - 2 * side;
+  if (availableWidth <= 0) return;
+  int widestLabel = 0;
+  for (int i = 0; i < count; ++i) {
+    const int indicatorWidth = tabs[i].indicator == fui::TabIndicator::None
+                                   ? 0
+                                   : tabProps.indicatorSize + tabProps.indicatorGap;
+    widestLabel = std::max(widestLabel, screen.target().measureText(tabProps.text.font, tabs[i].label,
+                                                                   tabProps.text).width + indicatorWidth);
   }
-
-  // Legacy Lyra two-state treatment: with the selection on the tab band, the
-  // band fills gray and the active tab is a solid pill; with the selection
-  // down in the list, the band is plain and the active tab keeps a gray box
-  // with an underline. The 1px rule under the band is always there, drawn
-  // full-width below (not by tabBar, whose rect is inset for side padding).
-  fui::StyleSet tabStyles;
-  tabStyles.explicitlySet = true;
-  tabStyles.normal.foreground = fui::Paint::solid(fui::Color::Black);
-  if (tabsFocused) {
-    tabStyles.selected.background = fui::Paint::solid(fui::Color::Black);
-    tabStyles.selected.foreground = fui::Paint::solid(fui::Color::White);
-    tabStyles.selected.radius = screen.theme().listRowRadius;
-  } else if (metrics.tabPillFullSlot) {
-    // Legacy RoundedRaff unfocused treatment: same pill, dimmed to dark gray,
-    // text stays inverted; no underline.
-    tabStyles.selected.background = fui::Paint::dither(fui::Color::DarkGray);
-    tabStyles.selected.foreground = fui::Paint::solid(fui::Color::White);
-    tabStyles.selected.radius = screen.theme().listRowRadius;
-  } else {
-    tabStyles.selected.background = fui::Paint::dither(fui::Color::LightGray);
-    tabStyles.selected.foreground = fui::Paint::solid(fui::Color::Black);
-    tabProps.selectedUnderline = 2;
+  // Preserve full category names: fold a crowded band into rows before
+  // resorting to two text lines inside a tab.
+  int columns = count;
+  const int horizontalInset = tabProps.tabInset.left + tabProps.tabInset.right + 8;
+  while (columns > 1 &&
+         widestLabel + horizontalInset > (availableWidth - (columns - 1) * tabProps.gap) / columns) {
+    --columns;
   }
-  // Focus/flash states keep the pill instead of falling back to an unset
-  // (blank) style.
+  const int slotWidth = (availableWidth - (columns - 1) * tabProps.gap) / columns;
+  tabProps.text.maxLines = widestLabel + horizontalInset > slotWidth ? 2 : 1;
+  const int verticalInset =
+      tabProps.tabInset.top + tabProps.tabInset.bottom + tabProps.contentInset.top + tabProps.contentInset.bottom;
+  const int16_t tabBand = std::max<int16_t>(preferredTabHeight, tabLineHeight * tabProps.text.maxLines + verticalInset);
+  const int rowCount = (count + columns - 1) / columns;
+
+  // The underline identifies the current category even while focus is in the
+  // list. A thin outline distinguishes keyboard focus on the tab band.
+  fui::StyleSet tabStyles = fui::plainStyles(fui::Paint::solid(fui::Color::Black));
+  if (ringPos() == 0) {
+    tabStyles.selected.border = fui::Paint::solid(fui::Color::Black);
+    tabStyles.selected.borderWidth = 1;
+  }
   tabStyles.focused = tabStyles.selected;
   tabStyles.active = tabStyles.selected;
   tabProps.tabStyles = tabStyles;
-  const fui::Rect contentTabRect = screen.takeTop(tabBand);
-  const fui::Rect frameRect = screen.frame().screen();
-  // Tab chrome is a full-width screen band like the legacy GUI tab bar. The
-  // remaining list content still stays inside the device safe area.
-  const fui::Rect tabRect{frameRect.x, contentTabRect.y, frameRect.width, contentTabRect.height};
-  // Focused band wash is the Lyra treatment; legacy RoundedRaff keeps the
-  // band plain in both states.
-  if (tabsFocused && !metrics.tabPillFullSlot) {
-    screen.target().fill(tabRect, fui::Paint::dither(fui::Color::LightGray));
-  }
-  // The band chrome (wash, divider) spans the full screen width, but the tab
-  // slots keep the content side padding so the outer pills never touch the
-  // bezel. The divider is drawn here rather than by tabBar(), which would
-  // inset it along with the slots; the slot band is shortened by the same 1px
-  // so pill geometry is unchanged.
-  const auto side = static_cast<int16_t>(metrics.contentSidePadding);
-  const fui::Rect slotsRect{static_cast<int16_t>(tabRect.x + side), tabRect.y,
-                            static_cast<int16_t>(tabRect.width - 2 * side), static_cast<int16_t>(tabRect.height - 1)};
+  tabProps.selectedUnderline = 2;
+  const fui::Rect tabRect = screen.takeTop(static_cast<int16_t>(tabBand * rowCount))
+                                .inset(fui::Insets{0, side, 0, side});
   tabProps.divider = false;
-  fui::tabBar(screen.frame(), slotsRect, tabProps);
+  for (int row = 0; row < rowCount; ++row) {
+    tabProps.tabs = tabs + row * columns;
+    tabProps.count = static_cast<uint8_t>(std::min(columns, count - row * columns));
+    if (UITheme::isRtl()) {
+      std::reverse(tabs + row * columns, tabs + row * columns + tabProps.count);
+    }
+    const fui::Rect slotsRect{tabRect.x, static_cast<int16_t>(tabRect.y + row * tabBand),
+                              tabRect.width, tabBand};
+    fui::tabBar(screen.frame(), slotsRect, tabProps);
+  }
   screen.target().fill(fui::Rect{tabRect.x, static_cast<int16_t>(tabRect.bottom() - 1), tabRect.width, 1},
                        fui::Paint::solid(fui::Color::Black));
   screen.spacer(static_cast<int16_t>(metrics.verticalSpacing));

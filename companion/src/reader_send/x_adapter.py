@@ -39,7 +39,7 @@ def load_export(data: bytes) -> dict:
     return payload
 
 
-def thread_item(url: str, payload: dict) -> ReadingItem:
+def thread_item(url: str, payload: dict, *, thread: bool = True) -> ReadingItem:
     requested = post_id(url)
     data = payload.get("data", [])
     data = [data] if isinstance(data, dict) else data
@@ -172,11 +172,13 @@ def thread_item(url: str, payload: dict) -> ReadingItem:
     item = extract("<article>" + "".join(body) + "</article>", canonical, title=title, author=author,
                    date=str(ordered[0].get("created_at", "")))
     item.source_type = "x"
-    item.source_id = "x:" + str(target.get("conversation_id") or root_id) + ":" + author_id
+    anchor = str(target.get("conversation_id") or root_id) if thread else requested
+    item.source_id = "x:" + anchor + ":" + author_id
     item.provenance = {"requested_url": http_url(url), "conversation_id": str(target.get("conversation_id") or root_id),
                        "post_ids": ",".join(str(tweet["id"]) for tweet in ordered),
                        "media_links": json.dumps(preview_urls), "qr_payload": canonical}
-    item.warnings.append("Thread includes only accessible/exported connected posts by this author; missing/deleted posts cannot be reconstructed.")
+    if thread:
+        item.warnings.append("Thread includes only accessible/exported connected posts by this author; missing/deleted posts cannot be reconstructed.")
     if payload.get("_truncated"):
         item.warnings.append("API page limit reached; export the full thread for complete coverage.")
     return item

@@ -10,6 +10,7 @@
 #include <HalStorage.h>
 
 #include <cstdint>
+#include <memory>
 #include <string>
 
 #include "LibraryFormat.h"
@@ -96,12 +97,18 @@ class LibraryIndexFile {
   bool openImpl(const char* path, bool acceptStaleFold);
   bool readAt(uint32_t offset, void* dst, size_t len);
   bool readBlobField(const ClixRecord& record, uint8_t field, std::string& out);
+  bool readBlobAt(const ClixRecord& record, uint32_t relative, void* dst, size_t len);
 
   HalFile file;
   ClixHeader head{};
   bool opened = false;
   bool readFailed = false;
   ClixValidity lastValidity = ClixValidity::BadMagic;
+  // Repeated title/author/name reads share one bounded window, not one buffer
+  // per book. Allocation failure falls back to ordinary reads.
+  std::unique_ptr<uint8_t[]> blobCache;
+  uint32_t blobCacheOffset = UINT32_MAX;
+  size_t blobCacheSize = 0;
 };
 
 }  // namespace library

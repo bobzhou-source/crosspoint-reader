@@ -111,7 +111,9 @@ void UiListActivity::navigateButtons() {
 }
 
 void UiListActivity::syncListViewport(UiScreen& screen, fui::ListProps& props, const int selectionOffset) {
-  props.partialTrailingRow = true;
+  // Only complete rows are painted and registered as touch targets.
+  props.partialTrailingRow = false;
+  props.rtl = UITheme::isRtl();
   auto& n = activeNav();
   const int prevTop = n.top;
   const bool trusted = n.trusts(listCount());
@@ -132,11 +134,33 @@ void UiListActivity::syncListViewport(UiScreen& screen, fui::ListProps& props, c
   }
 }
 
+void UiListActivity::buildListMessage(UiScreen& screen, const char* message, const bool secondary) {
+  if (!message) return;
+  const int16_t side = static_cast<int16_t>(UITheme::getInstance().getMetrics().contentSidePadding);
+  const int16_t width = static_cast<int16_t>(screen.body().width - 2 * side);
+  if (width <= 0) return;
+  auto text = secondary ? screen.theme().smallText : screen.theme().bodyText;
+  text.align = UITheme::isRtl() ? fui::TextAlign::Right : fui::TextAlign::Left;
+  text.maxLines = secondary ? 5 : 3;
+  const int16_t height = fui::measureWrappedText(screen.target(), message, text, width).height;
+  const auto band = screen.takeTop(height).inset(fui::Insets{0, side, 0, side});
+  auto lineText = text;
+  lineText.maxLines = 1;
+  lineText.align = fui::TextAlign::Left;
+  fui::layoutText(screen.target(), band, message, text, [&](const char* line, const fui::Rect run) {
+    screen.target().text(run, line, lineText);
+  });
+}
+
 void UiListActivity::drawChrome() {
   const char* title = headerTitle();
   if (!title) return;
   const auto& metrics = UITheme::getInstance().getMetrics();
-  GUI.drawHeader(renderer, Rect{0, metrics.topPadding, renderer.getScreenWidth(), metrics.headerHeight}, title);
+  const auto safe = uiTarget.deviceContext().safeArea;
+  GUI.drawHeader(renderer,
+                 Rect{safe.left, safe.top + metrics.topPadding,
+                      renderer.getScreenWidth() - safe.left - safe.right, metrics.headerHeight},
+                 title);
 }
 
 void UiListActivity::drawFooter() {

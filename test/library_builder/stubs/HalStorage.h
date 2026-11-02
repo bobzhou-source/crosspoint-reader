@@ -7,6 +7,10 @@
 #include <string>
 #include <vector>
 
+inline constexpr unsigned O_RDONLY = 0;
+inline constexpr unsigned O_RDWR = 2;
+inline constexpr unsigned O_CREAT = 64;
+
 namespace fake {
 
 struct Node {
@@ -98,6 +102,7 @@ class HalFile {
   explicit operator bool() const { return bool(node); }
   bool isOpen() const { return bool(node); }
   bool close() {
+    if (!node) return true;
     const bool failed = !fake::failClosePath.empty() && path == fake::failClosePath;
     if (failed) {
       fake::failClosePath.clear();
@@ -107,6 +112,7 @@ class HalFile {
     return !failed;
   }
   bool isDirectory() const { return node && node->directory; }
+  bool sync() { return bool(node); }
   void rewindDirectory() { pos = 0; }
   HalFile openNextFile() {
     std::vector<std::string> children;
@@ -186,7 +192,8 @@ class HalStorage {
     fake::files[path]->directory = true;
     return true;
   }
-  HalFile open(const char* path) {
+  HalFile open(const char* path, unsigned flags = O_RDONLY) {
+    if ((flags & O_CREAT) && !exists(path)) fake::add(path, "");
     HalFile file;
     const auto found = fake::files.find(path);
     if (found != fake::files.end()) {

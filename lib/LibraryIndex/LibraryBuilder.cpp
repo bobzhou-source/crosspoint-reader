@@ -1,6 +1,7 @@
 #include "LibraryBuilder.h"
 
 #include <Arduino.h>
+#include <Benchmark.h>
 #include <BufferedFile.h>
 #include <Epub.h>
 #include <FsHelpers.h>
@@ -10,6 +11,7 @@
 #include <Utf8.h>
 
 #include <algorithm>
+#include <atomic>
 #include <cstddef>
 #include <cstring>
 
@@ -25,9 +27,11 @@ constexpr char BACKUP_PATH[] = "/.crosspoint/library.bak";
 constexpr char STAGE_PATH[] = "/.crosspoint/library.stage";
 constexpr char DIRTY_PATH[] = "/.crosspoint/library.dirty";
 constexpr char CACHE_DIR[] = "/.crosspoint";
+constexpr char JOURNAL_PATH[] = "/.crosspoint/library.resume";
+constexpr char ACTIVE_PATH[] = "/.crosspoint/library.updating";
 // Sticky fallback when the marker could not be persisted (card unavailable at
 // write time): callers must still see the index as stale until a rebuild clears it.
-bool dirtyInMemory = false;
+std::atomic<bool> dirtyInMemory{false};
 constexpr size_t LIBRARY_IO_BUFFER_SIZE = 4096;
 
 // Matches lib/FileIndex's buffer so a name this walk accepts is one the file
@@ -102,8 +106,8 @@ bool recoverInterruptedInstall() {
   }
 
   // Both names exist when power was lost after the new index became live but
-  // before backup cleanup. Validate them one at a time (SdFat has one reader)
-  // before deciding which copy is stale.
+  // before backup cleanup. Validate one at a time to bound temporary handles
+  // and cache allocations before deciding which copy is stale.
   LibraryIndexFile candidate;
   if (candidate.open(INDEX_PATH)) {
     candidate.close();
@@ -179,9 +183,8 @@ bool installNewIndex() {
 }
 
 void clearLibraryIndexDirty() {
-  dirtyInMemory = false;
-  if (Storage.exists(DIRTY_PATH) && !Storage.remove(DIRTY_PATH)) {
-    LOG_ERR("LIBIDX", "cannot clear dirty marker");
+  if (Storage.exists(ACTIVE_PATH) && !Storage.remove(ACTIVE_PATH)) {
+    LOG_ERR("LIBIDX", "cannot clear active build marker");
   }
 }
 
@@ -235,6 +238,105 @@ uint32_t fnv1a32(const char* data, const size_t len) {
   }
   return hash;
 }
+// Only metadata is journaled: directory enumeration is repeated after a restart
+// so removals and renames cannot resurrect obsolete rows. Each synced entry has
+// a checksum; a torn final entry is overwritten on the next attempt.
+class MetadataJournal {
+  struct Record {
+    uint64_t pathHash;
+    uint32_t size;
+    uint32_t mtime;
+    uint32_t version;
+    uint8_t titleLen;
+    uint8_t authorLen;
+    char title[255];
+    char author[128];
+    uint32_t checksum;
+  };
+  struct Key {
+    uint64_t hash;
+    uint16_t ordinal;
+  };
+  static constexpr uint32_t VERSION = 0x4C4A0100u + CLIX_FOLD_VERSION;
+  HalFile file;
+  std::unique_ptr<Record> scratch;
+  std::unique_ptr<Key[]> keys;
+  uint16_t count = 0;
+  uint16_t appended = 0;
+
+  bool valid() const {
+    return scratch->version == VERSION && scratch->authorLen <= sizeof(scratch->author) &&
+           scratch->checksum == fnv1a32(reinterpret_cast<const char*>(scratch.get()), offsetof(Record, checksum));
+  }
+
+ public:
+  void close() {
+    if (file) file.close();
+    keys.reset();
+    scratch.reset();
+  }
+
+  bool open(const BuildControl* control) {
+    file = Storage.open(JOURNAL_PATH, O_RDWR | O_CREAT);
+    if (!file) return false;
+    scratch = makeUniqueNoThrow<Record>();
+    if (!scratch) return false;
+    const auto available = std::min<uint64_t>(file.fileSize64() / sizeof(Record), CLIX_MAX_RECORDS);
+    if (available > 0) {
+      keys = makeUniqueNoThrow<Key[]>(available);
+      if (!keys) return false;
+      for (; count < available; count++) {
+        if (control && control->service && (count & 31u) == 0 && !control->service(control->context, 0, 0, 0))
+          return false;
+        if (file.read(scratch.get(), sizeof(Record)) != sizeof(Record) || !valid()) break;
+        keys[count] = {scratch->pathHash, count};
+      }
+      std::sort(keys.get(), keys.get() + count, [](const Key& a, const Key& b) {
+        return a.hash < b.hash || (a.hash == b.hash && a.ordinal > b.ordinal);
+      });
+    }
+    appended = count;
+    return true;
+  }
+
+  bool load(uint64_t hash, uint32_t size, uint32_t mtime, std::string& title, std::string& author) {
+    if (!keys || mtime == 0) return false;
+    Key* end = keys.get() + count;
+    const Key* key = std::lower_bound(keys.get(), end, hash, [](const Key& k, uint64_t h) { return k.hash < h; });
+    for (; key != end && key->hash == hash; ++key) {
+      if (!file.seekSet(static_cast<size_t>(key->ordinal) * sizeof(Record)) ||
+          file.read(scratch.get(), sizeof(Record)) != sizeof(Record) || !valid())
+        continue;
+      if (scratch->size != size || scratch->mtime != mtime) continue;
+      title.assign(scratch->title, scratch->titleLen);
+      author.assign(scratch->author, scratch->authorLen);
+      return true;
+    }
+    return false;
+  }
+
+  bool save(uint64_t hash, uint32_t size, uint32_t mtime, const std::string& title, const std::string& author) {
+    if (mtime == 0 || appended == CLIX_MAX_RECORDS) return true;
+    // Do not truncate before normalization: authorKey may depend on a surname
+    // at the end. Oversized metadata is rare and safely reparsed after a restart.
+    if (title.size() > sizeof(scratch->title) || author.size() > sizeof(scratch->author)) return true;
+    memset(scratch.get(), 0, sizeof(Record));
+    scratch->pathHash = hash;
+    scratch->size = size;
+    scratch->mtime = mtime;
+    scratch->version = VERSION;
+    scratch->titleLen = static_cast<uint8_t>(title.size());
+    scratch->authorLen = static_cast<uint8_t>(author.size());
+    memcpy(scratch->title, title.data(), scratch->titleLen);
+    memcpy(scratch->author, author.data(), scratch->authorLen);
+    scratch->checksum = fnv1a32(reinterpret_cast<const char*>(scratch.get()), offsetof(Record, checksum));
+    if (!file.seekSet(static_cast<size_t>(appended) * sizeof(Record)) ||
+        file.write(scratch.get(), sizeof(Record)) != sizeof(Record) || !file.sync())
+      return false;
+    appended++;
+    return true;
+  }
+};
 
 // Sentinel written into a staged record whose book matched no previous path. A
 // second pass decides whether it is a rename or genuinely new.
@@ -268,6 +370,15 @@ struct WalkState {
   uint16_t priorCount = 0;
   uint16_t reused = 0;
   uint32_t serviceUnits = 0;
+  const BuildControl* control = nullptr;
+  MetadataJournal* journal = nullptr;
+
+  bool service() {
+    if (control && control->service &&
+        !control->service(control->context, books, stats->parsed, stats->metadataReused + stats->metadataResumed))
+      failed = true;
+    return !failed;
+  }
 };
 
 // Bound to shownTitle when a book told us nothing. A `std::string()` temporary
@@ -341,14 +452,27 @@ int findPrior(WalkState& st, const uint64_t pathHash) {
     st.stats->metadataReused++;
   }
 
-  // Prefer the reader's existing cache. For an unopened book, loadMetadata()
-  // reuses the same EPUB parser but stops before the manifest, so this never
-  // builds spine, TOC, CSS, cover, or section caches during the library walk.
+  // Missing or changed entries must read the source, not a path-keyed reader
+  // cache which may still describe an earlier version of this same EPUB.
   if (!reuseMetadata && extractionExpected) {
-    st.stats->parsed++;
-    Epub epub(fullPath, CACHE_DIR);
     std::string bookTitle;
-    if (epub.loadMetadata(bookTitle, author)) {
+    const bool resumed = st.journal && st.journal->load(entry.pathHash, fileSize, modificationTime, bookTitle, author);
+    bool loaded = resumed;
+    if (resumed) {
+      st.stats->metadataResumed++;
+    } else {
+      const uint32_t parseStartMs = millis();
+      st.stats->parsed++;
+      Epub epub(fullPath, CACHE_DIR);
+      loaded = epub.loadMetadata(bookTitle, author);
+      if (loaded && st.journal && !st.journal->save(entry.pathHash, fileSize, modificationTime, bookTitle, author)) {
+        LOG_ERR("LIBIDX", "metadata checkpoint write failed");
+        st.failed = true;
+        return false;
+      }
+      st.stats->metadataMs += millis() - parseStartMs;
+    }
+    if (loaded) {
       entry.record.metadataStatus = CLIX_METADATA_EXTRACTED;
       if (!bookTitle.empty()) {
         title = std::move(bookTitle);
@@ -459,7 +583,7 @@ void walk(WalkState& st, const std::string& path, const int depth) {
 
   for (HalFile entry = dir.openNextFile(); entry; entry = dir.openNextFile()) {
     serviceBuilder(st.serviceUnits);
-    if (st.failed || st.books >= CLIX_MAX_RECORDS) {
+    if (!st.service() || st.books >= CLIX_MAX_RECORDS) {
       entry.close();
       break;
     }
@@ -612,8 +736,8 @@ bool emitIndex(const char* folderStagePath, WalkState& st, const uint16_t* order
       outBuffer.write(zeros, want);
     }
   };
-  const auto readStageAt = [&stage, &ioFailed](const uint64_t offset, void* data, const size_t len) {
-    if (ioFailed) return false;
+  const auto readStageAt = [&stage, &ioFailed, &st](const uint64_t offset, void* data, const size_t len) {
+    if (ioFailed || !st.service()) return false;
     if (!stage.seekSet(offset) || stage.read(reinterpret_cast<uint8_t*>(data), len) != static_cast<int>(len)) {
       LOG_ERR("LIBIDX", "record stage read failed at %u", static_cast<unsigned>(offset));
       ioFailed = true;
@@ -1023,7 +1147,7 @@ bool emitIndex(const char* folderStagePath, WalkState& st, const uint16_t* order
   const bool sizeMatches = written == header.selfSize;
   const bool closed = out.close();
 
-  if (ioFailed || !sizeMatches || !closed) {
+  if (ioFailed || st.failed || !sizeMatches || !closed) {
     LOG_ERR("LIBIDX", "emit incomplete (I/O %s, close %s, size %u vs %u) — keeping the old index",
             ioFailed ? "failed" : "ok", closed ? "ok" : "failed", static_cast<unsigned>(written),
             static_cast<unsigned>(header.selfSize));
@@ -1037,12 +1161,26 @@ bool emitIndex(const char* folderStagePath, WalkState& st, const uint16_t* order
   // Rename last. The previous index moves to a recoverable backup until the new
   // file owns the live path; a failed rename rolls it back instead of deleting
   // the only usable shelf.
+  if (st.control && st.control->deferInstall) {
+    stats.indexPrepared = true;
+    return true;
+  }
   return installNewIndex();
 }
 
 }  // namespace
 
 const char* libraryIndexPath() { return INDEX_PATH; }
+
+bool installPreparedLibraryIndex() {
+  LibraryIndexFile prepared;
+  if (!prepared.open(NEW_PATH)) return false;
+  prepared.close();
+  if (!installNewIndex()) return false;
+  clearLibraryIndexDirty();
+  Storage.remove(JOURNAL_PATH);
+  return true;
+}
 
 bool markLibraryIndexDirty() {
   if (Storage.exists(DIRTY_PATH)) return true;
@@ -1060,15 +1198,36 @@ bool markLibraryIndexDirty() {
   return true;
 }
 
-bool isLibraryIndexDirty() { return dirtyInMemory || Storage.exists(DIRTY_PATH); }
+bool isLibraryIndexDirty() { return dirtyInMemory.load() || Storage.exists(DIRTY_PATH) || Storage.exists(ACTIVE_PATH); }
 
-bool buildLibraryIndex(const char* rootPath, BuildStats& stats, const bool readMetadata) {
+bool buildLibraryIndex(const char* rootPath, BuildStats& stats, const bool readMetadata, const BuildControl* control) {
   const uint32_t startMs = millis();
   uint32_t serviceUnits = 0;
   stats = BuildStats{};
 
   Storage.mkdir(CACHE_DIR);
   if (!recoverInterruptedInstall()) return false;
+  // Claim this generation, leaving later transfer notifications at DIRTY_PATH.
+  // The active marker also makes failed/cancelled/manual builds retryable.
+  dirtyInMemory.exchange(false);
+  if (Storage.exists(DIRTY_PATH)) {
+    // Retain an interrupted generation until another persisted dirty marker
+    // exists. Removing/recreating the only marker leaves a power-loss window.
+    if (Storage.exists(ACTIVE_PATH) && !Storage.remove(ACTIVE_PATH)) {
+      dirtyInMemory = true;
+      return false;
+    }
+    if (!Storage.rename(DIRTY_PATH, ACTIVE_PATH)) {
+      dirtyInMemory = true;
+      return false;
+    }
+  } else if (!Storage.exists(ACTIVE_PATH)) {
+    HalFile active;
+    if (!Storage.openFileForWrite("LIBIDX", ACTIVE_PATH, active) || !active.close()) {
+      dirtyInMemory = true;
+      return false;
+    }
+  }
   Storage.remove(STAGE_PATH);
   const std::string folderStagePath = std::string(STAGE_PATH) + ".f";
   Storage.remove(folderStagePath.c_str());
@@ -1114,6 +1273,7 @@ bool buildLibraryIndex(const char* rootPath, BuildStats& stats, const bool readM
 
       for (uint16_t i = 0; i < priorCount; i++) {
         serviceBuilder(serviceUnits);
+        if (control && control->service && !control->service(control->context, 0, 0, 0)) return false;
         ClixRecord r{};
         uint64_t pathHash = 0;
         if (!previous.readRecord(i, r) || !previous.readPathHash(r, pathHash)) {
@@ -1143,6 +1303,15 @@ bool buildLibraryIndex(const char* rootPath, BuildStats& stats, const bool readM
   st.readMetadata = readMetadata;
   st.previous = previous.isOpen() ? &previous : nullptr;
   st.stats = &stats;
+  st.control = control;
+  MetadataJournal journal;
+  if (readMetadata) {
+    if (!journal.open(control)) {
+      LOG_ERR("LIBIDX", "cannot open metadata checkpoint");
+      return false;
+    }
+    st.journal = &journal;
+  }
 
   if (!Storage.openFileForWrite("LIBIDX", STAGE_PATH, st.stage) ||
       !Storage.openFileForWrite("LIBIDX", folderStagePath, st.folders)) {
@@ -1152,7 +1321,8 @@ bool buildLibraryIndex(const char* rootPath, BuildStats& stats, const bool readM
     return false;
   }
 
-  LOG_DBG("LIBIDX", "phase prepare/prior: %ums", static_cast<unsigned>(millis() - startMs));
+  LOG_INF("LIBIDX", "phase prepare/prior: %ums", static_cast<unsigned>(millis() - startMs));
+  benchmark::intervalMs(benchmark::EventType::Index, startMs, millis(), 2, 0);
   [[maybe_unused]] const uint32_t walkStartMs = millis();
   bool stageFlushed = false;
   {
@@ -1164,9 +1334,12 @@ bool buildLibraryIndex(const char* rootPath, BuildStats& stats, const bool readM
   }
   const bool stageClosed = st.stage.close();
   const bool foldersClosed = st.folders.close();
-  LOG_DBG("LIBIDX", "phase walk/metadata/stage: %ums", static_cast<unsigned>(millis() - walkStartMs));
+  LOG_INF("LIBIDX", "phase walk/stage: %ums, source/checkpoint %ums", static_cast<unsigned>(millis() - walkStartMs),
+          static_cast<unsigned>(stats.metadataMs));
+  benchmark::intervalMs(benchmark::EventType::Index, walkStartMs, millis(), 3, stats.metadataMs);
+  journal.close();
 
-  if (st.failed || !stageFlushed || !stageClosed || !foldersClosed) {
+  if (!st.service() || !stageFlushed || !stageClosed || !foldersClosed) {
     LOG_ERR("LIBIDX", "staging failed; keeping the previous index");
     Storage.remove(STAGE_PATH);
     Storage.remove(folderStagePath.c_str());
@@ -1186,7 +1359,9 @@ bool buildLibraryIndex(const char* rootPath, BuildStats& stats, const bool readM
     previous.close();
     Storage.remove(STAGE_PATH);
     Storage.remove(folderStagePath.c_str());
+    Storage.remove(JOURNAL_PATH);
     stats.walkMs = millis() - startMs;
+    benchmark::intervalMs(benchmark::EventType::Index, startMs, startMs + stats.walkMs, 1, 1);
     LOG_INF("LIBIDX", "unchanged: %u reused, %u parsed, no replacement, %ums",
             static_cast<unsigned>(stats.metadataReused), static_cast<unsigned>(stats.parsed),
             static_cast<unsigned>(stats.walkMs));
@@ -1231,6 +1406,7 @@ bool buildLibraryIndex(const char* rootPath, BuildStats& stats, const bool readM
     }
     for (uint16_t i = 0; i < st.books; i++) {
       serviceBuilder(serviceUnits);
+      if (!st.service()) return false;
       ClixRecord r{};
       if (!read.seekSet(static_cast<uint64_t>(i) * STAGE_STRIDE) ||
           read.read(reinterpret_cast<uint8_t*>(&r), sizeof(r)) != static_cast<int>(sizeof(r))) {
@@ -1272,12 +1448,13 @@ bool buildLibraryIndex(const char* rootPath, BuildStats& stats, const bool readM
       Storage.remove(folderStagePath.c_str());
       return false;
     }
-    for (uint16_t q = 0; q < priorCount; q++) {
-      serviceBuilder(serviceUnits);
-      if (priorList && !priorMatched(priorList[q])) stats.removed++;
-    }
   }
-  LOG_DBG("LIBIDX", "phase reconcile: %ums", static_cast<unsigned>(millis() - reconcileStartMs));
+  for (uint16_t q = 0; q < priorCount; q++) {
+    serviceBuilder(serviceUnits);
+    if (priorList && !priorMatched(priorList[q])) stats.removed++;
+  }
+  LOG_INF("LIBIDX", "phase reconcile: %ums", static_cast<unsigned>(millis() - reconcileStartMs));
+  benchmark::intervalMs(benchmark::EventType::Index, reconcileStartMs, millis(), 4, 0);
 
   // --- title order -----------------------------------------------------------
   [[maybe_unused]] const uint32_t titleStartMs = millis();
@@ -1323,6 +1500,7 @@ bool buildLibraryIndex(const char* rootPath, BuildStats& stats, const bool readM
       }
       for (uint16_t i = 0; i < st.books; i++) {
         serviceBuilder(serviceUnits);
+        if (!st.service()) return false;
         ClixRecord r{};
         const uint64_t offset = static_cast<uint64_t>(i) * STAGE_STRIDE;
         if (!stage.seekSet(offset) ||
@@ -1356,24 +1534,32 @@ bool buildLibraryIndex(const char* rootPath, BuildStats& stats, const bool readM
       LOG_ERR("LIBIDX", "sort skipped: key array alloc failed");
     }
   }
-  LOG_DBG("LIBIDX", "phase title order: %ums", static_cast<unsigned>(millis() - titleStartMs));
+  LOG_INF("LIBIDX", "phase title order: %ums", static_cast<unsigned>(millis() - titleStartMs));
+  benchmark::intervalMs(benchmark::EventType::Index, titleStartMs, millis(), 5, 0);
 
   [[maybe_unused]] const uint32_t emitStartMs = millis();
   const bool ok =
       emitIndex(folderStagePath.c_str(), st, order.get(), resolvedFirstSeen.get(), coreSortsAvailable, stats);
-  LOG_DBG("LIBIDX", "phase author/orders/emit: %ums", static_cast<unsigned>(millis() - emitStartMs));
+  LOG_INF("LIBIDX", "phase author/orders/emit: %ums", static_cast<unsigned>(millis() - emitStartMs));
+  benchmark::intervalMs(benchmark::EventType::Index, emitStartMs, millis(), 6, ok);
   Storage.remove(STAGE_PATH);
   Storage.remove(folderStagePath.c_str());
 
   stats.walkMs = millis() - startMs;
-  stats.indexReplaced = ok;
+  stats.indexReplaced = ok && !stats.indexPrepared;
+  benchmark::intervalMs(benchmark::EventType::Index, startMs, startMs + stats.walkMs, 1, ok);
   LOG_INF("LIBIDX",
-          "%s: %u books, %u folders, %u parsed, %u metadata reused, replaced %u, %u dup dropped, %u unreadable, %ums",
+          "%s: %u books, %u folders, %u parsed, %u metadata reused, %u resumed, replaced %u, %u dup dropped, %u "
+          "unreadable, %ums",
           ok ? "built" : "FAILED", static_cast<unsigned>(stats.books), static_cast<unsigned>(stats.folders),
           static_cast<unsigned>(stats.parsed), static_cast<unsigned>(stats.metadataReused),
-          static_cast<unsigned>(stats.indexReplaced), static_cast<unsigned>(stats.duplicatesDropped),
-          static_cast<unsigned>(stats.unreadableSkipped), static_cast<unsigned>(stats.walkMs));
-  if (ok) clearLibraryIndexDirty();
+          static_cast<unsigned>(stats.metadataResumed), static_cast<unsigned>(stats.indexReplaced),
+          static_cast<unsigned>(stats.duplicatesDropped), static_cast<unsigned>(stats.unreadableSkipped),
+          static_cast<unsigned>(stats.walkMs));
+  if (ok && !stats.indexPrepared) {
+    clearLibraryIndexDirty();
+    Storage.remove(JOURNAL_PATH);
+  }
   return ok;
 }
 

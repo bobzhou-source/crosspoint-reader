@@ -1,10 +1,10 @@
 #pragma once
 
 #include <BufferedFile.h>
+#include <CheckedTable.h>
 #include <HalStorage.h>
 
 #include <algorithm>
-#include <deque>
 #include <memory>
 #include <string>
 #include <vector>
@@ -74,7 +74,7 @@ class BookMetadataCache {
     uint16_t hrefLen;   // length for collision reduction
     int16_t spineIndex;
   };
-  std::deque<SpineHrefIndexEntry> spineHrefIndex;
+  CheckedTable<SpineHrefIndexEntry> spineHrefIndex;
   bool useSpineHrefIndex = false;
 
   static constexpr uint16_t LARGE_SPINE_THRESHOLD = 400;

@@ -159,7 +159,23 @@ bool HalGPIO::wasReleased(uint8_t buttonIndex) const { return inputMgr.wasReleas
 bool HalGPIO::wasAnyReleased() const { return inputMgr.wasAnyReleased(); }
 
 bool HalGPIO::rawInputActive() {
+  const bool capturedButtons = inputMgr.captureDigitalButtons();
+  if (capturedButtons) return true;
   if (inputMgr.isPowerButtonPhysicallyPressed()) return true;
+  // X4 Pro's GT911 holds INT low until its pending frame is consumed by update().
+  // Observe it without reading/clearing the touch frame from the indexing/render task.
+  const auto& touch = BoardConfig::ACTIVE.touch;
+  if (BoardConfig::isX4Pro() && inputMgr.hasTouch() && touch.irq >= 0 && digitalRead(touch.irq) == LOW) {
+    return true;
+  }
+  if (BoardConfig::ACTIVE.inputStyle != BoardConfig::InputStyle::XteinkAdcLadder) {
+    // Direct-GPIO buttons (X4 Pro and other digital boards) are active-low, as in
+    // InputManager::getDigitalState(); the ADC ladder below reports nothing for them.
+    const auto& pins = BoardConfig::ACTIVE.input;
+    for (const int8_t pin : {pins.back, pins.confirm, pins.left, pins.right, pins.up, pins.down}) {
+      if (pin >= 0 && digitalRead(pin) == LOW) return true;
+    }
+  }
   InputManager::ButtonAdcSample g1{}, g2{};
   inputMgr.readButtonAdc(g1, g2);
   // The Xteink ladder idles at the ADC full-scale rail (~4095); every button band sits below 3900.
