@@ -53,9 +53,11 @@ struct PageLayout {
   int viewportWidth;
   int linesPerPage;
   TextMeasure measure;
-  // CJK paragraph style: leading spaces, tabs and U+3000 of every paragraph
-  // are dropped, blank lines produce no display line, and the first line of a
-  // paragraph is indented by `firstLineIndent` pixels. Layout only; byte
+  // CJK paragraph style: whitespace is cleaned (a run of spaces, tabs and
+  // other controls shows as one space; BOM and zero-width spaces vanish;
+  // leading whitespace of every line and trailing whitespace of a complete
+  // line is dropped), blank lines produce no display line, and the first line
+  // of a paragraph is indented by `firstLineIndent` pixels. Layout only; byte
   // offsets still address the unmodified source.
   bool cjkParagraphs = false;
   int firstLineIndent = 0;

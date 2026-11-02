@@ -378,7 +378,7 @@ void ChapterHtmlSlimParser::flushPartWordBuffer() {
 }
 
 // start a new text block if needed
-void ChapterHtmlSlimParser::startNewTextBlock(const BlockStyle& blockStyle) {
+void ChapterHtmlSlimParser::startNewTextBlock(const BlockStyle& blockStyle, const bool paragraphEnd) {
   nextWordContinues = false;  // New block = new paragraph, no continuation
   if (currentTextBlock) {
     // already have a text block running and it is empty - just reuse it
@@ -415,7 +415,7 @@ void ChapterHtmlSlimParser::startNewTextBlock(const BlockStyle& blockStyle) {
       return;
     }
 
-    makePages();
+    makePages(paragraphEnd);
   }
   // If the pending anchor is a TOC chapter boundary, force a page break after the previous
   // block is flushed so the chapter starts on a fresh page.
@@ -1273,6 +1273,7 @@ void XMLCALL ChapterHtmlSlimParser::startElement(void* userData, const XML_Char*
   if (strcmp(name, "rt") == 0) {
     if (self->partWordBufferIndex > 0) {
       self->flushPartWordBuffer();
+      self->nextWordContinues = true;
     }
     self->collectingRubyText = true;
     self->depth += 1;
@@ -1408,7 +1409,7 @@ void XMLCALL ChapterHtmlSlimParser::startElement(void* userData, const XML_Char*
         brStyle = brStyle.withoutTop().withoutBottom();
       }
       brStyle.fromBrElement = true;
-      self->startNewTextBlock(brStyle);
+      self->startNewTextBlock(brStyle, false);
     } else {
       self->currentCssStyle = cssStyle;
       const auto accumulated = self->blockStyleStack.back().getCombinedBlockStyle(userAlignmentBlockStyle,
@@ -1843,11 +1844,6 @@ void XMLCALL ChapterHtmlSlimParser::endElement(void* userData, const XML_Char* n
       }
     }
     self->rubyTextBuffer.clear();
-    // Inline close: the next base (e.g. 字 in <ruby>漢<rt>かん</rt>字<rt>じ</rt></ruby>) joins the
-    // preceding one with no space. Whitespace in the source resets this in characterData().
-    if (self->currentTextBlock && !self->currentTextBlock->isEmpty()) {
-      self->nextWordContinues = true;
-    }
     self->depth -= 1;
     return;
   }
@@ -1855,8 +1851,8 @@ void XMLCALL ChapterHtmlSlimParser::endElement(void* userData, const XML_Char* n
     self->inRuby = false;
     self->rubyStartWordIndex = -1;
     self->rubyTextBuffer.clear();
-    // Inline close: text following </ruby> joins the annotated base with no space.
-    if (self->currentTextBlock && !self->currentTextBlock->isEmpty()) {
+    if (self->partWordBufferIndex > 0) {
+      self->flushPartWordBuffer();
       self->nextWordContinues = true;
     }
     self->depth -= 1;
@@ -1990,7 +1986,7 @@ void XMLCALL ChapterHtmlSlimParser::endElement(void* userData, const XML_Char* n
   }
 
   // Clear block style when leaving header or block elements
-  if (headerOrBlockTag && !insideSkippedSubtree) {
+  if (headerOrBlockTag && strcmp(name, "br") != 0 && !insideSkippedSubtree) {
     self->currentCssStyle.reset();
     self->updateEffectiveInlineStyle();
 
@@ -2251,7 +2247,7 @@ void ChapterHtmlSlimParser::addLineToPage(std::unique_ptr<TextBlock> line, const
   currentPageNextY += lineHeight;
 }
 
-void ChapterHtmlSlimParser::makePages() {
+void ChapterHtmlSlimParser::makePages(const bool paragraphEnd) {
   if (!currentTextBlock) {
     LOG_ERR("EHP", "!! No text block to make pages for !!");
     return;
@@ -2319,7 +2315,7 @@ void ChapterHtmlSlimParser::makePages() {
   }
 
   // Extra paragraph spacing if enabled (default behavior)
-  if (extraParagraphSpacing) {
+  if (extraParagraphSpacing && paragraphEnd) {
     currentPageNextY += lineHeight / 2;
   }
 }

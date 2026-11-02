@@ -129,19 +129,47 @@ void expectNoLostBytes(const std::string& label, const std::string& bytes, const
       if (!config.cjkParagraphs) return false;
       uint32_t cp = 0;
       const size_t n = TxtLineBreak::decodeAt(bytes.data(), at, bytes.size(), cp);
-      if (!TxtLineBreak::isParagraphIndentSpace(cp)) return false;
+      if (!TxtLineBreak::isParagraphIndentSpace(cp) && !TxtLineBreak::isSpaceLike(cp) &&
+          !TxtLineBreak::isInvisible(cp)) {
+        return false;
+      }
       at += n;
       return true;
     };
+    // The end in `bytes` of `line` displayed from `at`, or npos. The CJK style shows a run of whitespace as one
+    // character and drops invisible characters, so source whitespace between two displayed characters may vanish.
+    const auto matchEnd = [&](size_t at, const std::string& line) {
+      if (!config.cjkParagraphs) {
+        return bytes.compare(at, line.size(), line) == 0 ? at + line.size() : std::string::npos;
+      }
+      for (size_t i = 0; i < line.size();) {
+        uint32_t want = 0;
+        i += TxtLineBreak::decodeAt(line.data(), i, line.size(), want);
+        for (;;) {
+          if (at >= bytes.size()) return std::string::npos;
+          uint32_t have = 0;
+          const size_t n = TxtLineBreak::decodeAt(bytes.data(), at, bytes.size(), have);
+          if (have == want || (want == ' ' && TxtLineBreak::isAsciiSpace(have))) {
+            at += n;
+            break;
+          }
+          if (!TxtLineBreak::isSpaceLike(have) && !TxtLineBreak::isInvisible(have)) return std::string::npos;
+          at += n;
+        }
+      }
+      return at;
+    };
     size_t cursor = page.start;
     for (const std::string& line : page.lines) {
-      while (bytes.compare(cursor, line.size(), line) != 0) {
+      size_t end = matchEnd(cursor, line);
+      while (end == std::string::npos) {
         if (!skip(cursor)) {
           ADD_FAILURE() << "page " << p << ": source bytes at " << cursor << " are on no display line";
           return;
         }
+        end = matchEnd(cursor, line);
       }
-      cursor += line.size();
+      cursor = end;
       for (size_t i = 0; i < line.size();) {
         uint32_t cp = 0;
         i += TxtLineBreak::decodeAt(line.data(), i, line.size(), cp);
@@ -552,6 +580,108 @@ TEST(TxtPaginationParagraphStyle, ByteOffsetsStayExact) {
 TEST(TxtPaginationParagraphStyle, OtherBooksKeepTheirWhitespace) {
   const std::string text = "  Hello world\n\n\nNext\n";
   expectPages(text, {1000, 10, Model::Simple}, {Lines{"  Hello world", "", "", "Next"}}, {text.size()});
+}
+
+// ---------------------------------------------------------------------------------------------
+// CJK paragraph style: whitespace cleaning
+// ---------------------------------------------------------------------------------------------
+
+TEST(TxtPaginationClean, SourceIndentsNeverStackOnTheParagraphIndent) {
+  const Config config = cjkStyle({1000, 10, Model::Simple}, 40);
+  // Ideographic spaces, plain spaces, tabs, NBSP, BOM and zero-width spaces before the text all vanish:
+  // one first-line indent remains.
+  const std::string text = "\xEF\xBB\xBF\xE3\x80\x80\xE3\x80\x80 \t\xC2\xA0\xE2\x80\x8B" "甲乙\n"
+                           "\xE3\x80\x80\xE3\x80\x80 \xE3\x80\x80丙丁\n";
+  expectPages(text, config, {Lines{"甲乙", "丙丁"}}, {text.size()}, {Indents{40, 40}});
+}
+
+TEST(TxtPaginationClean, RunsOfWhitespaceShowAsOneSpace) {
+  const Config config = cjkStyle({1000, 10, Model::Simple}, 0);
+  const auto one = [&](const std::string& text, const std::string& line) {
+    expectPages(text, config, {Lines{line}}, {text.size()});
+  };
+  one("甲乙  丙丁\t\t戊\n", "甲乙 丙丁 戊");
+  // The watermark and 4-space gaps found in real novels.
+  one("UU看书  欢迎    光临\n", "UU看书 欢迎 光临");
+  // Mixed runs of plain whitespace collapse to a plain space.
+  one("甲 \t \xE2\x80\x83 乙\n", "甲 乙");
+}
+
+TEST(TxtPaginationClean, ControlsAndInvisiblesNeverReachTheFont) {
+  const Config config = cjkStyle({1000, 10, Model::Simple}, 0);
+  // A stray carriage return, form feed, DEL, BOM and zero-width space in the middle of a line.
+  const std::string text = "甲\r乙\x0C丙\x7F丁\xEF\xBB\xBF戊\xE2\x80\x8B己\n";
+  expectPages(text, config, {Lines{"甲 乙 丙 丁戊己"}}, {text.size()});
+  EXPECT_EQ(sweepLines(sweepNew(text, config, true))[0].find('\r'), std::string::npos);
+}
+
+TEST(TxtPaginationClean, SingleSpacesAndRealSpacingStay) {
+  const Config config = cjkStyle({1000, 10, Model::Simple}, 0);
+  const auto one = [&](const std::string& text, const std::string& line) {
+    expectPages(text, config, {Lines{line}}, {text.size()});
+  };
+  // A lone space between ideographs, a chapter number heading, ideographic space and NBSP are kept.
+  one("第79章 夺宝\n", "第79章 夺宝");
+  one("第一章\xE3\x80\x80命运\n", "第一章\xE3\x80\x80命运");
+  one("king\xC2\xA0size 床\n", "king\xC2\xA0size 床");
+  // A run of ideographic spaces or NBSP collapses to one.
+  one("甲\xE3\x80\x80\xE3\x80\x80乙\n", "甲\xE3\x80\x80乙");
+  one("甲\xC2\xA0\xC2\xA0乙\n", "甲\xC2\xA0乙");
+}
+
+TEST(TxtPaginationClean, TrailingWhitespaceNeverAddsALine) {
+  const Config config = cjkStyle({60, 10, Model::Simple}, 0);
+  // The first line is exactly full; the spaces, tabs and ideographic spaces after it are not a second line.
+  const std::string text = "甲乙丙   \t\xE3\x80\x80\n丁\n";
+  expectPages(text, config, {Lines{"甲乙丙", "丁"}}, {text.size()});
+  // A line of nothing but whitespace takes no display line, with CRLF too.
+  const std::string blank = "甲\r\n \t\xE3\x80\x80\r\n  \r\n乙\r\n";
+  expectPages(blank, config, {Lines{"甲", "乙"}}, {blank.size()});
+}
+
+TEST(TxtPaginationClean, AWrappedLineNeverStartsWithLeftoverSpaces) {
+  const Config config = cjkStyle({60, 10, Model::Simple}, 0);
+  const std::string han = "甲乙丙    丁戊\n";
+  expectPages(han, config, {Lines{"甲乙丙", "丁戊"}}, {han.size()});
+  // The same for Latin text and for a break that falls before an ideographic space.
+  const std::string latin = "abcdef     ghij\n";
+  expectPages(latin, config, {Lines{"abcdef", "ghij"}}, {latin.size()});
+  const std::string wide = "甲乙丙\xE3\x80\x80丁戊\n";
+  expectPages(wide, config, {Lines{"甲乙丙", "丁戊"}}, {wide.size()});
+}
+
+TEST(TxtPaginationClean, PageStartsAddressTheSourceBytes) {
+  // One line per page: each page starts at the first character after the whitespace run the line broke at.
+  const std::string text = "甲乙  丙丁  戊己";
+  expectPages(text, cjkStyle({40, 1, Model::Simple}, 0), {Lines{"甲乙"}, Lines{"丙丁"}, Lines{"戊己"}},
+              {8, 16, 22});
+  // A page ending inside a physical line that also has leading whitespace and a CRLF.
+  const std::string crlf = "\xE3\x80\x80甲乙  丙丁\r\n  戊己\r\n";
+  expectPages(crlf, cjkStyle({40, 1, Model::Simple}, 0), {Lines{"甲乙"}, Lines{"丙丁"}, Lines{"戊己"}},
+              {11, 19, 29});
+}
+
+TEST(TxtPaginationClean, OtherBooksKeepRunsTabsAndControls) {
+  const Config config{1000, 10, Model::Simple};
+  const std::string text = "a  b\t c\r\n\t\n";
+  expectPages(text, config, {Lines{"a  b\t c", "\t"}}, {text.size()});
+}
+
+TEST(TxtPaginationClean, WhitespaceHeavyTextMatchesTheReference) {
+  static const char* const kPieces[] = {"甲", "乙", "丙", "丁",  "，", "。", "A",  "bc", " ",     " ",
+                                        "  ", "\t", "\xE3\x80\x80", "\xC2\xA0", "\xEF\xBB\xBF", "\xE2\x80\x8B",
+                                        "\r",  "\x0C", "\n", "\n", "\r\n", "\xE2\x80\x83"};
+  const std::vector<Config> configs = {{440, 26, Model::Simple}, {120, 17, Model::Simple}, {60, 5, Model::Simple},
+                                       {40, 9, Model::Simple}};
+  for (uint32_t seed = 1; seed <= 24; seed++) {
+    Lcg rng(seed);
+    std::string text;
+    while (text.size() < 12000) text += kPieces[rng.below(static_cast<uint32_t>(std::size(kPieces)))];
+    expectMatchesReference("whitespace seed " + std::to_string(seed), text, cjkStyle(configs[seed % configs.size()], 20),
+                           false);
+    expectMatchesReference("whitespace seed " + std::to_string(seed), text,
+                           cjkStyle(configs[(seed + 1) % configs.size()], 0), false);
+  }
 }
 
 // ---------------------------------------------------------------------------------------------

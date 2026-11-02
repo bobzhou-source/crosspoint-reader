@@ -3,6 +3,7 @@
 #include <gtest/gtest.h>
 
 #include <filesystem>
+#include <fstream>
 #include <memory>
 #include <set>
 #include <string>
@@ -42,7 +43,99 @@ class ChapterHtmlSlimParserTest : public ::testing::TestWithParam<const char*> {
                                &cssParser};
 
   void SetUp() override { parser.currentTextBlock = std::make_unique<ParsedText>(false); }
+
+  std::vector<std::unique_ptr<Page>> parseMarkup(const std::string& markup, bool paragraphSpacing = false) {
+    const auto name = std::string("crosspoint-whitespace-") +
+                      ::testing::UnitTest::GetInstance()->current_test_info()->name() + ".xhtml";
+    filepath = (std::filesystem::temp_directory_path() / name).string();
+    {
+      std::ofstream file(filepath);
+      file << "<html><body>" << markup << "</body></html>";
+    }
+    std::vector<std::unique_ptr<Page>> pages;
+    parser.extraParagraphSpacing = paragraphSpacing;
+    parser.completePageFn = [&](std::unique_ptr<Page> page, auto, auto, auto) { pages.push_back(std::move(page)); };
+    EXPECT_TRUE(parser.parseAndBuildPages());
+    std::filesystem::remove(filepath);
+    return pages;
+  }
+
+  static std::vector<const PageLine*> lines(const std::vector<std::unique_ptr<Page>>& pages) {
+    std::vector<const PageLine*> result;
+    for (const auto& page : pages) {
+      for (const auto& element : page->elements) {
+        if (element->getTag() == TAG_PageLine) result.push_back(static_cast<const PageLine*>(element.get()));
+      }
+    }
+    return result;
+  }
 };
+
+TEST_F(ChapterHtmlSlimParserTest, CollapsesWhitespaceAcrossInlineNodesWithoutInventingGaps) {
+  const auto pages = parseMarkup("<p style=\"text-indent:0\"> \n Alpha <i> \t beta </i> gamma"
+                                "<b>delta</b>, <span> \n </span> epsilon \r\n </p>");
+  const auto rendered = lines(pages);
+  ASSERT_EQ(rendered.size(), 1u);
+  const auto* block = rendered[0]->getBlock();
+  ASSERT_EQ(block->wordCount(), 6u);
+  EXPECT_STREQ(block->wordText(0), "Alpha");
+  EXPECT_STREQ(block->wordText(1), "beta");
+  EXPECT_STREQ(block->wordText(2), "gamma");
+  EXPECT_STREQ(block->wordText(3), "delta");
+  EXPECT_STREQ(block->wordText(4), ",");
+  EXPECT_STREQ(block->wordText(5), "epsilon");
+  EXPECT_EQ(block->wordXpos(0), 0);
+  EXPECT_EQ(block->wordXpos(1) - block->wordXpos(0), 44);
+  EXPECT_EQ(block->wordXpos(2) - block->wordXpos(1), 36);
+  EXPECT_EQ(block->wordXpos(3) - block->wordXpos(2), 40);
+  EXPECT_EQ(block->wordXpos(4) - block->wordXpos(3), 40);
+  EXPECT_EQ(block->wordXpos(5) - block->wordXpos(4), 12);
+}
+
+TEST_F(ChapterHtmlSlimParserTest, BreakContinuesParagraphWithoutIndentOrExtraParagraphSpacing) {
+  const auto pages = parseMarkup("<p style=\"text-indent:2em;font-weight:bold\">Alpha<br/>\n  Beta<br/>Gamma</p>"
+                                "<p style=\"text-indent:0\">Delta</p>", true);
+  const auto rendered = lines(pages);
+  ASSERT_EQ(rendered.size(), 4u);
+  EXPECT_EQ(rendered[0]->getBlock()->wordXpos(0), 24);
+  EXPECT_EQ(rendered[1]->getBlock()->wordXpos(0), 0);
+  EXPECT_EQ(rendered[2]->getBlock()->wordXpos(0), 0);
+  EXPECT_EQ(rendered[1]->yPos - rendered[0]->yPos, 16);
+  EXPECT_EQ(rendered[2]->yPos - rendered[1]->yPos, 16);
+  EXPECT_EQ(rendered[3]->yPos - rendered[2]->yPos, 24);
+  EXPECT_EQ(rendered[1]->getBlock()->wordStyle(0) & EpdFontFamily::BOLD, EpdFontFamily::BOLD);
+}
+
+TEST_F(ChapterHtmlSlimParserTest, ConsecutiveBreaksPreserveExactlyOneBlankLine) {
+  const auto pages = parseMarkup("<p style=\"text-indent:0\">Alpha<br/>\n<br/>\nBeta</p>", true);
+  const auto rendered = lines(pages);
+  ASSERT_EQ(rendered.size(), 2u);
+  EXPECT_EQ(rendered[1]->yPos - rendered[0]->yPos, 32);
+}
+
+TEST_F(ChapterHtmlSlimParserTest, NonbreakingSpacesRemainExplicitAndNonbreaking) {
+  const auto pages = parseMarkup("<p style=\"text-indent:0\">A&#160;&#160;B</p>");
+  const auto rendered = lines(pages);
+  ASSERT_EQ(rendered.size(), 1u);
+  const auto* block = rendered[0]->getBlock();
+  ASSERT_EQ(block->wordCount(), 4u);
+  EXPECT_STREQ(block->wordText(1), " ");
+  EXPECT_STREQ(block->wordText(2), " ");
+  EXPECT_STREQ(block->wordText(3), "B");
+}
+
+TEST_F(ChapterHtmlSlimParserTest, RubyClosingTagsPreserveSourceWhitespace) {
+  for (const std::string markup : {
+           "<p style=\"text-indent:0\"><ruby>Alpha <rt>a</rt></ruby>Beta</p>",
+           "<p style=\"text-indent:0\"><ruby>Alpha<rt>a</rt> </ruby>Beta</p>"}) {
+    const auto pages = parseMarkup(markup);
+    const auto rendered = lines(pages);
+    ASSERT_EQ(rendered.size(), 1u);
+    const auto* block = rendered[0]->getBlock();
+    ASSERT_EQ(block->wordCount(), 2u);
+    EXPECT_EQ(block->wordXpos(1) - block->wordXpos(0), 44);
+  }
+}
 
 TEST_F(ChapterHtmlSlimParserTest, RubySurvivesPartialParagraphExtraction) {
   ParsedText text(false);

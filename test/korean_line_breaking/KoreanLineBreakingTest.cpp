@@ -57,8 +57,8 @@ TEST(KoreanLineBreaking, HyphenationOnSplitsBetweenSyllablesWithoutHyphen) {
   const auto lines = layout({"가나", "다라마바사아", "자"}, true, 50);
   const std::vector<std::vector<std::string>> expected{{"가나", "다라마"}, {"바사아", "자"}};
   ASSERT_EQ(wordsOf(lines), expected);
-  // 16 + 4 + 24 = 44 px leaves 6 px, all of it on the one word space.
-  EXPECT_EQ(lines[0].xpos, (std::vector<int16_t>{0, 26}));
+  // The 6 px spare is capped at one additional natural space (4 px).
+  EXPECT_EQ(lines[0].xpos, (std::vector<int16_t>{0, 24}));
 }
 
 TEST(KoreanLineBreaking, HyphenationOnKeepsTrailingPunctuationWithSyllable) {

@@ -28,6 +28,7 @@ from .epub import CONTAINER_XML, pack_epub
 
 CONVERTER_VERSION = 10
 UNGROUPED_VERSION = 9  # unchanged books retain their reproducible EPUB identity
+TEXT_CLEAN_REVISION = 1  # provenance only: recorded in the manifest of books built by this text handling; never forces a rebuild
 GROUP_CHAPTER_THRESHOLD = 3_000
 MANIFEST_NAME = ".novels-manifest.json"
 REPORT_NAME = ".novels-report.json"
@@ -469,10 +470,29 @@ def chapter_starts(headings: dict[int, Heading]) -> list[int]:
     return sorted(i for i, h in headings.items() if h.level != ECHO)
 
 
+def duplicate_echoes(paragraphs: list[str], headings: dict[int, Heading]) -> set[int]:
+    """Paragraph indices of echo lines that repeat their heading's displayed text exactly.
+
+    `第1章 标题` / `第1章 标题` would show the same title twice in a row; the second line is dropped (and
+    accounted for as removed text). An echo that differs in any character is kept under the heading.
+    """
+    if len(chapter_starts(headings)) < MIN_HEADINGS:
+        return set()
+    dropped: set[int] = set()
+    owner: int | None = None
+    for index in sorted(headings):
+        if headings[index].level != ECHO:
+            owner = index
+        elif owner is not None and strip_decoration(paragraphs[index]) == strip_decoration(paragraphs[owner]):
+            dropped.add(index)
+    return dropped
+
+
 def segment(paragraphs: list[str], headings: dict[int, Heading]) -> list[Segment]:
     starts = chapter_starts(headings)
     if len(starts) < MIN_HEADINGS:
         return [Segment(0, "", None, paragraphs)]
+    duplicates = duplicate_echoes(paragraphs, headings)
     segments: list[Segment] = []
     if starts[0] > 0:
         segments.append(Segment(0, FRONT_MATTER_LABEL, None, paragraphs[:starts[0]]))
@@ -482,8 +502,9 @@ def segment(paragraphs: list[str], headings: dict[int, Heading]) -> list[Segment
         first = start + 1
         while first < end and first in headings:  # the only headings inside a segment are its echoes
             first += 1
+        echoes = [strip_decoration(paragraphs[i]) for i in range(start + 1, first) if i not in duplicates]
         segments.append(Segment(heading.level, heading.label, strip_decoration(paragraphs[start]),
-                                paragraphs[first:end], [strip_decoration(p) for p in paragraphs[start + 1:first]]))
+                                paragraphs[first:end], echoes))
     return segments
 
 
@@ -762,21 +783,29 @@ def expected_book_text(normalized: str) -> tuple[str, dict]:
     The only edits to the source are the documented ones: leading/trailing `# = - * ☆ ★ ※` (and the
     `、` of a `☆、` marker) on heading lines, and lines made of nothing but those characters. Every
     removal is verified to sit at the edge of its heading or to be a whole decoration line, and the
-    total is reconciled with the length of the source, so nothing else can disappear unnoticed.
+    total is reconciled with the length of the source, so nothing else can disappear unnoticed. The one
+    other removal is an echo line identical to its heading (`duplicate_echoes`), counted whole in
+    `duplicate_heading_chars_removed`, never in `removed_decoration_chars`.
     """
     paragraphs, headings, ornaments = read_structure(normalized)
     shown = apply_decoration(paragraphs, headings)
+    duplicates = duplicate_echoes(paragraphs, headings)
     removed = sum(len("".join(line.split())) for line in ornaments)
+    duplicate_chars = 0
     cleaned = 0
-    for original, text in zip(paragraphs, shown):
-        if original != text:
+    for index, (original, text) in enumerate(zip(paragraphs, shown)):
+        if index in duplicates:
+            duplicate_chars += len("".join(original.split()))
+            shown[index] = ""
+        elif original != text:
             removed += _edge_removal(original, text)
             cleaned += 1
     expected = "".join("".join(shown).split())
-    if len("".join(normalized.split())) != len(expected) + removed:
+    if len("".join(normalized.split())) != len(expected) + removed + duplicate_chars:
         raise NovelPreservationError("Decoration accounting does not add up to the source text")
     return expected, {"removed_decoration_chars": removed, "decoration_lines_dropped": len(ornaments),
-                      "headings_cleaned": cleaned}
+                      "headings_cleaned": cleaned, "duplicate_headings_dropped": len(duplicates),
+                      "duplicate_heading_chars_removed": duplicate_chars}
 
 
 def check_preservation(epub: bytes, normalized: str) -> dict:
@@ -937,7 +966,7 @@ def _convert_one(task: dict) -> dict:
             return {**prior, **result, "status": "skipped"}
         book = convert_bytes(data, source.stem)
         atomic_write(out_path, book.epub, overwrite=True)
-        result.update(book.info, status="converted", converter_version=CONVERTER_VERSION,
+        result.update(book.info, status="converted", converter_version=CONVERTER_VERSION, text_clean=TEXT_CLEAN_REVISION,
                       output_sha256=digest(book.epub), output_bytes=len(book.epub))
     except ReaderError as exc:
         result.update(status="failed", error=str(exc))
@@ -949,10 +978,11 @@ def _convert_one(task: dict) -> dict:
 
 
 def _manifest_entry(record: dict) -> dict:
-    keep = ("status", "output", "source_sha256", "source_bytes", "converter_version", "output_sha256", "output_bytes",
+    keep = ("status", "output", "source_sha256", "source_bytes", "converter_version", "text_clean", "output_sha256", "output_bytes",
             "title", "author", "encoding", "mode", "volumes", "chapters", "split_chapters", "front_matter", "files",
             "toc_entries", "max_file_bytes", "median_file_bytes", "removed_control_chars", "removed_decoration_chars",
-            "decoration_lines_dropped", "headings_cleaned", "warnings", "error")
+            "decoration_lines_dropped", "headings_cleaned", "duplicate_headings_dropped", "duplicate_heading_chars_removed",
+            "warnings", "error")
     return {key: record[key] for key in keep if key in record}
 
 
@@ -1049,6 +1079,8 @@ def convert_tree(src: Path, out: Path, *, force: bool = False, jobs: int = 1,
         "removed_decoration_chars": sum(r.get("removed_decoration_chars", 0) for r in ok),
         "decoration_lines_dropped": sum(r.get("decoration_lines_dropped", 0) for r in ok),
         "headings_cleaned": sum(r.get("headings_cleaned", 0) for r in ok),
+        "duplicate_headings_dropped": sum(r.get("duplicate_headings_dropped", 0) for r in ok),
+        "duplicate_heading_chars_removed": sum(r.get("duplicate_heading_chars_removed", 0) for r in ok),
         "xhtml_files": len(sizes),
         "xhtml_median_bytes": int(statistics.median(sizes)) if sizes else 0,
         "xhtml_max_bytes": max(sizes, default=0),

@@ -234,46 +234,68 @@ struct ReferenceLine {
   int indent = 0;
 };
 
+// The CJK paragraph style's display text of one complete physical line, written independently of the layout
+// code: BOM, zero-width space and word joiner vanish; a run of whitespace (plain space, controls, Unicode
+// spaces, NBSP, ideographic space) between two characters becomes one plain space, or the run's first NBSP or
+// ideographic space when it holds no plain whitespace; whitespace at either end vanishes.
+inline std::string cleanedReferenceLine(const std::string& line) {
+  std::string out;
+  std::string pending;  // the run seen since the last character, as it will be written
+  size_t at = 0;
+  while (at < line.size()) {
+    uint32_t cp = 0;
+    const size_t n = TxtLineBreak::decodeAt(line.data(), at, line.size(), cp);
+    const std::string bytes = line.substr(at, n);
+    at += n;
+    if (cp == 0xFEFF || cp == 0x200B || cp == 0x2060) continue;
+    const bool plain = cp == ' ' || (cp < 0x20 && cp != '\n') || cp == 0x7F || (cp >= 0x2000 && cp <= 0x200A) ||
+                       cp == 0x202F || cp == 0x205F;
+    if (plain) {
+      pending = " ";
+    } else if (cp == 0xA0 || cp == 0x3000) {
+      if (pending.empty()) pending = bytes;
+    } else {
+      if (!out.empty()) out += pending;
+      pending.clear();
+      out += bytes;
+    }
+  }
+  return out;
+}
+
 inline std::vector<ReferenceLine> referenceLines(const std::string& bytes, const Config& config) {
   const WidthOracle oracle(config.model);
-  const auto widthOf = [&](const size_t from, const size_t to) {
-    return oracle.width(bytes.substr(from, to - from).c_str());
-  };
-  const auto decode = [&](const size_t pos, const size_t end, uint32_t& cp) {
-    return TxtLineBreak::decodeAt(bytes.data(), pos, end, cp);
-  };
-  const auto clusterEnd = [&](size_t pos, const size_t end) {
-    uint32_t cp = 0;
-    pos += decode(pos, end, cp);
-    while (pos < end) {
-      const size_t n = decode(pos, end, cp);
-      if (!TxtLineBreak::isClusterExtender(cp)) break;
-      pos += n;
-    }
-    return pos;
-  };
 
   std::vector<ReferenceLine> out;
   size_t lineStart = 0;
   while (lineStart < bytes.size()) {
     const size_t newline = bytes.find('\n', lineStart);
     const size_t lineEnd = newline == std::string::npos ? bytes.size() : newline;
-    size_t end = lineEnd;
-    if (end > lineStart && bytes[end - 1] == '\r') end--;
-    size_t s = lineStart;
-    if (config.cjkParagraphs) {
-      while (s < end) {
-        uint32_t cp = 0;
-        const size_t n = decode(s, end, cp);
-        if (!TxtLineBreak::isParagraphIndentSpace(cp)) break;
-        s += n;
-      }
-    }
+    size_t rawEnd = lineEnd;
+    if (rawEnd > lineStart && bytes[rawEnd - 1] == '\r') rawEnd--;
+    std::string line = bytes.substr(lineStart, rawEnd - lineStart);
+    if (config.cjkParagraphs) line = cleanedReferenceLine(line);
+    const size_t end = line.size();
+    size_t s = 0;
     if (s == end) {
       if (!config.cjkParagraphs) out.push_back({});  // a blank line, which the CJK style drops
       lineStart = lineEnd + 1;
       continue;
     }
+    const auto widthOf = [&](const size_t from, const size_t to) { return oracle.width(line.substr(from, to - from).c_str()); };
+    const auto decode = [&](const size_t pos, const size_t limit, uint32_t& cp) {
+      return TxtLineBreak::decodeAt(line.data(), pos, limit, cp);
+    };
+    const auto clusterEnd = [&](size_t pos, const size_t limit) {
+      uint32_t cp = 0;
+      pos += decode(pos, limit, cp);
+      while (pos < limit) {
+        const size_t n = decode(pos, limit, cp);
+        if (!TxtLineBreak::isClusterExtender(cp)) break;
+        pos += n;
+      }
+      return pos;
+    };
 
     bool first = true;
     while (s < end) {
@@ -310,9 +332,16 @@ inline std::vector<ReferenceLine> referenceLines(const std::string& bytes, const
         }
         bestNext = best;
       }
-      out.push_back({bytes.substr(s, best - s), indent});
+      out.push_back({line.substr(s, best - s), indent});
       first = false;
       s = bestNext;
+      // A continued line of the CJK style never starts with whitespace.
+      while (config.cjkParagraphs && s < end) {
+        uint32_t cp = 0;
+        const size_t n = decode(s, end, cp);
+        if (cp != ' ' && cp != 0xA0 && cp != 0x3000) break;
+        s += n;
+      }
     }
     lineStart = lineEnd + 1;
   }
