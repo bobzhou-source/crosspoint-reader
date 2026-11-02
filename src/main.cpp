@@ -35,6 +35,7 @@
 #include "SdCardFontSystem.h"
 #include "activities/Activity.h"
 #include "activities/ActivityManager.h"
+#include "activities/settings/BenchmarkSettingsActivityNavRun.h"
 #include "activities/settings/SdFirmwareUpdateActivity.h"
 #include "components/UITheme.h"
 #include "fontIds.h"
@@ -474,6 +475,10 @@ void setup() {
 
   HalSystem::checkPanic();
 
+  // A navigation run that died (crash, power loss, sleep) left a backup of the owner's recents, positions and
+  // statistics; put it back before anything reads them.
+  nav_run::recover();
+
   APP_STATE.loadFromFile();
   const bool isSleepWake = wakeupReason == HalGPIO::WakeupReason::PowerButton;
   const bool isPersistedSleepWake = isSleepWake && !APP_STATE.showBootScreen;
@@ -639,7 +644,7 @@ void setup() {
     activityManager.requestUpdateAndWait();
     // Absorb any button held at this point into currentState as a non-edge:
     // two gpio.update() calls separated by > InputManager's 5ms debounce
-    // transition the held bit through lastDebounceTime into currentState
+    // transition the held bit through the debounce into currentState
     // without setting pressedEvents, so the first loop()'s own gpio.update()
     // sees state == currentState and emits nothing.
     gpio.update();
@@ -656,6 +661,7 @@ void loop() {
   static unsigned long lastMemPrint = 0;
 
   gpio.setSharedConfirmPowerShortPressEmitsPower(SETTINGS.shortPwrBtn == CrossPointSettings::SHORT_PWRBTN::SLEEP);
+  nav_run::tick();  // injects the next scripted press (if any) before this loop's input is sampled
   mappedInputManager.update();
 
   if (activityManager.requiresExclusiveStorageLoop()) {
@@ -678,6 +684,13 @@ void loop() {
       (gpio.wasAnyPressed() || gpio.wasAnyReleased() || gpio.wasTouchActivity())) {
     // Only reader activity flags: no key identities, coordinates, or text input.
     benchmark::point(benchmark::EventType::Input, gpio.wasAnyPressed(), gpio.wasAnyReleased(), gpio.wasTouchActivity());
+  }
+  if (benchmark::nav::runActive() && benchmark::enabled() &&
+      (gpio.wasAnyPressed() || gpio.wasAnyReleased() || gpio.wasTouchActivity())) {
+    // Navigation run only: marks each input edge and whether the run injected it. No key identity.
+    benchmark::record(benchmark::nav::encodeInput(gpio.wasAnyPressed(), gpio.wasAnyReleased(), gpio.wasTouchActivity(),
+                                                  gpio.lastEdgeInjected(), activityManager.currentActivityId(),
+                                                  benchmark::nowUs()));
   }
   if (benchmark::flushDue()) {
     RenderLock lock(RenderLock::Mode::Try);
@@ -897,8 +910,9 @@ void loop() {
   {
     RenderLock lock(RenderLock::Mode::Try);
     if (!lock.ownsLock()) {
-      // Let rendering advance without treating lock contention as idle.
-      delay(10);
+      // Let rendering advance without treating lock contention as idle; an
+      // input edge ends the wait early so input during a render is not delayed.
+      gpio.waitForInput(10);
       return;
     }
     skipLoopDelay = activityManager.skipLoopDelay();
@@ -923,8 +937,10 @@ void loop() {
         if (gpio.rawInputActive()) break;
       }
     } else {
-      // Short delay to prevent tight loop while still being responsive
-      delay(10);
+      // Short wait to prevent a tight loop; an input edge (or a raw change
+      // reaching the end of its debounce window) ends it early. With no input
+      // this wakes exactly as often as the former fixed delay(10).
+      gpio.waitForInput(10);
     }
   }
 }

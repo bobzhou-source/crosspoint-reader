@@ -184,9 +184,37 @@ TEST(BenchmarkWriter, RejectsEventTypesPastTheNameTable) {
   Writer writer;
   writer.begin(Sink::write, &sink);
   Event event;
-  event.type = static_cast<EventType>(static_cast<uint8_t>(EventType::ManualRefresh) + 1);
+  event.type = static_cast<EventType>(static_cast<uint8_t>(EventType::StatsFlush) + 1);
   EXPECT_EQ(writer.event(event), Writer::Result::Failed);
   EXPECT_TRUE(sink.output.empty());
+}
+
+TEST(BenchmarkWriter, SerializesStatsFlushWithEverySlot) {
+  Sink sink;
+  Writer writer;
+  writer.begin(Sink::write, &sink);
+  Event event = encodeStatsFlush(5000000, 5012000, StatsFlushReason::Periodic, StatsFlushResult::Saved, 14, 15, 180412,
+                                 412, true);
+  event.sequence = 9;
+  ASSERT_EQ(writer.event(event), Writer::Result::Written);
+  EXPECT_EQ(sink.output,
+            "{\"event\":\"stats_flush\",\"seq\":9,\"start_us\":5000000,\"end_us\":5012000,"
+            "\"duration_us\":12000,\"data\":[0,1,14,15,180412,412,1,0]}\n");
+}
+
+TEST(BenchmarkWriter, StatsFlushEncoderKeepsReasonResultAndNeverEndsBeforeItStarts) {
+  const Event clean = encodeStatsFlush(900, 400, StatsFlushReason::Exit, StatsFlushResult::Clean, 0, 0, 77, 0, false);
+  EXPECT_EQ(clean.type, EventType::StatsFlush);
+  EXPECT_EQ(clean.endUs, clean.startUs);
+  EXPECT_EQ(clean.data[0], 2u);
+  EXPECT_EQ(clean.data[1], 0u);
+  EXPECT_EQ(clean.data[6], 0u);
+  EXPECT_EQ(clean.data[7], 0u);
+  const Event failed = encodeStatsFlush(1, 2, StatsFlushReason::Suspend, StatsFlushResult::Failed, 3, 4, 5, 0, true);
+  EXPECT_EQ(failed.data[0], 1u);
+  EXPECT_EQ(failed.data[1], 2u);
+  EXPECT_EQ(failed.data[6], 1u);
+  EXPECT_EQ(static_cast<uint8_t>(StatsFlushReason::Explicit), 3);
 }
 
 TEST(BatterySampling, DueOnFirstSampleThenEveryFiveMinutesAwake) {

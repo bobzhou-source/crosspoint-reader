@@ -40,6 +40,10 @@ uint32_t reportedLost = 0;
 uint32_t bootWakeReason = 0;
 bool shutdownRegistered = false;
 char sessionPathStorage[80]{};
+// Navigation-run refresh evidence. Display calls are observed only while a probe is armed.
+portMUX_TYPE probeMux = portMUX_INITIALIZER_UNLOCKED;
+nav::RefreshProbe refreshProbe;
+std::atomic<bool> probeActive{false};
 uint32_t previousSettings[10]{};
 bool haveSettings = false;
 
@@ -376,7 +380,40 @@ void span(EventType type, uint64_t begun, uint32_t a, uint32_t b, uint32_t c) {
   event.data[1] = b;
   event.data[2] = c;
   record(event);
+  if (type == EventType::Display && probeActive.load(std::memory_order_relaxed)) {
+    taskENTER_CRITICAL(&probeMux);
+    refreshProbe.onDisplayCall(static_cast<uint8_t>(a), b, event.startUs, event.endUs);
+    taskEXIT_CRITICAL(&probeMux);
+  }
 }
+
+namespace nav {
+namespace {
+std::atomic<bool> runActiveFlag{false};
+std::atomic<bool> syncPermitFlag{false};
+}  // namespace
+
+void setRunActive(bool active) { runActiveFlag.store(active, std::memory_order_relaxed); }
+bool runActive() { return runActiveFlag.load(std::memory_order_relaxed); }
+void setSyncPermit(bool permitted) { syncPermitFlag.store(permitted, std::memory_order_relaxed); }
+bool syncPermit() { return syncPermitFlag.load(std::memory_order_relaxed); }
+
+void armProbe(uint64_t atUs) {
+  taskENTER_CRITICAL(&probeMux);
+  refreshProbe.arm(atUs);
+  taskEXIT_CRITICAL(&probeMux);
+  probeActive.store(true, std::memory_order_relaxed);
+}
+
+void disarmProbe() { probeActive.store(false, std::memory_order_relaxed); }
+
+RefreshSnapshot probeSnapshot() {
+  taskENTER_CRITICAL(&probeMux);
+  const RefreshSnapshot snapshot = refreshProbe.snapshot();
+  taskEXIT_CRITICAL(&probeMux);
+  return snapshot;
+}
+}  // namespace nav
 
 void intervalMs(EventType type, uint32_t startMs, uint32_t endMs, uint32_t code, uint32_t detail) {
   if (!enabled()) return;

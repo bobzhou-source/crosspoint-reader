@@ -214,6 +214,7 @@ void runWorker(void*) {
         snapshot.phase = result.phase;
         snapshot.active = false;
         ++snapshot.revision;
+        ++snapshot.finishedRuns;
       }
       if (!stop.load()) persistStatus();
       runLog = RunLog{};

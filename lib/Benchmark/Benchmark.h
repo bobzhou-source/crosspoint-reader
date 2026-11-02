@@ -1,6 +1,7 @@
 #pragma once
 
 #include "BenchmarkBuffer.h"
+#include "NavScript.h"
 
 namespace benchmark {
 
@@ -19,6 +20,22 @@ void point(EventType type, uint32_t a = 0, uint32_t b = 0, uint32_t c = 0, uint3
 void span(EventType type, uint64_t started, uint32_t a = 0, uint32_t b = 0, uint32_t c = 0);
 void intervalMs(EventType type, uint32_t startMs, uint32_t endMs, uint32_t code = 0, uint32_t detail = 0);
 void memory();
+
+namespace nav {
+// True while a navigation run owns the device (set by the run, read by ActivityManager and main). Atomic.
+void setRunActive(bool active);
+bool runActive();
+// While set, and only while the foreground activity is the Reader Sync screen, the Reader sync scheduler may launch
+// its worker although a run is active. Set by the run for one guarded `sync` step and cleared when that step ends.
+void setSyncPermit(bool permitted);
+bool syncPermit();
+// Arms the display-call probe at `atUs` (benchmark::nowUs() clock) and starts observing completed refreshes.
+// Only calls recorded while a session is active are seen. Safe from any task.
+void armProbe(uint64_t atUs);
+void disarmProbe();
+RefreshSnapshot probeSnapshot();
+}  // namespace nav
+
 // ReaderSettings slot 4 records AdaptiveRefreshPolicy::kVersion.
 void settings(uint32_t font, uint32_t pointSize, uint32_t spacing, uint32_t orientation, uint32_t antialias,
               uint32_t inverted, uint32_t margin, uint32_t sleepScreen, uint32_t sdFontId);

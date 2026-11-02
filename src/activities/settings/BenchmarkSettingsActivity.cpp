@@ -13,21 +13,42 @@
 #include "SdCardFontSystem.h"
 #include "activities/reader/ReaderActivity.h"
 #include "activities/util/BmpViewerActivity.h"
+#include "BenchmarkSettingsActivityNavRun.h"
 #include "components/UITheme.h"
 #include "network/ReaderSync.h"
 
 namespace fui = freeink::ui;
 namespace {
 constexpr uint8_t TARGETS[] = {10, 3, 5, 1};
-constexpr StrId LABELS[] = {StrId::STR_BENCHMARK_RUN, StrId::STR_BENCHMARK_RECORD,
-                          StrId::STR_BENCHMARK_STATUS, StrId::STR_BENCHMARK_RESULT,
-                          StrId::STR_BENCHMARK_COUNTS, StrId::STR_BENCHMARK_HELP};
+constexpr StrId LABELS[] = {StrId::STR_BENCHMARK_RUN,    StrId::STR_BENCHMARK_RECORD, StrId::STR_BENCHMARK_STATUS,
+                            StrId::STR_BENCHMARK_RESULT, StrId::STR_BENCHMARK_COUNTS, StrId::STR_BENCHMARK_HELP,
+                            StrId::STR_BENCHMARK_NAV_RUN};
 
-void captureEnvironment() {
-  benchmark::hardware();
-  benchmark::settings(SETTINGS.fontFamily, SETTINGS.fontPointSize, SETTINGS.lineSpacing, SETTINGS.orientation,
-                      SETTINGS.textAntiAliasing, SETTINGS.screenInverted, SETTINGS.screenMargin, SETTINGS.sleepScreen,
-                      benchmark::id(SETTINGS.sdFontFamilyName));
+StrId navOutcomeLabel(const nav_run::Status& status) {
+  using benchmark::nav::Outcome;
+  if (status.restoreFailed) return StrId::STR_BENCHMARK_NAV_RESTORE_FAILED;
+  switch (status.outcome) {
+    case Outcome::Complete: return status.summary.failed == 0 ? StrId::STR_BENCHMARK_COMPLETE : StrId::STR_BENCHMARK_NAV_DIVERGED;
+    case Outcome::Cancelled: return StrId::STR_BENCHMARK_CANCELLED;
+    case Outcome::Timeout: return StrId::STR_BENCHMARK_TIMEOUT;
+    case Outcome::Diverged: return StrId::STR_BENCHMARK_NAV_DIVERGED;
+    case Outcome::BadScript: return StrId::STR_BENCHMARK_NAV_BAD_SCRIPT;
+    case Outcome::Recorder: return StrId::STR_BENCHMARK_RECORDER_FAILED;
+    case Outcome::Unmappable: return StrId::STR_BENCHMARK_NAV_UNMAPPED;
+    case Outcome::Interrupted: return StrId::STR_BENCHMARK_NAV_INTERRUPTED;
+  }
+  return StrId::STR_BENCHMARK_RECORDER_FAILED;
+}
+
+StrId navStartLabel(const nav_run::StartResult result) {
+  switch (result) {
+    case nav_run::StartResult::ScriptTooLarge: return StrId::STR_BENCHMARK_NAV_TOO_LARGE;
+    case nav_run::StartResult::BadScript: return StrId::STR_BENCHMARK_NAV_BAD_SCRIPT;
+    case nav_run::StartResult::OutOfMemory: return StrId::STR_BENCHMARK_NAV_NO_MEMORY;
+    case nav_run::StartResult::BackupFailed: return StrId::STR_BENCHMARK_NAV_BACKUP_FAILED;
+    case nav_run::StartResult::RestorePending: return StrId::STR_BENCHMARK_NAV_RESTORE_PENDING;
+    default: return StrId::STR_BENCHMARK_RECORDER_FAILED;
+  }
 }
 
 StrId outcomeLabel(const BenchmarkOutcome outcome) {
@@ -89,6 +110,7 @@ void BenchmarkSettingsActivity::activateIndex(const int index) {
   if (running) return;
   if (index == 0) beginRun();
   else if (index == 1) toggleRecording();
+  else if (index == 6) beginNavRun();
   requestUpdate();
 }
 
@@ -107,13 +129,19 @@ void BenchmarkSettingsActivity::toggleRecording() {
       statusLabel = StrId::STR_BENCHMARK_RECORDER_FAILED;
       return;
     }
-    captureEnvironment();
+    nav_run::captureEnvironment();
     statusLabel = benchmark::enabled() ? StrId::STR_BENCHMARK_RECORDING : StrId::STR_BENCHMARK_RECORDER_FAILED;
   } else {
     const bool wasRecording = benchmark::enabled();
     const bool closed = wasRecording && benchmark::stop(benchmark::StopReason::User);
     statusLabel = wasRecording && !closed ? StrId::STR_BENCHMARK_RECORDER_FAILED : StrId::STR_BENCHMARK_STOPPED;
   }
+}
+
+void BenchmarkSettingsActivity::beginNavRun() {
+  const auto result = nav_run::start(renderer, mappedInput);
+  navStartFailed = result != nav_run::StartResult::Started && result != nav_run::StartResult::Busy;
+  navStartLabel_ = navStartLabel(result);
 }
 
 void BenchmarkSettingsActivity::beginRun() {
@@ -170,7 +198,7 @@ void BenchmarkSettingsActivity::beginRun() {
       return;
     }
     snprintf(resultPath, sizeof(resultPath), "%s", benchmark::sessionPath());
-    captureEnvironment();
+    nav_run::captureEnvironment();
     running = true;
     phase = 1;
     runStarted = millis();
@@ -232,11 +260,40 @@ void BenchmarkSettingsActivity::childFinished(const ActivityResult& result) {
   startPhase();
 }
 
+void BenchmarkSettingsActivity::buildNavRow() {
+  const auto& status = nav_run::status();
+  rows[6].value = "";
+  if (navStartFailed) {
+    rows[6].subtitle = I18N.get(navStartLabel_);
+    return;
+  }
+  if (status.running) {
+    rows[6].subtitle = tr(STR_BENCHMARK_RUNNING);
+    return;
+  }
+  if (!status.ran) {
+    rows[6].subtitle = nav_run::restorePending() ? tr(STR_BENCHMARK_NAV_RESTORE_PENDING) : tr(STR_BENCHMARK_NAV_HELP_DETAIL);
+    return;
+  }
+  // The status line never reads as success unless nothing failed; counts always show what was not applicable.
+  const auto& summary = status.summary;
+  char countsText[128];
+  snprintf(countsText, sizeof(countsText), tr(STR_BENCHMARK_NAV_COUNTS_FORMAT), static_cast<unsigned>(summary.steps),
+           static_cast<unsigned>(summary.ok), static_cast<unsigned>(summary.unverified),
+           static_cast<unsigned>(summary.noRefresh), static_cast<unsigned>(summary.skipped),
+           static_cast<unsigned>(summary.external), static_cast<unsigned>(summary.failed));
+  snprintf(navText, sizeof(navText), "%s. %s. %s%s%s", I18N.get(navOutcomeLabel(status)), countsText, status.path,
+           status.restoreRan && !status.restoreFailed ? ". " : "",
+           status.restoreRan && !status.restoreFailed ? tr(STR_BENCHMARK_NAV_RESTORED) : "");
+  rows[6].value = status.finalized ? tr(STR_BENCHMARK_SAVED) : tr(STR_BENCHMARK_PARTIAL);
+  rows[6].subtitle = navText;
+}
+
 void BenchmarkSettingsActivity::resumeNormalRecording() {
   if (!resumeNormal) return;
   resumeNormal = false;
   const bool started = benchmark::begin(benchmark::SessionMode::Normal);
-  if (started) captureEnvironment();
+  if (started) nav_run::captureEnvironment();
   resumeFailed = !started || !benchmark::enabled();
 }
 
@@ -278,6 +335,7 @@ void BenchmarkSettingsActivity::buildScreen(UiScreen& screen) {
   snprintf(counts, sizeof(counts), tr(STR_BENCHMARK_COUNTS_FORMAT), completed[0], completed[1], completed[2], completed[3]);
   rows[4].subtitle = counts;
   rows[5].subtitle = tr(STR_BENCHMARK_HELP_DETAIL);
+  buildNavRow();
   fui::ListProps props;
   props.items = rows;
   props.count = ITEM_COUNT;

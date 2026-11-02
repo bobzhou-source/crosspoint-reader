@@ -23,6 +23,7 @@ void RecentBooksStore::toJson(JsonDocument& doc) const {
 bool RecentBooksStore::fromJson(JsonVariantConst doc) {
   // Tolerate a missing/invalid 'books' key (treat as empty list); only a
   // JSON parse error is fatal. A null JsonArray iterates zero times.
+  ++revision;
   recentBooks.clear();
   JsonArrayConst arr = doc["books"].as<JsonArrayConst>();
   recentBooks.reserve(std::min(arr.size(), static_cast<size_t>(MAX_RECENT_BOOKS)));
@@ -59,6 +60,7 @@ void RecentBooksStore::addBook(const std::string& path, const std::string& title
   if (recentBooks.size() > MAX_RECENT_BOOKS) {
     recentBooks.resize(MAX_RECENT_BOOKS);
   }
+  ++revision;
 
   saveToFile();
 }
@@ -72,6 +74,7 @@ void RecentBooksStore::updateBook(const std::string& path, const std::string& ti
     book.title = title;
     book.author = author;
     book.coverBmpPath = coverBmpPath;
+    ++revision;
     saveToFile();
   }
 }
@@ -83,6 +86,7 @@ bool RecentBooksStore::removeByPath(const std::string& path) {
     return false;
   }
   recentBooks.erase(it);
+  ++revision;
   if (!saveToFile()) {
     LOG_ERR("RBS", "Failed to persist removal of recent book: %s", path.c_str());
   }
@@ -100,16 +104,36 @@ void RecentBooksStore::updatePath(const std::string& oldPath, const std::string&
   if (!oldCachePath.empty() && !it->coverBmpPath.empty() && it->coverBmpPath.rfind(oldCachePath, 0) == 0) {
     it->coverBmpPath = newCachePath + it->coverBmpPath.substr(oldCachePath.size());
   }
+  ++revision;
   saveToFile();
 }
 
 bool RecentBooksStore::isMissing(const RecentBook& book) { return !Storage.exists(book.path.c_str()); }
 
-bool RecentBooksStore::pruneMissing() {
-  const size_t before = recentBooks.size();
-  recentBooks.erase(std::remove_if(recentBooks.begin(), recentBooks.end(), &isMissing), recentBooks.end());
-  return recentBooks.size() != before;
+uint16_t RecentBooksStore::missingMask() const {
+  static_assert(MAX_RECENT_BOOKS <= 16, "Missing-book mask must cover every recent entry");
+  uint16_t mask = 0;
+  for (size_t i = 0; i < recentBooks.size(); ++i) {
+    if (isMissing(recentBooks[i])) mask |= static_cast<uint16_t>(1u << i);
+  }
+  return mask;
 }
+
+bool RecentBooksStore::pruneMissing(uint16_t mask) {
+  if (mask == 0) return false;
+  size_t kept = 0;
+  for (size_t i = 0; i < recentBooks.size(); ++i) {
+    if ((mask & (1u << i)) != 0) continue;
+    if (kept != i) recentBooks[kept] = std::move(recentBooks[i]);
+    ++kept;
+  }
+  if (kept == recentBooks.size()) return false;
+  recentBooks.resize(kept);
+  ++revision;
+  return true;
+}
+
+bool RecentBooksStore::pruneMissing() { return pruneMissing(missingMask()); }
 
 RecentBook RecentBooksStore::getDataFromBook(std::string path) const {
   std::string lastBookFileName = "";

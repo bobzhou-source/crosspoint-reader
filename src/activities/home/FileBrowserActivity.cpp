@@ -232,7 +232,9 @@ void FileBrowserActivity::onExit() {
 }
 
 // To avoid traversing directories twice (once for cache clearing, once for deletion),
-// we do both in one pass here, instead of using Storage.removeDir
+// we do both in one pass here, instead of using Storage.removeDir. Each removed
+// book also leaves the recents list (persisted only when it was listed), so Home
+// and the Library never show an entry whose file is gone.
 bool FileBrowserActivity::removeDirFile(const std::string& fullPath) {
   auto file = Storage.open(fullPath.c_str());
   if (!file) {
@@ -243,7 +245,9 @@ bool FileBrowserActivity::removeDirFile(const std::string& fullPath) {
   if (!file.isDirectory()) {
     file.close();
     clearBookCache(fullPath);
-    return Storage.remove(fullPath.c_str());
+    if (!Storage.remove(fullPath.c_str())) return false;
+    RECENT_BOOKS.removeByPath(fullPath);
+    return true;
   }
   file.close();
 
@@ -305,6 +309,7 @@ bool FileBrowserActivity::removeDirFile(const std::string& fullPath) {
           LOG_ERR("FileBrowser", "Failed to remove file: %s", entryPath.c_str());
           return false;
         }
+        RECENT_BOOKS.removeByPath(entryPath);
       }
     }
   }

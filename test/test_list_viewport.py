@@ -8,13 +8,14 @@ ROOT = Path(__file__).resolve().parents[1]
 # Compile the production method without the activity's hardware dependencies.
 source = (ROOT / "src/activities/UiListActivity.cpp").read_text()
 method = source.split("void UiListActivity::syncListViewport(", 1)[1]
-method = "void UiListActivity::syncListViewport(" + method.split(
-    "\nvoid UiListActivity::drawChrome", 1
-)[0]
+method = "void UiListActivity::syncListViewport(" + method.split("\n}", 1)[0] + "\n}"
 harness = r"""
 #include <components/lists/list.h>
 #include <cassert>
 namespace fui = freeink::ui;
+struct UITheme {
+  static bool isRtl() { return false; }
+};
 struct UiScreen {
   int16_t height = 80;
   void syncListViewport(fui::ListNav& nav, fui::ListProps& props, int count, int offset) {

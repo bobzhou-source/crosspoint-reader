@@ -50,7 +50,9 @@ Writer::Result Writer::event(const Event& event, bool terminal) {
   static constexpr const char* NAMES[] = {"activity", "render", "display_call", "busy_wait", "memory", "index",
                                           "epub_phase", "reader_input", "sleep_request", "loss", "flush", "end",
                                           "reader_settings", "display_settings", "run_step", "run_result",
-                                          "sync_run", "battery_sample", "refresh_clear", "manual_refresh"};
+                                          "sync_run", "battery_sample", "refresh_clear", "manual_refresh",
+                                          "nav_step", "nav_result", "nav_input", "nav_rows", "nav_restore",
+                                          "reserved_25", "stats_flush"};
   const auto type = static_cast<size_t>(event.type);
   if (type >= sizeof(NAMES) / sizeof(NAMES[0]) || event.endUs < event.startUs) {
     live = false;
@@ -81,6 +83,23 @@ Writer::Result Writer::event(const Event& event, bool terminal) {
     return Result::Failed;
   }
   return line(encoded, static_cast<size_t>(length), terminal);
+}
+
+Event encodeStatsFlush(const uint64_t startUs, const uint64_t endUs, const StatsFlushReason reason,
+                       const StatsFlushResult result, const uint32_t bookGeneration, const uint32_t summaryGeneration,
+                       const uint32_t sincePreviousMs, const uint32_t lateMs, const bool dirty) {
+  Event event;
+  event.type = EventType::StatsFlush;
+  event.startUs = startUs;
+  event.endUs = endUs < startUs ? startUs : endUs;
+  event.data[0] = static_cast<uint32_t>(reason);
+  event.data[1] = static_cast<uint32_t>(result);
+  event.data[2] = bookGeneration;
+  event.data[3] = summaryGeneration;
+  event.data[4] = sincePreviousMs;
+  event.data[5] = lateMs;
+  event.data[6] = dirty ? 1u : 0u;
+  return event;
 }
 
 uint32_t id(const char* text) {

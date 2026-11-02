@@ -1,4 +1,5 @@
 #pragma once
+#include <atomic>
 #include <functional>
 #include <vector>
 
@@ -35,6 +36,12 @@ class HomeActivity final : public Activity {
   std::vector<RecentBook> recentBooks;
   const HomeMenuItem initialMenuItem;
   const bool cleanInitialRefresh;
+  // A Library transition may prepare private data during the blocking waveform,
+  // but never while Home draws/updates recents or performs post-frame cover I/O.
+  enum class NavigationFramePhase : uint8_t { Idle, Drawing, Waveform, Frozen };
+  std::atomic<NavigationFramePhase> navigationFramePhase{NavigationFramePhase::Idle};
+  std::atomic<uint32_t> feedbackRequested{0};
+  std::atomic<uint32_t> feedbackPrepared{0};
 
   // Convert HomeMenuItem to menu index (used in onEnter)
   int menuItemToIndex(HomeMenuItem item, bool hasOpdsUrl) const {
@@ -102,5 +109,8 @@ class HomeActivity final : public Activity {
   void onExit() override;
   void loop() override;
   void render(RenderLock&&) override;
+  // Called only for a committed Home→Library replace, before RenderLock.
+  // False means no classic touch feedback was queued; never waits in that case.
+  bool prepareLibraryTransition();
   bool isHomeActivity() const override { return true; }
 };
