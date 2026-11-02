@@ -131,7 +131,9 @@ struct SessionInfo {
 };
 
 // One JSON object per line, newline-terminated. Return the line length, or 0
-// when it does not fit (the caller must not write a truncated row).
+// when it does not fit (the caller must not write a truncated row). Every row
+// fits in kMaxRowBytes; the complete row (10 series) is the longest.
+static constexpr size_t kMaxRowBytes = 1024;
 size_t formatSessionRow(char* out, size_t capacity, const SessionInfo& info);
 size_t formatRungRow(char* out, size_t capacity, const Rung& rung, const RungMeasurement& m, uint8_t rating,
                      uint32_t elapsedMs);

@@ -2,14 +2,15 @@
 
 #include <CrossPointSettings.h>
 #include <EpdFontFamily.h>
+#include <FontCacheManager.h>
 #include <FsHelpers.h>
 #include <HalDisplay.h>
 #include <HalStorage.h>
 #include <I18n.h>
 #include <Logging.h>
+#include <RefreshCalibrationText.h>
 #include <RefreshPolicyConfig.h>
 #include <SdCardFontSystem.h>
-#include <Utf8.h>
 #include <esp_random.h>
 
 #include <algorithm>
@@ -347,6 +348,12 @@ void RefreshCalibrationActivity::renderMenu() {
 void RefreshCalibrationActivity::renderFrame() {
   layoutRecorded = false;
   renderer.clearScreen();
+  // Same two passes as the readers: the scan pass records the page's codepoints so an SD-card
+  // font loads them in one batch instead of glyph by glyph, and the scope resets the per-page
+  // glyph caches afterwards.
+  auto scope = renderer.getFontCacheManager()->createPrewarmScope();
+  drawContent(-1);
+  scope.endScanAndPrewarm();
   drawContent(-1);
   displayContentFrame(frame == 0);
   commitPageAdvance();
@@ -450,7 +457,7 @@ void RefreshCalibrationActivity::drawContent(const int plane) {
     }
     const bool gray = renderer.grayscaleCapabilities().supported();
     const uint8_t pass = !gray ? 3 : plane < 0 ? 0 : plane == 0 ? 1 : 2;
-    drawImage(kBodyTop, imageBottom, pass);
+    if (!renderer.isFontCacheScanning()) drawImage(kBodyTop, imageBottom, pass);
     if (plane < 0) drawTextPage(TextKind::Latin, pageOffset, imageBottom + 8, kBodyBottom, width, 6, true);
     return;
   }
@@ -465,41 +472,17 @@ void RefreshCalibrationActivity::drawContent(const int plane) {
 
 void RefreshCalibrationActivity::drawTextPage(const TextKind kind, uint32_t offset, const int top, const int bottom,
                                              const int maxWidth, const int maxLines, const bool record) {
-  const char* corpus = kind == TextKind::Latin ? kLatin : kCjk;
-  const size_t corpusLength = strlen(corpus);
-  if (offset >= corpusLength) offset = 0;
-  int y = top;
+  const bool cjk = kind == TextKind::Cjk;
+  const char* corpus = cjk ? kCjk : kLatin;
+  const size_t corpusLength = cjk ? sizeof(kCjk) - 1 : sizeof(kLatin) - 1;
+  const auto width = [](const void* context, const char* text) {
+    const auto* self = static_cast<const RefreshCalibrationActivity*>(context);
+    return self->renderer.getTextWidth(self->fontId, text);
+  };
   const int lineHeight = renderer.getLineHeight(fontId);
-  int lines = 0;
-  while (y + lineHeight <= bottom && lines < maxLines) {
-    size_t length = 0;
-    while (offset + length < corpusLength && corpus[offset + length] == ' ') ++length;
-    size_t lastBreak = 0;
-    while (offset + length < corpusLength) {
-      size_t step = 1;
-      if (kind == TextKind::Cjk) {
-        const unsigned char* cursor = reinterpret_cast<const unsigned char*>(corpus + offset + length);
-        utf8NextCodepoint(&cursor);
-        step = static_cast<size_t>(cursor - reinterpret_cast<const unsigned char*>(corpus + offset + length));
-      } else {
-        while (offset + length + step < corpusLength && corpus[offset + length + step] != ' ') ++step;
-      }
-      if (step == 0) break;
-      line[length + step] = '\0';
-      memcpy(line, corpus + offset, length + step);
-      if (renderer.getTextWidth(fontId, line) > maxWidth) break;
-      length += step;
-      lastBreak = length;
-      if (kind == TextKind::Latin && corpus[offset + length] == ' ') break;
-    }
-    if (lastBreak == 0) break;
-    line[lastBreak] = '\0';
-    memcpy(line, corpus + offset, lastBreak);
+  for (int y = top, lines = 0; y + lineHeight <= bottom && lines < maxLines; y += lineHeight, ++lines) {
+    offset = rc::nextFixtureLine(corpus, corpusLength, offset, cjk, maxWidth, width, this, line, sizeof(line));
     renderer.drawText(fontId, kMargin, y, line);
-    offset += lastBreak;
-    if (offset >= corpusLength) offset = 0;
-    y += lineHeight;
-    ++lines;
   }
   if (record) pageEnd = offset;
 }

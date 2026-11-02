@@ -74,5 +74,5 @@ class RefreshCalibrationActivity final : public Activity {
   char sessionId[16] = {};
   char logPath[80] = {};
   char line[192] = {};
-  char row[720] = {};
+  char row[refresh_calibration::kMaxRowBytes] = {};
 };

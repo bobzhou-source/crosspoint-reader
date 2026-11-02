@@ -1,6 +1,8 @@
 add_executable(RefreshCalibrationLadderTest
   RefreshCalibrationLadderTest.cpp
+  RefreshCalibrationTextTest.cpp
   ${REPO_ROOT}/lib/RefreshCalibration/RefreshCalibrationLadder.cpp
+  ${REPO_ROOT}/lib/RefreshCalibration/RefreshCalibrationText.cpp
   ${REPO_ROOT}/lib/AdaptiveRefresh/AdaptiveRefreshPolicy.cpp
 )
 

@@ -256,7 +256,7 @@ TEST(RefreshCalibrationLog, SessionRowEscapesUntrustedNamesAndListsSkips) {
   info.pixelCount = 384000;
   info.policySource = "file";
   info.config.clearThresholdPermille = 2400;
-  char line[1024];
+  char line[rc::kMaxRowBytes];
   const size_t n = rc::formatSessionRow(line, sizeof(line), info);
   ASSERT_GT(n, 0u);
   const auto doc = parseLine(line, n);
@@ -278,7 +278,7 @@ TEST(RefreshCalibrationResume, ReplayingTheLogRestoresTheExactNextRung) {
   info.session = "rc-1";
   info.skipMask = rc::classBit(ContentClass::DenseCjk);
   std::vector<std::string> log;
-  char line[1024];
+  char line[rc::kMaxRowBytes];
   log.emplace_back(line, rc::formatSessionRow(line, sizeof(line), info));
   Ladder live(info.skipMask);
   const Viewer viewer = uniformViewer(2);
@@ -309,6 +309,21 @@ TEST(RefreshCalibrationResume, ReplayingTheLogRestoresTheExactNextRung) {
   const size_t n = rc::formatCompleteRow(line, sizeof(line), live);
   ASSERT_GT(n, 0u);
   EXPECT_EQ(parseLine(line, n)["series"].size(), 10u);
+}
+
+TEST(RefreshCalibrationLog, TheCompleteRowFitsTheActivityBuffer) {
+  // Too small a buffer once dropped the complete row silently; every outcome must fit.
+  for (const int8_t tolerated : {-1, 0, 3, 7}) {
+    Ladder ladder;
+    run(ladder, uniformViewer(tolerated));
+    ASSERT_TRUE(ladder.done());
+    char line[rc::kMaxRowBytes];
+    const size_t n = rc::formatCompleteRow(line, sizeof(line), ladder);
+    ASSERT_GT(n, 0u) << "tolerated " << static_cast<int>(tolerated);
+    const auto doc = parseLine(line, n);
+    EXPECT_STREQ(doc["event"].as<const char*>(), "complete");
+    EXPECT_EQ(doc["series"].size(), 10u);
+  }
 }
 
 TEST(RefreshCalibrationResume, DamagedOrForeignLogsAreRejected) {
