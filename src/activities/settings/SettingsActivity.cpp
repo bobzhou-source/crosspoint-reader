@@ -14,6 +14,7 @@
 
 #include "AboutActivity.h"
 #include "BenchmarkSettingsActivity.h"
+#include "RefreshCalibrationActivity.h"
 #include "ButtonRemapActivity.h"
 #include "ClearCacheActivity.h"
 #include "ClockSettingsActivity.h"
@@ -107,6 +108,7 @@ void SettingsActivity::rebuildSettingsLists() {
   systemSettings.push_back(SettingInfo::Action(StrId::STR_KOREADER_SYNC, SettingAction::KOReaderSync));
   systemSettings.push_back(SettingInfo::Action(StrId::STR_READER_SYNC, SettingAction::ReaderSync));
   systemSettings.push_back(SettingInfo::Action(StrId::STR_BENCHMARK, SettingAction::Benchmark));
+  systemSettings.push_back(SettingInfo::Action(StrId::STR_REFRESH_CALIBRATION, SettingAction::RefreshCalibration));
   systemSettings.push_back(SettingInfo::Action(StrId::STR_READING_STATS, SettingAction::ReadingStats));
   systemSettings.push_back(SettingInfo::Action(StrId::STR_OPDS_SERVERS, SettingAction::OPDSBrowser));
   systemSettings.push_back(SettingInfo::Action(StrId::STR_CLEAR_READING_CACHE, SettingAction::ClearCache));
@@ -403,6 +405,13 @@ void SettingsActivity::toggleCurrentSetting() {
           startActivityForResult(std::move(activity), nullptr);
         } else {
           LOG_ERR("SETTINGS", "OOM: Benchmark settings");
+        }
+        break;
+      case SettingAction::RefreshCalibration:
+        if (auto activity = makeUniqueNoThrow<RefreshCalibrationActivity>(renderer, mappedInput)) {
+          startActivityForResult(std::move(activity), nullptr);
+        } else {
+          LOG_ERR("SETTINGS", "OOM: refresh calibration");
         }
         break;
       case SettingAction::KOReaderSync:

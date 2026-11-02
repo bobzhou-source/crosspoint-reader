@@ -76,9 +76,10 @@ void ActivityManager::renderTaskLoop() {
     RenderLock lock;
     if (currentActivity) {
       HalPowerManager::Lock powerLock;  // Ensure we don't go into low-power mode while rendering
-      display.setInverted(night_mode::invertActivity(SETTINGS.screenInverted != 0,
-                                                   SETTINGS.darkMenusWithNightMode != 0,
-                                                   currentActivity->isReaderActivity()));
+      bool inverted = night_mode::invertActivity(SETTINGS.screenInverted != 0, SETTINGS.darkMenusWithNightMode != 0,
+                                                 currentActivity->isReaderActivity());
+      currentActivity->forcedInversion(inverted);
+      display.setInverted(inverted);
       if (benchmark::enabled()) {
         benchmark::settings(SETTINGS.fontFamily, SETTINGS.fontPointSize, SETTINGS.lineSpacing, SETTINGS.orientation,
                             SETTINGS.textAntiAliasing, SETTINGS.screenInverted, SETTINGS.screenMargin,

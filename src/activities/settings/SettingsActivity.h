@@ -19,6 +19,7 @@ enum class SettingAction {
   ClockSettings,
   ReaderSync,
   Benchmark,
+  RefreshCalibration,
   ReadingStats,
   KOReaderSync,
   OPDSBrowser,

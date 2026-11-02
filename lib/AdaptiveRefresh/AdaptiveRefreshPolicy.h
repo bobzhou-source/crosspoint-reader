@@ -105,8 +105,8 @@ class AdaptiveRefreshPolicy {
 
   // initialClearRequired=false is the quick-resume case where the panel is
   // already known to show the restored page (allowFastInitialRefresh).
-  explicit AdaptiveRefreshPolicy(bool initialClearRequired = true, const Config& config = Config{})
-      : config_(config) {
+  explicit AdaptiveRefreshPolicy(bool initialClearRequired = true) : AdaptiveRefreshPolicy(initialClearRequired, Config{}) {}
+  explicit AdaptiveRefreshPolicy(bool initialClearRequired, const Config& config) : config_(config) {
     reset(initialClearRequired);
   }
 

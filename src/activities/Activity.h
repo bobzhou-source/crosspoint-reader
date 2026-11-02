@@ -49,6 +49,12 @@ class Activity {
   // transitions so no filesystem code races a raw SD-card owner.
   virtual bool requiresExclusiveStorageLoop() const { return false; }
   virtual bool isReaderActivity() const { return false; }
+  // Overrides the night-mode output polarity for this activity's renders.
+  // Return true and set `inverted` to force it (refresh calibration).
+  virtual bool forcedInversion(bool& inverted) const {
+    (void)inverted;
+    return false;
+  }
   // Private automated workloads must not enable background sync or user controls.
   virtual bool isBenchmarkActivity() const { return false; }
   // Returns true when the activity schedules its own forced refresh.
