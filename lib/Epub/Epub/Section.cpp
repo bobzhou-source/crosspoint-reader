@@ -57,7 +57,8 @@ namespace {
 //      Justification no longer stretches between syllables.
 // v49: Book-style paragraphs without an explicit alignment fall back to left, not justification.
 // v50: Bound justification gaps and preserve paragraph spacing/style across explicit line breaks.
-constexpr uint8_t SECTION_FILE_VERSION = 50;
+// v51: Orphan/widow control (2/2), headings kept with the next paragraph, float drop caps join their word.
+constexpr uint8_t SECTION_FILE_VERSION = 51;
 // Written into the version field while a build is in progress; patched to
 // SECTION_FILE_VERSION only when the build is finalized. An abandoned /
 // crash-interrupted .bin therefore carries version 0, which loadSectionFile rejects

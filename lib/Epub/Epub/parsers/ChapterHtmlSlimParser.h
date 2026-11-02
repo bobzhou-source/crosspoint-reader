@@ -39,6 +39,12 @@ class ChapterHtmlSlimParser {
   char partWordBuffer[MAX_WORD_SIZE + 1] = {};
   int partWordBufferIndex = 0;
   bool nextWordContinues = false;  // true when next flushed word attaches to previous (inline element boundary)
+  // Depth of an out-of-flow (CSS float) inline element that opened as the first content of its
+  // block, e.g. a KFX drop cap <span class="dropcap">M</span>. INT_MAX when none is open.
+  int leadingFloatDepth = INT_MAX;
+  // Set when that float closes: CSS removes whitespace at the start of the line box beside a
+  // float, so the formatting newline in "<span>M</span>\nost" must not become a word space.
+  bool joinAfterLeadingFloat = false;
   std::unique_ptr<ParsedText> currentTextBlock = nullptr;
   // Ruby text state
   bool inRuby = false;
@@ -151,6 +157,41 @@ class ChapterHtmlSlimParser {
   // so the section build fails readably instead of emitting pages with holes.
   bool layoutOom = false;
 
+  // Orphan/widow control (EPUB pagination). Lines of the text block being paginated wait here
+  // until enough of the paragraph is known to choose a break that leaves at least ORPHAN_LINES
+  // at a page bottom and WIDOW_LINES at the next page top. Never holds more than
+  // PAGINATION_LOOKAHEAD_LINES + 1 lines, so memory stays bounded for huge paragraphs.
+  static constexpr size_t ORPHAN_LINES = 2;
+  static constexpr size_t WIDOW_LINES = 2;
+  static constexpr size_t PAGINATION_LOOKAHEAD_LINES =
+      ORPHAN_LINES > 2 * WIDOW_LINES ? ORPHAN_LINES : 2 * WIDOW_LINES;
+  struct PendingLine {
+    std::unique_ptr<TextBlock> line;
+    uint32_t visibleOffset = 0;
+  };
+  std::vector<PendingLine> pendingLines;
+  int wordsPendingInBlock = 0;  // words extracted into pendingLines, not yet on a page
+  size_t blockLinesPlaced = 0;  // lines of the text block being paginated already on pages
+  size_t blockLinesOnPage = 0;  // ...of which on currentPage
+  bool blockTopSpacingApplied = false;
+  bool currentBlockIsHeading = false;
+  size_t blockAnchorStart = 0;  // anchorData index where the current text block's anchors begin
+  // Where the current block's first line landed (valid once blockLinesPlaced > 0).
+  struct PlacedRun {
+    int page = -1;
+    size_t firstElement = 0;
+    int16_t startY = 0;
+    uint32_t visibleOffset = 0;
+    size_t linkCount = 0;
+    size_t footnoteCount = 0;
+    size_t anchorStart = 0;
+  };
+  PlacedRun blockRun;
+  // Heading run kept with the following paragraph while it is the last content on its page.
+  PlacedRun keepRun;
+  size_t keepRunEnd = 0;
+  bool keepRunValid = false;
+
   // Resumable parse state. The one-shot parseAndBuildPages() drives these
   // internally; the incremental section builder drives them across render ticks
   // so a large single chapter can yield between pages instead of blocking the UI
@@ -171,6 +212,14 @@ class ChapterHtmlSlimParser {
   void addTableRowSeparator();
   void setCurrentPageVisibleOffset(uint32_t offset);
   void makePages(bool paragraphEnd = true);
+  void applyBlockTopSpacing();
+  void queueBlockLine(std::unique_ptr<TextBlock> line, uint32_t visibleOffset);
+  void placePendingLines(bool blockComplete);
+  void placeBlockLine(PendingLine& pending);
+  size_t pendingLinesThatFit(size_t first, size_t count) const;
+  int lineAdvance(const TextBlock& line) const;
+  void breakPageForKeep(uint32_t nextVisibleOffset);
+  void finishBlockPagination();
   static EpdFontFamily::Style fontStyleForTextDecoration(CssTextDecoration decoration);
   static void applyDirectionToEntry(StyleStackEntry& entry, const CssStyle& css);
   static void applyTextDecorationToEntry(StyleStackEntry& entry, const CssStyle& css);

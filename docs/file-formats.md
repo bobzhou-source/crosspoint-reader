@@ -102,6 +102,17 @@ if (parsedSize != fileSize) {
 
 ## `section.bin`
 
+### Version 51
+
+The serialized layout is unchanged. Cached pages are rebuilt because EPUB
+pagination now keeps at least two lines of a paragraph at the bottom of a page and
+at least two at the top of the next (orphan/widow control; short paragraphs move
+whole), a heading moves to the next page with the paragraph it introduces, and a
+floated inline element that opens a block (a drop cap such as
+`<span style="float:left">M</span>\nost`) joins the following word instead of
+being separated by the source newline. The CSS rule cache (version 13) now records
+`float`.
+
 ### Version 50
 
 The serialized layout is unchanged. Cached pages are rebuilt because justification
