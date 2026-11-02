@@ -209,7 +209,7 @@ reader-send card autosync --no-notify --batch 8 --passes 1
 4. acknowledges, one request each, **only the items whose card copy matched**, until the pass's request budget is spent; an item that failed verification stays `ready` on the server and is reported as held back, and items beyond the budget are acknowledged on the next pass or mount;
 5. if more ready items remain it waits 60 seconds and repeats, up to `--passes` (1–10, default 3), which keeps every minute under the server's 60-request budget.
 
-HTTP 429 stops the run immediately with no retry: acknowledgements already made stand, everything else is retried by the next mount (a card copy that is already verified is acknowledged without downloading again, ahead of any new download). Annotations are imported even when the cloud step fails or the key is missing. The run never ejects, never stages firmware, never writes `/books/Novels` or `/books/Books`, and deletes no book. It appends a few lines per run to `~/Library/Logs/reader-card-autosync.log` (rotated at 512 KiB; never contains the key) and posts one macOS notification with the number of books delivered. Exit status is 0 for success, skipped or busy, and 2 for an error or rate limit.
+HTTP 429 stops the run immediately with no retry: acknowledgements already made stand, everything else is retried by the next mount (a card copy that is already verified is acknowledged without downloading again, ahead of any new download). Annotations are imported even when the cloud step fails or the key is missing. The run never ejects, never stages firmware, and never writes `/books/Novels` or `/books/Books`. It deletes no book: the Inbox cleanup step below only *plans* moves into `/books/Inbox/.trash/` unless `"inbox_cleanup": true` is set in `card.json`. It appends a few lines per run to `~/Library/Logs/reader-card-autosync.log` (rotated at 512 KiB; never contains the key) and posts one macOS notification with the number of books delivered. Exit status is 0 for success, skipped or busy, and 2 for an error or rate limit.
 
 The management key is **not** stored in a plist, script or log. `READER_SYNC_KEY` is used when it is in the environment; otherwise the run reads the dedicated Keychain item `reader-workbench:sync-key`, account `b` (the same item `collect` uses) at run time and holds the value only in the process, restoring the environment afterwards. To (re)store it, paste the 64-hex key at the prompt (no key on the command line):
 
@@ -218,6 +218,55 @@ security add-generic-password -U -a b -s reader-workbench:sync-key -w
 ```
 
 The LaunchAgent is `~/Library/LaunchAgents/dev.reader-workbench.card-autosync.plist` (label `dev.reader-workbench.card-autosync`). It has `StartOnMount` and `RunAtLoad` and runs `<repo>/companion/.venv/bin/python -m reader_send --cache-dir ~/.cache/reader-send card autosync`, with no secrets and no schedule: launchd starts it on every volume mount and the UUID check makes every other volume a no-op. Load it with `launchctl bootstrap gui/$(id -u) <plist>`; `launchctl bootout gui/$(id -u)/dev.reader-workbench.card-autosync` removes it. It is independent of the (disabled) `reader-send-subscriptions` agent. macOS may ask once to allow Python to access removable volumes; allow it.
+
+### X daily digests, Inbox repack and Inbox cleanup
+
+X posts reach the reader as **one EPUB per local day** instead of one book per post. The server (`robertzhou.dev`, `server/digest.js`) builds them, so Wi-Fi direct sync and card autosync both receive the same files and the firmware needs no change:
+
+- A post whose `original_url` is an X status URL is held back from the `ready`/`active` listings until its digest exists. An X post shared explicitly through `/reader/links` is still delivered on its own.
+- Management listings (the collector every 15 minutes, card autosync) build at most one digest volume per request. A day (America/New_York, server env `READER_DIGEST_TZ`) is published once it has ended and the local clock has passed 05:00 (`READER_DIGEST_HOUR`). The device's own listing never builds, so it stays within the 4-second timeout.
+- Each volume holds at most 100 posts or 6 MiB of post EPUBs, and the result stays under 8 MiB. Titles: `X — Sun 2 Nov 2026`, then `X — 2 Nov (2)`, `(3)` …. Posts that arrive after a day's volume was delivered go into the next volume number; a built volume is never rewritten.
+- A re-uploaded copy of a post already in a volume joins that volume rather than being delivered twice.
+- Acknowledging a digest consumes every member post in the same transaction, once; a repeated acknowledgement is a no-op. Deleting an undelivered digest returns its posts to the queue.
+- Articles that have an author (Substack, RSS) stay one EPUB each but are listed under the card name `Author — Title (2 Nov 2026).epub`. The stored `source_path` is unchanged, so the collector's metadata comparison still holds.
+
+**Feed manifest (`reader-feed-v1`).** Every digest contains `META-INF/feed.json`, referenced from the OPF by `<meta name="reader-feed" content="META-INF/feed.json"/>`. A future on-device feed screen can read it instead of parsing HTML:
+
+```json
+{"format": "reader-feed-v1", "kind": "digest", "id": "<digest item id or null>", "source": "x",
+ "day": "2026-11-02", "volume": 1, "timezone": "America/New_York", "title": "X — Mon 2 Nov 2026",
+ "generator": "server",
+ "items": [{"id": "<cloud item id or null>", "key": "x:<status id>", "source": "x", "author": "Ann A",
+            "handle": "ann", "published": "2026-11-02T14:05:00Z", "url": "https://x.com/ann/status/…",
+            "href": "posts/0001.xhtml", "title": "first 140 characters"}]}
+```
+
+- `href` is relative to `OEBPS/`. Each post is its own spine document `OEBPS/posts/NNNN.xhtml` (`<section id="post">`), in contents order: grouped by author, then by time.
+- `OEBPS/contents.xhtml` is the first spine item. `key` is stable across re-uploads and repacks; `id` is null only for digests repacked from card files with no cloud id.
+- `generator` is `"server"` or `"companion"`; both write the same fields.
+
+**Annotations in digests.** The firmware still uploads `item_id: null` with `book_path` = the card path and `source_anchor.native.chapterHref` = the spine document. `GET /reader/annotations/feed?after=&limit=` (management key only) resolves each annotation to `{sequence, annotation_id, digest_id, item_id, key, href}`. It matches the card name, including the firmware's `-<sha8>.epub` collision name and `<id>.epub`, and then the chapter `href` from the manifest. The existing `/reader/annotations` records are unchanged.
+
+**Repacking the singles already on the card** (dry run by default; prints one line per file):
+
+```sh
+reader-send card repack --root "/Volumes/NO NAME"          # plan only: N singles → M digests
+reader-send card repack --root "/Volumes/NO NAME" --apply  # write digests, move singles away
+```
+
+- It reads each companion-format X post EPUB in `/books/Inbox` and groups them by local day (`--timezone`, default America/New_York). Digests already on the card continue their volume numbers and skip posts they already contain.
+- `--apply` writes each digest (temporary file, fsync, rename, SHA-256 read-back), then moves the originals to `/books/Inbox/.singles-archive/` without deleting anything. It drops their `recent.json` entries and marks the library dirty.
+- Singles that have highlights or notes stay where they are. Without `--root`, the configured card (`card.json`) is used.
+
+**Inbox cleanup** (auto-delete) runs at the end of every `card autosync` and can be run by hand with `reader-send card cleanup [--root PATH] [--apply]`. It is a dry run unless `--apply` is given or `card.json` has `"inbox_cleanup": true` (absent = off). The policy:
+
+- X digests and single X posts move to trash 3 days after they were finished, or 30 days after delivery even if unread. Delivery time is the file's modification time, or when cleanup first saw the file.
+- Articles move to trash 14 days after they were first seen finished. An unread long post is never removed, and neither is a non-X book that did not come from sync.
+- "Finished" comes from the reader's `progress.bin`: past the last spine item, or on the last page of the last one.
+- A book with highlights or notes is held until every one of its annotations has a server receipt (`/.crosspoint/reader-sync/notes/<id>.receipt`).
+- Annotations stay retrievable after cleanup: on the server (`reader-send cloud annotations`, `/reader/annotations/export`) and on the card, where `/.crosspoint/annotations/<key>/` is never touched.
+- "Delete" moves the book to `/books/Inbox/.trash/` and removes its reading cache (`/.crosspoint/epub_<hash>`) and its `recent.json` entry. Trash entries older than 7 days are purged.
+- State lives in `<cache>/.inbox-cleanup-<volume uuid>.json`, and repeated runs are idempotent.
 
 ### Convert Chinese TXT novels for the reader
 
