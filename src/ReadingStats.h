@@ -11,5 +11,7 @@ void tick(bool input);
 void page(uint32_t progress);
 void suspend();
 void finish();
+// Forgets the in-RAM statistics so the next use reloads them from the card. Call only with no book open.
+void reload();
 bool flush();
 }  // namespace reading_stats

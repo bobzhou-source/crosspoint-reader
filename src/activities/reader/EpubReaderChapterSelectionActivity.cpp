@@ -1,9 +1,11 @@
 #include "EpubReaderChapterSelectionActivity.h"
 
+#include <Benchmark.h>
 #include <FontCacheManager.h>
 #include <GfxRenderer.h>
 #include <I18n.h>
 
+#include <algorithm>
 #include <string>
 
 #include "MappedInputManager.h"
@@ -53,11 +55,22 @@ void EpubReaderChapterSelectionActivity::onEnter() {
 // CJK fallback glyphs -- one bounded SD pass per list page; repaints inside
 // the window stay RAM-only.
 void EpubReaderChapterSelectionActivity::refreshTocWindow(const int start) {
+  const uint64_t rowLoadStarted = benchmark::start();
   const int total = listCount();
+  const int visibleEnd = std::min(total, start + std::max(1, nav.visibleRows));
+  if (windowStart >= 0 && start >= windowStart && visibleEnd <= windowStart + windowCount) {
+    benchmark::span(benchmark::EventType::NavRows, rowLoadStarted,
+                    static_cast<uint32_t>(benchmark::NavRowsScreen::Contents), 1, 0);
+    return;
+  }
   int clamped = start;
   if (clamped > total - TOC_WINDOW) clamped = total - TOC_WINDOW;
   if (clamped < 0) clamped = 0;
-  if (clamped == windowStart) return;
+  if (clamped == windowStart) {
+    benchmark::span(benchmark::EventType::NavRows, rowLoadStarted,
+                    static_cast<uint32_t>(benchmark::NavRowsScreen::Contents), 1, 0);
+    return;
+  }
 
   windowCount = total - clamped < TOC_WINDOW ? total - clamped : TOC_WINDOW;
   for (int i = 0; i < windowCount; i++) {
@@ -71,6 +84,8 @@ void EpubReaderChapterSelectionActivity::refreshTocWindow(const int start) {
     windowItems[i] = item;
   }
   windowStart = clamped;
+  benchmark::span(benchmark::EventType::NavRows, rowLoadStarted,
+                  static_cast<uint32_t>(benchmark::NavRowsScreen::Contents), 0, static_cast<uint32_t>(windowCount));
 
   struct PrewarmCtx {
     const std::string* labels;
@@ -161,6 +176,7 @@ void EpubReaderChapterSelectionActivity::buildScreen(UiScreen& screen) {
   refreshTocWindow(nav.top);
   props.items = windowItems;
   props.itemsWindowFirst = static_cast<uint16_t>(windowStart);
+  props.itemsWindowCount = static_cast<uint16_t>(windowCount);
   screen.list(props);
 }
 

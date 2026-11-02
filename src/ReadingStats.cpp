@@ -1,6 +1,7 @@
 #include "ReadingStats.h"
 
 #include <Arduino.h>
+#include <Benchmark.h>
 #include <HalClock.h>
 #include <HalStorage.h>
 #include <Logging.h>
@@ -44,6 +45,45 @@ void clock(uint32_t& day, uint32_t& second) {
   day = civilDay(local.tm_year + 1900, local.tm_mon + 1, local.tm_mday);
   second = local.tm_hour * 3600 + local.tm_min * 60 + local.tm_sec;
 }
+// Every flush path funnels here. The throttle (lastFlush moves first, so a clean or failed attempt is not retried
+// until the next interval) and the save order are the original ones; when a benchmark session is live the call is also
+// recorded as one stats_flush row spanning the whole call, so a periodic checkpoint can be placed against a turn.
+bool flushFor(benchmark::StatsFlushReason reason) {
+  const uint32_t now = millis();
+  const uint32_t sincePrevious = now - lastFlush;
+  lastFlush = now;  // Failure retries are throttled too.
+  if (!opened) return true;
+  const uint64_t startedUs = benchmark::start();  // zero, with no clock read, when no session is recording
+  const bool wasDirty = accumulator.dirty;
+  auto result = benchmark::StatsFlushResult::Clean;
+  if (wasDirty) {
+    accumulator.updateTop();
+    if (!Storage.ensureDirectoryExists(DIRECTORY) ||
+        !save(files, bookStem, &accumulator.book, sizeof(accumulator.book), bookGeneration) ||
+        !save(files, SUMMARY, &accumulator.summary, sizeof(accumulator.summary), summaryGeneration)) {
+      LOG_ERR("STATS", "Failed to save reading statistics");
+      result = benchmark::StatsFlushResult::Failed;
+    } else {
+      accumulator.dirty = false;
+      result = benchmark::StatsFlushResult::Saved;
+    }
+  }
+  if (startedUs) {
+    const bool periodic = reason == benchmark::StatsFlushReason::Periodic;
+    benchmark::record(benchmark::encodeStatsFlush(startedUs, benchmark::nowUs(), reason, result, bookGeneration,
+                                                  summaryGeneration, sincePrevious,
+                                                  periodic && sincePrevious > FLUSH_MS ? sincePrevious - FLUSH_MS : 0,
+                                                  wasDirty));
+  }
+  return result != benchmark::StatsFlushResult::Failed;
+}
+void suspendFor(benchmark::StatsFlushReason reason) {
+  if (!opened) return;
+  uint32_t day, second;
+  clock(day, second);
+  accumulator.pause(millis(), day, second);
+  flushFor(reason);
+}
 }  // namespace
 Accumulator& data() {
   if (!loaded) {
@@ -86,33 +126,32 @@ void tick(bool input) {
   const uint32_t now = millis();
   if (!accumulator.active()) accumulator.resume(now, day, second);
   accumulator.tick(now, day, second, input);
-  if (now - lastFlush >= FLUSH_MS) flush();
+  if (now - lastFlush >= FLUSH_MS) flushFor(benchmark::StatsFlushReason::Periodic);
 }
 void page(uint32_t progress) {
   if (opened) accumulator.page(progress);
 }
-bool flush() {
-  lastFlush = millis();  // Failure retries are throttled too.
-  if (!opened || !accumulator.dirty) return true;
-  accumulator.updateTop();
-  if (!Storage.ensureDirectoryExists(DIRECTORY) ||
-      !save(files, bookStem, &accumulator.book, sizeof(accumulator.book), bookGeneration) ||
-      !save(files, SUMMARY, &accumulator.summary, sizeof(accumulator.summary), summaryGeneration)) {
-    LOG_ERR("STATS", "Failed to save reading statistics");
-    return false;
-  }
-  accumulator.dirty = false;
-  return true;
-}
+bool flush() { return flushFor(benchmark::StatsFlushReason::Explicit); }
+// The reader calls this on every loop while it is covered. Only the transition out of an active (or still unsaved)
+// session does work; once the book is paused and clean there is nothing to pause or flush, so a repeat is a no-op
+// and records no stats_flush row. A dirty book (including one whose save failed) always goes through, so retries
+// and failed-save results are unchanged. finish() is separate and always flushes.
 void suspend() {
-  if (!opened) return;
-  uint32_t day, second;
-  clock(day, second);
-  accumulator.pause(millis(), day, second);
-  flush();
+  if (!opened || (!accumulator.active() && !accumulator.dirty)) return;
+  suspendFor(benchmark::StatsFlushReason::Suspend);
 }
 void finish() {
-  suspend();
+  suspendFor(benchmark::StatsFlushReason::Exit);
   opened = false;
+}
+void reload() {
+  // The files were rewritten behind the accumulator's back; drop everything it holds so the next use reads them.
+  accumulator = Accumulator{};
+  bookGeneration = 0;
+  summaryGeneration = 0;
+  lastFlush = 0;
+  loaded = false;
+  opened = false;
+  bookStem[0] = '\0';
 }
 }  // namespace reading_stats

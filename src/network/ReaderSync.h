@@ -10,6 +10,7 @@ struct Status {
   bool enabled = false;
   bool active = false;
   uint32_t revision = 0;
+  uint32_t finishedRuns = 0;  // worker runs that reached a terminal phase since boot (the benchmark waits on this)
   uint32_t books = 0;
   uint32_t notes = 0;
   uint32_t rejectedNotes = 0;

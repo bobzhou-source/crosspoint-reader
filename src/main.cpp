@@ -34,6 +34,7 @@
 #include "SdCardFontSystem.h"
 #include "activities/Activity.h"
 #include "activities/ActivityManager.h"
+#include "activities/settings/BenchmarkSettingsActivityNavRun.h"
 #include "activities/settings/SdFirmwareUpdateActivity.h"
 #include "components/UITheme.h"
 #include "fontIds.h"
@@ -473,6 +474,10 @@ void setup() {
 
   HalSystem::checkPanic();
 
+  // A navigation run that died (crash, power loss, sleep) left a backup of the owner's recents, positions and
+  // statistics; put it back before anything reads them.
+  nav_run::recover();
+
   APP_STATE.loadFromFile();
   const bool isSleepWake = wakeupReason == HalGPIO::WakeupReason::PowerButton;
   const bool isPersistedSleepWake = isSleepWake && !APP_STATE.showBootScreen;
@@ -654,6 +659,7 @@ void loop() {
   static unsigned long lastMemPrint = 0;
 
   gpio.setSharedConfirmPowerShortPressEmitsPower(SETTINGS.shortPwrBtn == CrossPointSettings::SHORT_PWRBTN::SLEEP);
+  nav_run::tick();  // injects the next scripted press (if any) before this loop's input is sampled
   mappedInputManager.update();
 
   if (activityManager.requiresExclusiveStorageLoop()) {
@@ -676,6 +682,13 @@ void loop() {
       (gpio.wasAnyPressed() || gpio.wasAnyReleased() || gpio.wasTouchActivity())) {
     // Only reader activity flags: no key identities, coordinates, or text input.
     benchmark::point(benchmark::EventType::Input, gpio.wasAnyPressed(), gpio.wasAnyReleased(), gpio.wasTouchActivity());
+  }
+  if (benchmark::nav::runActive() && benchmark::enabled() &&
+      (gpio.wasAnyPressed() || gpio.wasAnyReleased() || gpio.wasTouchActivity())) {
+    // Navigation run only: marks each input edge and whether the run injected it. No key identity.
+    benchmark::record(benchmark::nav::encodeInput(gpio.wasAnyPressed(), gpio.wasAnyReleased(), gpio.wasTouchActivity(),
+                                                  gpio.lastEdgeInjected(), activityManager.currentActivityId(),
+                                                  benchmark::nowUs()));
   }
   if (benchmark::flushDue()) {
     RenderLock lock(RenderLock::Mode::Try);

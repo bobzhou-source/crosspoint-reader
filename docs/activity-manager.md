@@ -79,6 +79,76 @@ A single `ActivityManager` owns the render task and manages an activity stack:
 └──────────────────────────────────────────────────────────┘
 ```
 
+## Navigation data and repaint boundaries
+
+`InputManager` retains X4 Pro button edges and publishes press/release events
+through `HalGPIO`; `MappedInputManager` applies the configured logical mapping.
+`ButtonNavigator` consumes those edges: Home steps on press, lists step on
+release, and holds page through the list. Swipes request viewport movement
+without moving the selected row. `requestUpdate(true)` means immediate
+scheduling, **not** a full panel refresh.
+
+| Routine move | State and storage work | Layout and requested refresh |
+|---|---|---|
+| Home button/swipe | Changes `selectorIndex`; loaded recents and cover caches are reused. | Repaints Home with `FAST_REFRESH`; its initial cleanup paint may request `HALF_REFRESH`. |
+| Home cover/menu tap | Classic Home selects and paints touch-down feedback, then opens once on release. A committed Library transition may prepare its private index while that feedback waveform runs. | Home feedback and destination retain their existing refresh requests. Cover-grid Home still dispatches on release. |
+| Library row / viewport page | Ring/`ListNav` change; the materialized row window is reused while its start, capacity, count and grouping match. Only a window miss reads index records and label fields. | `UiListActivity` builds the list and chrome, then requests the default `FAST_REFRESH`. |
+| Library sort, filter, recents or changed index | Invalidates row text before the next layout. An unchanged background scan does not invalidate the window; status-only repaints reuse it. | Same list renderer and refresh request; background publication retains its existing render lock and navigation clamp. |
+| File Browser row / page | Navigation operates on resident filenames; only visible names are formatted, and glyphs are prewarmed by window. No directory enumeration per row move. | Shared list renderer, default `FAST_REFRESH`. |
+| Folder enter / Back to parent | Changes path, enumerates and sorts the destination directory. Parent return selects the directory just exited and follows that selection. | Shared list renderer, default `FAST_REFRESH`; no new directory cache. |
+| Reader menu move | Moves `ListNav`; menu rows are constructed once, with only live values updated on render. | List and chrome repaint, default `FAST_REFRESH`. |
+| EPUB / TXT Contents move | Reuses the existing 24-row title window while it covers the required viewport; a miss reads LUT entries / TXT headings and prewarms their glyphs. Current-chapter markers and absolute action indexes stay attached to the cached rows. | Shared list renderer, default `FAST_REFRESH`; the supplied item count bounds the window. |
+| Settings move | Moves the tab ring or `ListNav`; structural rows are resident and live setting values are refreshed in place. Directory/font discovery runs on settings-list rebuilds, not row moves. | Shared list renderer, default `FAST_REFRESH`. |
+| Back from a child screen | `finish()` queues a pop and the parent repaints from its retained state; Library has staged Back behavior before leaving. | Destination activity chooses its existing mode; no refresh-mode override here. |
+| Keyboard header Back | Checks logical Back before text/key touch routing, so a header tap cancels instead of being swallowed as an unmatched key tap. | Parent repaint after pop; no intermediate keyboard refresh. |
+
+These are activity **requests**, not guarantees of a particular electrical
+waveform. Renderer promotion, night-mode inversion policy, panel support and
+the GC/ghost-cleanup cadence remain authoritative and unchanged. List paints
+still reconstruct the framebuffer: data-window reuse avoids SD/decode work,
+not the layout or panel waveform.
+
+For classic touch Home→Library replacement only, `ActivityManager` first revokes
+background sync/storage ownership. Home's feedback epoch identifies the requested
+highlight, and its atomic render phase waits for all drawing/recents writes to
+finish before freezing further outgoing work. Library preparation can then overlap
+the **existing blocking** Home waveform; it neither redraws the framebuffer nor
+changes polarity, refresh mode, completed-frame/OTA acceptance, or render locking.
+Home's post-waveform cover loading is skipped only once that outgoing transition
+has committed. Physical/cover-grid paths with no classic touch feedback do not wait
+for a nonexistent frame and use ordinary entry.
+
+Preparation reads a bounded recents missing mask without modifying the shared
+store. If no pruning is needed, it opens/validates the destination's private index
+and resolves pins once. Otherwise pruning and its persistence remain under the
+entry render lock, before opening the long-lived index reader. `onEnter` consumes
+the prepared state once; a changed recents revision discards prepared index/pins
+and rechecks the current store rather than applying stale mask positions.
+
+When benchmark recording is enabled, `nav_rows` spans report Library or
+Contents window requests: screen ID, cache hit (1) or load (0), and rows
+materialized (zero on a hit). Load duration includes SD-backed row reads and
+metadata decoding/materialization, not raw SD bus time. Contents glyph prewarm
+is outside that span and remains part of total render time. Disabled recording
+does not read the profiling clock.
+Screen ID 3 (`LibraryPrepare`) instead reports the entry-preparation interval,
+with fields `[3, 0, indexed-book-count]` (zero if deferred/missing). Compare that
+interval against the outgoing panel BUSY interval to establish actual overlap;
+it remains included in input-to-settled destination latency. Host barriers verify
+ownership behavior, not a millisecond performance improvement.
+
+Focused host behavior checks (each invokes one host compiler):
+
+```bash
+python3 test/test_library_row_window.py
+python3 test/test_contents_row_window.py
+python3 test/test_home_touch_navigation.py
+python3 test/test_list_viewport.py
+python3 test/test_keyboard_back_navigation.py
+python3 test/test_library_entry_preparation.py
+python3 test/test_home_library_preparation.py
+```
+
 ## Migration Checklist
 
 ### 1. Change Base Class

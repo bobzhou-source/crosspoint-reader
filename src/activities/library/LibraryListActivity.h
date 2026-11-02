@@ -28,10 +28,10 @@ struct LibraryBuildJob;
 // are truncated to one line by the widget — more books on the screen, even if
 // half a name is hidden.
 //
-// Only the visible window of rows is materialized per render (strings and
-// ListItems for at most one page). The ordinary shelf therefore keeps one page
-// of strings; an active search additionally uses one fallible uint16_t slot per
-// indexed book so an allocation failure remains recoverable on the C3.
+// Only the visible window of rows is materialized (strings and ListItems for
+// at most one page), then reused until the viewport or row data changes. An
+// active search additionally uses one fallible uint16_t slot per indexed book
+// so an allocation failure remains recoverable on the C3.
 //
 // The index is refreshed by a low-priority background task (LibraryBuildJob),
 // never on the UI task: the screen paints from the existing index first, keeps
@@ -43,6 +43,7 @@ class LibraryListActivity final : public UiTabListActivity {
   LibraryListActivity(GfxRenderer& renderer, MappedInputManager& mappedInput);
   ~LibraryListActivity() override;
 
+  void prepareEnter() override;
   void onEnter() override;
   void onExit() override;
   void loop() override;
@@ -139,12 +140,18 @@ class LibraryListActivity final : public UiTabListActivity {
   static void backActionTrampoline(const freeink::ui::ActionEvent& event, void* user);
 
   // Data
+  void loadEntryIndex();
+  enum class EntryPreparation : uint8_t { None, NeedsPrune, Ready };
+  EntryPreparation entryPreparation = EntryPreparation::None;
+  uint16_t preparedMissingMask = 0;
+  uint32_t preparedRecentsRevision = 0;
   void applyFilter();
   int bookRowCount() const;
   int rowFor(int entry) const;
   // fileName, when asked for, is the on-card name the row's icon derives from
   // (the display title may come from metadata and carry no extension).
-  bool rowTextFor(int entry, std::string& title, std::string& author, std::string* fileName = nullptr);
+  bool rowTextFor(int entry, std::string& title, std::string& author, std::string* fileName = nullptr,
+                  uint32_t* initial = nullptr);
   uint32_t titleInitialFor(int entry);
   bool buildGroupStarts();
   int groupForBook(int bookEntry) const;
@@ -152,7 +159,8 @@ class LibraryListActivity final : public UiTabListActivity {
 
   // Screen building
   void buildHeader(UiScreen& screen);
-  // Materializes ListItems and their strings for the visible window only.
+  // Materializes ListItems only when the visible window or its data changes.
+  void refreshRowWindow(int start, size_t capacity);
   void buildRows(UiScreen& screen);
   static void formatInitialHeading(uint32_t initial, std::string& out);
   void formatAuthorHeading(const std::string& author, std::string& out) const;
@@ -227,6 +235,10 @@ class LibraryListActivity final : public UiTabListActivity {
   std::vector<std::string> winTitles;
   std::vector<std::string> winAuthors;
   std::vector<std::string> winHeaders;
+  int winStart = -1;
+  size_t winCapacity = 0;
+  int winCount = 0;
+  bool winCollapsed = false;
 
   // Pinned overlay state: per store entry its RecentAsc row (0xFFFF when the
   // book is not in the index), and the current-direction rows to skip, sorted

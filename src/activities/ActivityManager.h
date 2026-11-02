@@ -105,6 +105,10 @@ class ActivityManager {
   bool requiresExclusiveStorageLoop() const;
   bool isReaderActivity() const;
   bool isBenchmarkActivity() const;
+  // Navigation benchmark observers (main task): hashed name of the current activity, and whether a render or an
+  // activity transition is still queued.
+  uint32_t currentActivityId() const;
+  bool hasPendingWork() const;
   bool handleForcedRefresh();
   bool skipLoopDelay() const;
   ScreenshotInfo getScreenshotInfo() const;

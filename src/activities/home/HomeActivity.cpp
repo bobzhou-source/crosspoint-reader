@@ -12,6 +12,8 @@
 #include <Memory.h>
 #include <Utf8.h>
 #include <Xtc.h>
+#include <freertos/FreeRTOS.h>
+#include <freertos/task.h>
 
 #include <algorithm>
 #include <cstring>
@@ -463,8 +465,10 @@ void HomeActivity::loop() {
   if (coverTouch != MappedInputManager::RowTouch::None) {
     if (UITheme::isRtl()) touchedBook = recentCount - 1 - touchedBook;
     if (coverTouch == MappedInputManager::RowTouch::Down) {
+      // Down is held-level input: queue feedback only when the highlight changes.
       if (selectorIndex != touchedBook) {
         selectorIndex = touchedBook;
+        feedbackRequested.fetch_add(1, std::memory_order_release);
         requestUpdate();
       }
     } else {
@@ -484,6 +488,7 @@ void HomeActivity::loop() {
     if (menuTouch == MappedInputManager::RowTouch::Down) {
       if (selectorIndex != touchedIndex) {
         selectorIndex = touchedIndex;
+        feedbackRequested.fetch_add(1, std::memory_order_release);
         requestUpdate();
       }
     } else {
@@ -498,8 +503,35 @@ void HomeActivity::loop() {
   }
 }
 
+bool HomeActivity::prepareLibraryTransition() {
+  if (coverGridUi) return false;
+  const uint32_t requested = feedbackRequested.load(std::memory_order_acquire);
+  if (requested == 0) return false;
+  // A prior frame must not satisfy a newer touch-down request. The render task
+  // owns all cover/recents work until it publishes this frame's prepared epoch.
+  while (feedbackPrepared.load(std::memory_order_acquire) != requested) vTaskDelay(1);
+  for (;;) {
+    auto phase = navigationFramePhase.load(std::memory_order_acquire);
+    if (phase == NavigationFramePhase::Frozen) return true;
+    if ((phase == NavigationFramePhase::Idle || phase == NavigationFramePhase::Waveform) &&
+        navigationFramePhase.compare_exchange_weak(phase, NavigationFramePhase::Frozen,
+                                                    std::memory_order_acq_rel)) {
+      return true;
+    }
+    vTaskDelay(1);
+  }
+}
+
 void HomeActivity::render(RenderLock&&) {
   const auto& metrics = UITheme::getInstance().getMetrics();
+  if (!coverGridUi) {
+    auto phase = NavigationFramePhase::Idle;
+    if (!navigationFramePhase.compare_exchange_strong(phase, NavigationFramePhase::Drawing,
+                                                      std::memory_order_acq_rel)) {
+      return;  // The outgoing Home is frozen for a committed Library transition.
+    }
+  }
+  const uint32_t feedback = feedbackRequested.load(std::memory_order_acquire);
 
   renderer.clearScreen();
   if (coverGridUi) {
@@ -589,7 +621,16 @@ void HomeActivity::render(RenderLock&&) {
                                             tr(STR_DIR_DOWN));
   GUI.drawButtonHints(renderer, labels.btn1, labels.btn2, labels.btn3, labels.btn4);
 
+  // All Home SD/recents mutations are complete. Leave the framebuffer and the
+  // blocking display call unchanged; only destination-private data can overlap.
+  feedbackPrepared.store(feedback, std::memory_order_release);
+  navigationFramePhase.store(NavigationFramePhase::Waveform, std::memory_order_release);
   renderer.displayBuffer(cleanInitialRefresh && !firstRenderDone ? HalDisplay::HALF_REFRESH : HalDisplay::FAST_REFRESH);
+  auto phase = NavigationFramePhase::Waveform;
+  if (!navigationFramePhase.compare_exchange_strong(phase, NavigationFramePhase::Drawing,
+                                                    std::memory_order_acq_rel)) {
+    return;  // Do not start outgoing cover work after destination preparation.
+  }
 
   if (!firstRenderDone) {
     firstRenderDone = true;
@@ -599,6 +640,7 @@ void HomeActivity::render(RenderLock&&) {
     const int themeThumbHeight = GUI.homeCoverThumbHeight(renderer, static_cast<int>(recentBooks.size()));
     loadRecentCovers(themeThumbHeight > 0 ? themeThumbHeight : metrics.homeCoverHeight);
   }
+  navigationFramePhase.store(NavigationFramePhase::Idle, std::memory_order_release);
 }
 
 void HomeActivity::onSelectBook(const std::string& path) { activityManager.goToReader(path); }

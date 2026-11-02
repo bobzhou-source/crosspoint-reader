@@ -141,22 +141,64 @@ void HalGPIO::begin() {
 
 void HalGPIO::update() {
   inputMgr.update();
+  if (injectionGuard &&
+      (inputMgr.wasAnyPressed() || inputMgr.wasAnyReleased() || inputMgr.wasTouchActivity() || inputMgr.isPressed(0) ||
+       inputMgr.isPressed(1) || inputMgr.isPressed(2) || inputMgr.isPressed(3) || inputMgr.isPressed(4) ||
+       inputMgr.isPressed(5))) {
+    realInputDuringInjection = true;
+  }
+  // Edges last exactly one update(), like InputManager's own.
+  injectPressEdge = false;
+  injectReleaseEdge = false;
+  if (injectStage == InjectStage::Queued) {
+    injectStage = InjectStage::Down;
+    injectDownAtMs = millis();
+    injectPressEdge = true;
+  } else if (injectStage == InjectStage::Down && millis() - injectDownAtMs >= injectHoldMs) {
+    injectStage = InjectStage::Idle;
+    injectHeldMs = millis() - injectDownAtMs;
+    injectReleaseEdge = true;
+  }
   const bool connected = isUsbConnected();
   usbStateChanged = (connected != lastUsbConnected);
   lastUsbConnected = connected;
 }
 
+bool HalGPIO::injectPress(const uint8_t buttonIndex, const uint16_t holdMs) {
+  if (buttonIndex > BTN_DOWN || injectStage != InjectStage::Idle || injectReleaseEdge) return false;
+  injectIndex = buttonIndex;
+  injectHoldMs = holdMs;
+  injectStage = InjectStage::Queued;
+  return true;
+}
+
+void HalGPIO::setInjectionGuard(const bool enabled) {
+  injectionGuard = enabled;
+  realInputDuringInjection = false;
+  if (!enabled) {
+    injectStage = InjectStage::Idle;
+    injectPressEdge = false;
+    injectReleaseEdge = false;
+  }
+}
+
 bool HalGPIO::wasUsbStateChanged() const { return usbStateChanged; }
 
-bool HalGPIO::isPressed(uint8_t buttonIndex) const { return inputMgr.isPressed(buttonIndex); }
+bool HalGPIO::isPressed(uint8_t buttonIndex) const {
+  return inputMgr.isPressed(buttonIndex) || (injectStage == InjectStage::Down && buttonIndex == injectIndex);
+}
 
-bool HalGPIO::wasPressed(uint8_t buttonIndex) const { return inputMgr.wasPressed(buttonIndex); }
+bool HalGPIO::wasPressed(uint8_t buttonIndex) const {
+  return inputMgr.wasPressed(buttonIndex) || (injectPressEdge && buttonIndex == injectIndex);
+}
 
-bool HalGPIO::wasAnyPressed() const { return inputMgr.wasAnyPressed(); }
+bool HalGPIO::wasAnyPressed() const { return inputMgr.wasAnyPressed() || injectPressEdge; }
 
-bool HalGPIO::wasReleased(uint8_t buttonIndex) const { return inputMgr.wasReleased(buttonIndex); }
+bool HalGPIO::wasReleased(uint8_t buttonIndex) const {
+  return inputMgr.wasReleased(buttonIndex) || (injectReleaseEdge && buttonIndex == injectIndex);
+}
 
-bool HalGPIO::wasAnyReleased() const { return inputMgr.wasAnyReleased(); }
+bool HalGPIO::wasAnyReleased() const { return inputMgr.wasAnyReleased() || injectReleaseEdge; }
 
 bool HalGPIO::rawInputActive() {
   const bool capturedButtons = inputMgr.captureDigitalButtons();
@@ -183,7 +225,11 @@ bool HalGPIO::rawInputActive() {
   return (g1.raw >= 0 && g1.raw < kIdleRailMin) || (g2.raw >= 0 && g2.raw < kIdleRailMin);
 }
 
-unsigned long HalGPIO::getHeldTime() const { return inputMgr.getHeldTime(); }
+unsigned long HalGPIO::getHeldTime() const {
+  if (injectStage == InjectStage::Down) return millis() - injectDownAtMs;
+  if (injectReleaseEdge) return injectHeldMs;
+  return inputMgr.getHeldTime();
+}
 
 unsigned long HalGPIO::getPowerButtonHeldTime() const { return inputMgr.getPowerButtonHeldTime(); }
 

@@ -14,12 +14,14 @@ class BenchmarkSettingsActivity final : public UiListActivity {
   bool isBenchmarkActivity() const override { return running; }
 
  private:
-  static constexpr int ITEM_COUNT = 6;
+  static constexpr int ITEM_COUNT = 7;
   int listCount() const override { return ITEM_COUNT; }
   const char* headerTitle() const override;
   void buildScreen(UiScreen& screen) override;
   void activateIndex(int index) override;
   void beginRun();
+  void beginNavRun();
+  void buildNavRow();
   void startPhase();
   void childFinished(const ActivityResult& result);
   // Caller owns RenderLock, including the ActivityManager onExit path.
@@ -31,6 +33,9 @@ class BenchmarkSettingsActivity final : public UiListActivity {
   StrId statusLabel = StrId::STR_BENCHMARK_READY;
   char resultPath[80]{};
   char counts[64]{};
+  char navText[256]{};
+  StrId navStartLabel_ = StrId::STR_BENCHMARK_RECORDER_FAILED;
+  bool navStartFailed = false;
   uint8_t completed[4]{};
   uint8_t phase = 0;
   uint32_t runStarted = 0;

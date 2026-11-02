@@ -100,7 +100,7 @@ void ActivityManager::renderTaskLoop() {
           currentActivity->isHomeActivity() || currentActivity->hasCompletedHealthyRender();
       if (healthyNormalUi && Storage.ready()) {
         ota_boot::acceptPendingUpdate();
-        if (!currentActivity->isBenchmarkActivity()) reader_sync::healthyRender();
+        if (!isBenchmarkActivity()) reader_sync::healthyRender();
       }
     }
     // Notify any task blocked in requestUpdateAndWait() that the render is done.
@@ -151,7 +151,7 @@ void ActivityManager::loop() {
       // The header back button shares this band; its taps stay Back.
       statusBarTap = mappedInput.wasScreenTapped(tx, ty) && ty < 44 && !HeaderBackTapTarget::contains(tx, ty);
     }
-    if (!currentActivity->isBenchmarkActivity() && currentActivity->name != "FrontlightPanel" &&
+    if (!isBenchmarkActivity() && currentActivity->name != "FrontlightPanel" &&
         (statusBarTap || mappedInput.wasLightPanelGesture())) {
       pushActivity(std::make_unique<FrontlightPanelActivity>(renderer, mappedInput));
       return;
@@ -165,6 +165,14 @@ void ActivityManager::loop() {
     // Join before taking RenderLock: the worker may still be finishing SD I/O.
     // Every activity transition revokes background radio/storage ownership.
     reader_sync::cancelAndJoin();
+    if (pendingAction == PendingAction::Replace && currentActivity && currentActivity->isHomeActivity() &&
+        pendingActivity && pendingActivity->name == "Library" &&
+        static_cast<HomeActivity*>(currentActivity.get())->prepareLibraryTransition()) {
+      // Home has finished drawing but may still be in its blocking waveform.
+      // Keep that RenderLock/completed-frame boundary; prepare private SD data
+      // only after background ownership and outgoing recents writes are quiet.
+      pendingActivity->prepareEnter();
+    }
     if (pendingAction == PendingAction::Pop) {
       RenderLock lock;
 
@@ -256,7 +264,11 @@ void ActivityManager::loop() {
   {
     RenderLock lock(RenderLock::Mode::Try);
     if (lock.ownsLock() && currentActivity) {
-      syncUi.permitted = !currentActivity->isBenchmarkActivity() &&
+      // A benchmark workload inhibits Reader sync, except the one guarded `sync` step of a navigation run, which
+      // permits it on the Reader Sync screen only (see benchmark::nav::setSyncPermit).
+      const bool benchmarkInhibits =
+          isBenchmarkActivity() && !(benchmark::nav::syncPermit() && currentActivity->name == "ReaderSyncSettings");
+      syncUi.permitted = !benchmarkInhibits &&
                          (currentActivity->isHomeActivity() || currentActivity->hasCompletedHealthyRender() ||
                           currentActivity->name == "ReaderSyncSettings");
       syncUi.homeShown = currentActivity->isHomeActivity();
@@ -416,7 +428,10 @@ void ActivityManager::popActivity() {
   pendingAction = PendingAction::Pop;
 }
 
-bool ActivityManager::preventAutoSleep() const { return currentActivity && currentActivity->preventAutoSleep(); }
+bool ActivityManager::preventAutoSleep() const {
+  // A navigation run owns the device: no inactivity sleep between its injected presses.
+  return benchmark::nav::runActive() || (currentActivity && currentActivity->preventAutoSleep());
+}
 
 bool ActivityManager::requiresExclusiveStorageLoop() const {
   return currentActivity && currentActivity->requiresExclusiveStorageLoop();
@@ -429,7 +444,15 @@ bool ActivityManager::isReaderActivity() const {
 }
 
 bool ActivityManager::isBenchmarkActivity() const {
-  return currentActivity && currentActivity->isBenchmarkActivity();
+  return benchmark::nav::runActive() || (currentActivity && currentActivity->isBenchmarkActivity());
+}
+
+uint32_t ActivityManager::currentActivityId() const {
+  return currentActivity ? benchmark::id(currentActivity->name.c_str()) : 0;
+}
+
+bool ActivityManager::hasPendingWork() const {
+  return requestedUpdate.load() || pendingAction != PendingAction::None || pendingActivity != nullptr;
 }
 
 bool ActivityManager::handleForcedRefresh() { return currentActivity && currentActivity->handleForcedRefresh(); }

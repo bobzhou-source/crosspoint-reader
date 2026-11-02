@@ -1,5 +1,6 @@
 #include "TxtReaderChapterSelectionActivity.h"
 
+#include <Benchmark.h>
 #include <FontCacheManager.h>
 #include <GfxRenderer.h>
 #include <I18n.h>
@@ -75,11 +76,22 @@ bool TxtReaderChapterSelectionActivity::readTitle(const size_t offset, std::stri
 // is a short read from the book, so this runs only when the viewport leaves the
 // current window, then batch-prewarms the window's glyphs.
 void TxtReaderChapterSelectionActivity::refreshRowWindow(const int start) {
+  const uint64_t rowLoadStarted = benchmark::start();
   const int total = listCount();
+  const int visibleEnd = std::min(total, start + std::max(1, nav.visibleRows));
+  if (windowStart >= 0 && start >= windowStart && visibleEnd <= windowStart + windowCount) {
+    benchmark::span(benchmark::EventType::NavRows, rowLoadStarted,
+                    static_cast<uint32_t>(benchmark::NavRowsScreen::Contents), 1, 0);
+    return;
+  }
   int clamped = start;
   if (clamped > total - ROW_WINDOW) clamped = total - ROW_WINDOW;
   if (clamped < 0) clamped = 0;
-  if (clamped == windowStart) return;
+  if (clamped == windowStart) {
+    benchmark::span(benchmark::EventType::NavRows, rowLoadStarted,
+                    static_cast<uint32_t>(benchmark::NavRowsScreen::Contents), 1, 0);
+    return;
+  }
 
   const auto& chapters = pageIndex.chapters();
   windowCount = total - clamped < ROW_WINDOW ? total - clamped : ROW_WINDOW;
@@ -102,6 +114,8 @@ void TxtReaderChapterSelectionActivity::refreshRowWindow(const int start) {
     windowItems[i] = item;
   }
   windowStart = clamped;
+  benchmark::span(benchmark::EventType::NavRows, rowLoadStarted,
+                  static_cast<uint32_t>(benchmark::NavRowsScreen::Contents), 0, static_cast<uint32_t>(windowCount));
 
   struct PrewarmCtx {
     const std::string* labels;
@@ -188,6 +202,7 @@ void TxtReaderChapterSelectionActivity::buildScreen(UiScreen& screen) {
   refreshRowWindow(nav.top);
   props.items = windowItems;
   props.itemsWindowFirst = static_cast<uint16_t>(windowStart);
+  props.itemsWindowCount = static_cast<uint16_t>(windowCount);
   screen.list(props);
 }
 

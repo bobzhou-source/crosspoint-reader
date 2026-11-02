@@ -28,6 +28,10 @@ class Activity {
   explicit Activity(std::string name, GfxRenderer& renderer, MappedInputManager& mappedInput)
       : name(std::move(name)), renderer(renderer), mappedInput(mappedInput) {}
   virtual ~Activity() = default;
+  // Optional private-data preparation after background ownership is revoked,
+  // before taking the outgoing screen's RenderLock. Must not draw or mutate
+  // shared screen data; onEnter remains the publication/lifecycle boundary.
+  virtual void prepareEnter() {}
   virtual void onEnter();
   virtual void onExit();
   virtual void loop() {}
