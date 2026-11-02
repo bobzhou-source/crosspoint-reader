@@ -51,6 +51,7 @@ class RefreshCalibrationActivity final : public Activity {
   void commitPageAdvance();
   refresh_calibration::Ladder ladder;
   refresh_calibration::Rung rung;
+  refresh_calibration::RungMeasurement measurement;
   unsigned long rungStartedMs = 0;
   AdaptiveRefreshPolicy driver;    // runs the hardware: fast unless a clear is requested
   AdaptiveRefreshPolicy observer;  // the active config, only watched
