@@ -14,6 +14,9 @@
 #include "SettingsList.h"
 #include "fontIds.h"
 
+#include <BoardConfig.h>
+#include <FrontlightCurve.h>
+
 namespace {
 
 // Stack buffer for "<key>_obf" key construction — avoids a std::string
@@ -108,6 +111,12 @@ void CrossPointSettings::toJson(JsonDocument& doc) const {
   // unconfigured, so the default keeps following the UI language.
   if (keyboardLayouts != 0) {
     doc["keyboardLayouts"] = keyboardLayouts;
+  }
+
+  // X4 Pro only. Other boards still use the old gamma, so writing the version
+  // key there would skip the remap if this file later landed on an X4 Pro.
+  if (BoardConfig::isX4Pro()) {
+    doc["frontlightCurveVersion"] = frontlight::kSettingsCurveVersion;
   }
 }
 
@@ -258,6 +267,16 @@ bool CrossPointSettings::fromJson(JsonVariantConst doc) {
   // Absent means unconfigured, which is the default.
   if (doc["keyboardLayouts"].is<uint16_t>()) {
     keyboardLayouts = doc["keyboardLayouts"].as<uint16_t>();
+  }
+
+  // X4 Pro brightness curve v2: 1% is 1 LSB of 4095, and the old gamma is kept
+  // from 30% up. Remap a stored percent so mid/high look the same and the old
+  // 1% stays reachable. Warmth is not remapped; the new curve is the point.
+  const int curveVersion = doc["frontlightCurveVersion"] | 0;
+  if (BoardConfig::isX4Pro() && curveVersion < frontlight::kSettingsCurveVersion &&
+      doc["frontlightBrightness"].is<int>()) {
+    s.frontlightBrightness = frontlight::migrateBrightness(s.frontlightBrightness);
+    needsResave = true;
   }
 
   if (needsResave) {

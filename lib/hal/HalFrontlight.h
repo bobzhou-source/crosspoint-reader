@@ -1,5 +1,6 @@
 #pragma once
 
+#include <FrontlightCurve.h>
 #include <FrontlightManager.h>
 
 // Thin firmware HAL over the SDK frontlight manager. It is inert on boards
@@ -22,6 +23,9 @@ class HalFrontlight {
   bool isOn() const { return lit; }
 
  private:
+  // Reads /.crosspoint/frontlight.json if present. Missing or invalid files
+  // keep the compiled curve. Called from begin().
+  void loadCurve();
   HalFrontlight() = default;
 
   FrontlightManager manager;

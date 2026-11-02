@@ -43,7 +43,7 @@ uint8_t percentFromPermille(const int16_t permille) {
 }  // namespace
 
 FrontlightPanelActivity::FrontlightPanelActivity(GfxRenderer& renderer, MappedInputManager& mappedInput)
-    : Activity("FrontlightPanel", renderer, mappedInput), UiAppHost(renderer) {}
+    : Activity("FrontlightPanel", renderer, mappedInput), UiAppHost(renderer), buttonNavigator(180, 400) {}
 
 void FrontlightPanelActivity::onEnter() {
   Activity::onEnter();
@@ -250,10 +250,14 @@ void FrontlightPanelActivity::loop() {
     return;
   }
 
-  buttonNavigator.onPressAndContinuous({MappedInputManager::Button::Left},
-                                       [this] { adjustBrightness(-BRIGHTNESS_STEP); });
-  buttonNavigator.onPressAndContinuous({MappedInputManager::Button::Right},
-                                       [this] { adjustBrightness(BRIGHTNESS_STEP); });
+  // A tap moves 1%. A hold repeats every 180 ms, and above 10% it steps by 2
+  // so the fine end of the new curve stays settable without a long crawl.
+  buttonNavigator.onPress({MappedInputManager::Button::Left}, [this] { adjustBrightness(-1); });
+  buttonNavigator.onPress({MappedInputManager::Button::Right}, [this] { adjustBrightness(1); });
+  buttonNavigator.onContinuous({MappedInputManager::Button::Left},
+                               [this] { adjustBrightness(brightness < 10 ? -1 : -2); });
+  buttonNavigator.onContinuous({MappedInputManager::Button::Right},
+                               [this] { adjustBrightness(brightness < 10 ? 1 : 2); });
 }
 
 void FrontlightPanelActivity::panelScreen(UiScreen& screen, void* user) {
