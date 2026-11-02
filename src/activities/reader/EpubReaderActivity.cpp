@@ -1687,9 +1687,7 @@ EpubReaderActivity::RenderPlan EpubReaderActivity::planRender(const bool pageHas
   RenderPlan plan;
   page_prerender::PlanInputs& in = plan.in;
   in.pageHasImages = pageHasImages;
-  in.absoluteImageGrayscale = pageHasImages && !gpio.deviceIsX3() &&
-                              display.getController() == HalDisplay::Controller::UC8279 &&
-                              renderer.grayscaleCapabilities(HalDisplay::GrayscaleMode::Absolute).supported();
+  in.absoluteImageGrayscale = pageHasImages && ReaderUtils::absoluteImageGrayscale(renderer, refreshPolicy.config());
   const auto grayscale = renderer.grayscaleCapabilities(
       in.absoluteImageGrayscale ? HalDisplay::GrayscaleMode::Absolute : HalDisplay::GrayscaleMode::Overlay);
   // Inverted (night) output and B/W-only panels report no grayscale
@@ -1985,8 +1983,8 @@ void EpubReaderActivity::renderContents(std::unique_ptr<Page> page, const int or
   }
   refreshPolicy.commit(refresh);
   // Image pages leave residue (gray waveforms, dithered fills) that FAST text
-  // refreshes do not settle; the next page clears it.
-  if (pageHasImages) refreshPolicy.requestClear();
+  // refreshes do not settle; by default the next page clears it.
+  if (pageHasImages) refreshPolicy.imagePageShown();
   const auto tDisplay = millis();
   benchmark::intervalMs(benchmark::EventType::Phase, tBwRender, tDisplay,
                         static_cast<uint32_t>(benchmark::Phase::Display));

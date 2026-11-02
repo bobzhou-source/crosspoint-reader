@@ -36,6 +36,8 @@ TEST(RefreshPolicyConfig, CompiledDefaultsAreThePublishedPolicyConstants) {
   EXPECT_EQ(kCompiled.weightImagePermille, 1000u);
   EXPECT_EQ(kCompiled.weightGrayscaleImageExtraPermille, 500u);
   EXPECT_EQ(kCompiled.frameChargePermille, 0u);
+  EXPECT_TRUE(kCompiled.clearAfterImage);
+  EXPECT_EQ(kCompiled.imageWaveform, AdaptiveRefreshPolicy::ImageWaveform::Quality);
 }
 
 TEST(RefreshPolicyConfig, FullFileIsAppliedVerbatim) {
@@ -43,6 +45,7 @@ TEST(RefreshPolicyConfig, FullFileIsAppliedVerbatim) {
     "clear_threshold_permille":2400,"night_clear_threshold_permille":3100,"safety_cap":90,
     "weight_grayscale_permille":100,"weight_image_permille":2000,
     "weight_grayscale_image_extra_permille":700,"frame_charge_permille":15,
+    "clear_after_image":false,"image_waveform":"fast",
     "meta":{"generated_by":"analyze.py","series":[1,2,3]}})");
   EXPECT_EQ(state.source, Source::File);
   EXPECT_EQ(state.clampedFields, 0u);
@@ -53,6 +56,37 @@ TEST(RefreshPolicyConfig, FullFileIsAppliedVerbatim) {
   EXPECT_EQ(state.config.weightImagePermille, 2000u);
   EXPECT_EQ(state.config.weightGrayscaleImageExtraPermille, 700u);
   EXPECT_EQ(state.config.frameChargePermille, 15u);
+  EXPECT_FALSE(state.config.clearAfterImage);
+  EXPECT_EQ(state.config.imageWaveform, AdaptiveRefreshPolicy::ImageWaveform::Fast);
+}
+
+TEST(RefreshPolicyConfig, ImageKeysTakeOnlyTheirOwnTypes) {
+  const State noClear = parseText(R"({"schema":1,"clear_after_image":false})");
+  EXPECT_EQ(noClear.source, Source::File);
+  EXPECT_FALSE(noClear.config.clearAfterImage);
+  Config expected;
+  expected.clearAfterImage = false;
+  EXPECT_EQ(noClear.config, expected) << "one image key must leave every other tunable compiled";
+
+  const State fast = parseText(R"({"schema":1,"image_waveform":"fast"})");
+  EXPECT_EQ(fast.source, Source::File);
+  expected = Config{};
+  expected.imageWaveform = AdaptiveRefreshPolicy::ImageWaveform::Fast;
+  EXPECT_EQ(fast.config, expected);
+
+  const State explicitDefaults = parseText(R"({"schema":1,"clear_after_image":true,"image_waveform":"quality"})");
+  EXPECT_EQ(explicitDefaults.source, Source::File);
+  EXPECT_EQ(explicitDefaults.config, kCompiled);
+
+  // Neither key has a range to clamp into: a wrong type or name is a typo, not a request.
+  expectRejected(R"({"schema":1,"clear_after_image":0})", "not a bool: clear_after_image");
+  expectRejected(R"({"schema":1,"clear_after_image":"false"})", "not a bool: clear_after_image");
+  expectRejected(R"({"schema":1,"clear_after_image":null})", "not a bool: clear_after_image");
+  expectRejected(R"({"schema":1,"image_waveform":"Fast"})", "not quality/fast: image_waveform");
+  expectRejected(R"({"schema":1,"image_waveform":"overlay"})", "not quality/fast: image_waveform");
+  expectRejected(R"({"schema":1,"image_waveform":1})", "not quality/fast: image_waveform");
+  expectRejected(R"({"schema":1,"image_waveform":true})", "not quality/fast: image_waveform");
+  expectRejected(R"({"schema":1,"clear_after_image":false,"image_waveform":"fastest"})", "image_waveform");
 }
 
 TEST(RefreshPolicyConfig, MissingTunablesKeepDefaultsAndNightFollowsDay) {

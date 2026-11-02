@@ -25,6 +25,15 @@ constexpr unsigned long SKIP_HOLD_MS = 700;
 constexpr unsigned long BOOKMARK_HOLD_MS = 400;
 constexpr unsigned long BOOKMARK_MESSAGE_DURATION_MS = 2500;
 
+// EPUB picture pages on UC8279 use absolute four-grey planes (the quality
+// waveform) unless the refresh policy asks for the fast overlay path. Other
+// panels always take the overlay path.
+inline bool absoluteImageGrayscale(const GfxRenderer& renderer, const AdaptiveRefreshPolicy::Config& policy) {
+  return policy.imageWaveform == AdaptiveRefreshPolicy::ImageWaveform::Quality && !gpio.deviceIsX3() &&
+         display.getController() == HalDisplay::Controller::UC8279 &&
+         renderer.grayscaleCapabilities(HalDisplay::GrayscaleMode::Absolute).supported();
+}
+
 inline void drawState(GfxRenderer& renderer, const MappedInputManager& input, const char* title, const char* message) {
   const auto& metrics = UITheme::getInstance().getMetrics();
   GUI.drawHeader(renderer, Rect{0, metrics.topPadding, renderer.getScreenWidth(), metrics.headerHeight},

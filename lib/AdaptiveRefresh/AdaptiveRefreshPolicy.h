@@ -87,6 +87,18 @@ class AdaptiveRefreshPolicy {
   // Flat charge per fast frame, in thousandths of a screen, independent of
   // how much changed. 0: debt follows changed pixels only.
   static constexpr uint32_t kFrameChargePermille = 0;
+  // The page after an inline picture is a clear. With false the picture page
+  // is charged like any other frame (the image weights above) and the clear
+  // waits for the debt threshold.
+  static constexpr bool kClearAfterImage = true;
+
+  // How EPUB picture pages are drawn on panels with absolute grayscale planes
+  // (UC8279). Quality: absolute four-grey planes on the quality waveform,
+  // which cycles the whole page. Fast: the B/W page plus overlay grey masks;
+  // the driver still picks the quality waveform when greys cover a large part
+  // of the panel. Panels without absolute planes always use overlay masks.
+  enum class ImageWaveform : uint8_t { Quality, Fast };
+  static constexpr ImageWaveform kImageWaveform = ImageWaveform::Quality;
 
   // Every tunable of the rule. The defaults are the compiled constants above;
   // a policy built with Config{} behaves exactly like the compiled policy.
@@ -99,6 +111,8 @@ class AdaptiveRefreshPolicy {
     uint32_t weightImagePermille = kWeightImagePermille;
     uint32_t weightGrayscaleImageExtraPermille = kWeightGrayscaleImageExtraPermille;
     uint32_t frameChargePermille = kFrameChargePermille;
+    bool clearAfterImage = kClearAfterImage;
+    ImageWaveform imageWaveform = kImageWaveform;
 
     bool operator==(const Config&) const = default;
   };
@@ -116,6 +130,13 @@ class AdaptiveRefreshPolicy {
 
   // Sticky until a Clear is committed. Not charged as debt.
   void requestClear() { clearRequested_ = true; }
+
+  // Call right after committing a page with an inline picture. With
+  // clearAfterImage the next page is a requested clear. Without it the
+  // picture's charge stays in the debt; when the picture page was itself the
+  // clear, its greys were laid down after the clearing base, so its charge
+  // opens the new budget instead of vanishing with the cleared debt.
+  void imagePageShown();
 
   // The previous frame's ink is unknown (frames the policy never saw, buffer
   // lend/return). The fallback estimate then assumes the previous frame had the
@@ -151,6 +172,7 @@ class AdaptiveRefreshPolicy {
   uint32_t pendingCharge_ = 0;   // this frame's charge, set by decide()
   uint32_t pendingInk_ = 0;      // this frame's logical-ink pixels
   uint32_t prevInk_ = 0;         // ink of the last committed frame
+  uint32_t clearedCharge_ = 0;   // charge of the last committed frame if it was a clear, else 0
   uint16_t fastSinceClear_ = 0;  // saturating
   bool initialClear_ = true;
   bool clearRequested_ = false;

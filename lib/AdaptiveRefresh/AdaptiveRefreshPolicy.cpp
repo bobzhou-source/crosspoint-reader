@@ -23,6 +23,7 @@ void AdaptiveRefreshPolicy::reset(bool initialClearRequired) {
   pendingCharge_ = 0;
   pendingInk_ = 0;
   prevInk_ = 0;
+  clearedCharge_ = 0;
   fastSinceClear_ = 0;
   initialClear_ = initialClearRequired;
   clearRequested_ = false;
@@ -88,9 +89,13 @@ void AdaptiveRefreshPolicy::commit(Refresh displayed) {
     fastSinceClear_ = 0;
     initialClear_ = false;
     clearRequested_ = false;
-  } else if (pendingValid_) {
-    debt_ = saturate(static_cast<uint64_t>(debt_) + pendingCharge_);
-    if (fastSinceClear_ != 0xFFFFu) ++fastSinceClear_;
+    clearedCharge_ = pendingValid_ ? pendingCharge_ : 0;
+  } else {
+    clearedCharge_ = 0;
+    if (pendingValid_) {
+      debt_ = saturate(static_cast<uint64_t>(debt_) + pendingCharge_);
+      if (fastSinceClear_ != 0xFFFFu) ++fastSinceClear_;
+    }
   }
   if (pendingValid_ && pendingFrameValid_) {
     prevInk_ = pendingInk_;
@@ -99,4 +104,13 @@ void AdaptiveRefreshPolicy::commit(Refresh displayed) {
     prevInkKnown_ = false;
   }
   pendingValid_ = false;
+}
+
+void AdaptiveRefreshPolicy::imagePageShown() {
+  if (config_.clearAfterImage) {
+    clearRequested_ = true;
+    return;
+  }
+  debt_ = saturate(static_cast<uint64_t>(debt_) + clearedCharge_);
+  clearedCharge_ = 0;
 }

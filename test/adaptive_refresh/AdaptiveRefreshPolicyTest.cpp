@@ -388,3 +388,87 @@ TEST(AdaptiveRefreshPolicyConfig, DefaultConfigReproducesTheV1RuleExactly) {
     }
   }
 }
+
+namespace {
+
+// A reader page turn: changed pixels, AA text greys, and optionally an inline picture.
+Policy::Inputs readerPage(uint32_t changed, bool picture) {
+  auto in = exact(changed);
+  in.visibleGrayscale = true;
+  in.hasImage = picture;
+  return in;
+}
+
+}  // namespace
+
+TEST(AdaptiveRefreshPolicyImages, CompiledConfigKeepsTheClearAfterEveryPicture) {
+  // rc9.2 called requestClear() after every picture page; Config{} must give the
+  // same refresh, reason and debt on every page of a mixed book.
+  Policy current;
+  Policy rc92;
+  uint32_t seed = 12345;
+  unsigned pictures = 0;
+  for (int i = 0; i < 600; ++i) {
+    seed = seed * 1103515245u + 12345u;
+    const uint32_t changed = 20 + (seed >> 8) % 600;
+    const bool picture = (seed >> 20) % 7 == 0;
+    const auto in = readerPage(changed, picture);
+    const auto a = current.decide(in);
+    const auto b = rc92.decide(in);
+    ASSERT_EQ(a.refresh, b.refresh) << "page " << i;
+    ASSERT_EQ(a.reason, b.reason) << "page " << i;
+    current.commit(a.refresh);
+    rc92.commit(b.refresh);
+    if (picture) {
+      ++pictures;
+      current.imagePageShown();
+      rc92.requestClear();
+      ASSERT_TRUE(current.clearPending()) << "the page after a picture is a clear by default";
+    }
+    ASSERT_EQ(current.debtPixels(), rc92.debtPixels()) << "page " << i;
+  }
+  EXPECT_GT(pictures, 50u);
+}
+
+TEST(AdaptiveRefreshPolicyImages, WithoutClearAfterImageThePictureIsChargedNotCleared) {
+  Policy::Config config;
+  config.clearAfterImage = false;
+  Policy p(false, config);
+  const auto picture = step(p, readerPage(100, true));  // 100 * 2.75 = 275
+  ASSERT_EQ(picture.refresh, Refresh::Fast);
+  p.imagePageShown();
+  EXPECT_FALSE(p.clearPending());
+  EXPECT_EQ(p.debtPixels(), 275u) << "a fast picture page is charged once";
+  // AA text pages cost 125 each: 275 + 125 * 10 reaches 1500 on the tenth.
+  EXPECT_EQ(fastFramesBeforeClear(p, readerPage(100, false)), 9u);
+  Policy textOnly(false, config);
+  EXPECT_EQ(fastFramesBeforeClear(textOnly, readerPage(100, false)), 11u);
+}
+
+TEST(AdaptiveRefreshPolicyImages, APictureThatIsItselfTheClearOpensTheNextBudget) {
+  Policy::Config config;
+  config.clearAfterImage = false;
+  Policy p(false, config);
+  for (int i = 0; i < 11; ++i) ASSERT_EQ(step(p, readerPage(100, false)).refresh, Refresh::Fast);
+  ASSERT_EQ(p.debtPixels(), 1375u);
+  const auto picture = step(p, readerPage(200, true));  // 550 more crosses 1500
+  ASSERT_EQ(picture.refresh, Refresh::Clear);
+  ASSERT_EQ(picture.reason, Reason::Debt);
+  EXPECT_EQ(p.debtPixels(), 0u);
+  p.imagePageShown();
+  EXPECT_EQ(p.debtPixels(), 550u) << "the picture's greys came after the clearing base";
+  EXPECT_FALSE(p.clearPending());
+  // 550 + 125 * 8 reaches 1500 on the eighth text page.
+  EXPECT_EQ(fastFramesBeforeClear(p, readerPage(100, false)), 7u);
+}
+
+TEST(AdaptiveRefreshPolicyImages, PictureChargeFollowsTheImageWeights) {
+  Policy::Config config;
+  config.clearAfterImage = false;
+  config.weightImagePermille = 0;
+  config.weightGrayscaleImageExtraPermille = 0;
+  Policy p(false, config);
+  (void)step(p, readerPage(100, true));
+  p.imagePageShown();
+  EXPECT_EQ(p.debtPixels(), 125u) << "image weights 0: a picture page costs like an AA text page";
+}

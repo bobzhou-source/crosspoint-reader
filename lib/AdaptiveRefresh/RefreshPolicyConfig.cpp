@@ -88,6 +88,22 @@ State parse(const char* data, const size_t length) {
       if (!pair.value().is<JsonObjectConst>()) return invalid("meta is not an object");
       continue;
     }
+    if (strcmp(key, "clear_after_image") == 0) {
+      if (!pair.value().is<bool>()) return invalid("not a bool", key);
+      state.config.clearAfterImage = pair.value().as<bool>();
+      continue;
+    }
+    if (strcmp(key, "image_waveform") == 0) {
+      const char* name = pair.value().is<const char*>() ? pair.value().as<const char*>() : nullptr;
+      if (name && strcmp(name, imageWaveformName(AdaptiveRefreshPolicy::ImageWaveform::Quality)) == 0) {
+        state.config.imageWaveform = AdaptiveRefreshPolicy::ImageWaveform::Quality;
+      } else if (name && strcmp(name, imageWaveformName(AdaptiveRefreshPolicy::ImageWaveform::Fast)) == 0) {
+        state.config.imageWaveform = AdaptiveRefreshPolicy::ImageWaveform::Fast;
+      } else {
+        return invalid("not quality/fast", key);
+      }
+      continue;
+    }
     const Tunable* tunable = nullptr;
     for (const auto& candidate : kTunables) {
       if (strcmp(candidate.key, key) == 0) {

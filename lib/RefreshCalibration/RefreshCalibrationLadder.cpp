@@ -1,6 +1,7 @@
 #include "RefreshCalibrationLadder.h"
 
 #include <ArduinoJson.h>
+#include <RefreshPolicyConfig.h>
 
 #include <cstdarg>
 #include <cstdio>
@@ -211,12 +212,14 @@ size_t formatSessionRow(char* out, const size_t capacity, const SessionInfo& inf
   line.addString(info.policySource);
   line.add(",\"policy_config\":{\"clear_threshold_permille\":%lu,\"night_clear_threshold_permille\":%lu,"
            "\"safety_cap\":%u,\"weight_grayscale_permille\":%lu,\"weight_image_permille\":%lu,"
-           "\"weight_grayscale_image_extra_permille\":%lu,\"frame_charge_permille\":%lu}",
+           "\"weight_grayscale_image_extra_permille\":%lu,\"frame_charge_permille\":%lu,"
+           "\"clear_after_image\":%s,\"image_waveform\":\"%s\"}",
            static_cast<unsigned long>(c.clearThresholdPermille), static_cast<unsigned long>(c.nightClearThresholdPermille),
            static_cast<unsigned>(c.safetyCap), static_cast<unsigned long>(c.weightGrayscalePermille),
            static_cast<unsigned long>(c.weightImagePermille),
            static_cast<unsigned long>(c.weightGrayscaleImageExtraPermille),
-           static_cast<unsigned long>(c.frameChargePermille));
+           static_cast<unsigned long>(c.frameChargePermille), c.clearAfterImage ? "true" : "false",
+           refresh_policy_config::imageWaveformName(c.imageWaveform));
   line.add(",\"panel_pixels\":%lu,\"font\":", static_cast<unsigned long>(info.pixelCount));
   line.addString(info.fontName);
   line.add(",\"font_id\":%lu,\"point_size\":%lu,\"antialias\":%u,\"skip\":[",
