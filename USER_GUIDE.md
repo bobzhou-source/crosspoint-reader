@@ -83,6 +83,24 @@ The X4 Pro has a built-in frontlight with adjustable brightness and warmth. It i
 
 If the frontlight doesn't come back on after the device wakes from sleep, check **Restore Light on Wake** in **[Display Settings](#361-display)** (on by default). Turning it off is intentional if you'd rather have the light stay off on wake and switch it on yourself each time — but it's easy to forget you changed it.
 
+Brightness is still 0–100. **1% is now four times dimmer** than the old 1% (one step of the 12-bit PWM, instead of one step of 10-bit). A saved brightness of 30% or higher looks the same as before. A saved 1% comes back as 2%, which is the old floor, and the new 1% is the dimmer level below it. The on-device −/+ buttons and the Left/Right keys move 1% per tap. Holding Left or Right repeats, and above 10% the repeat steps by 2. The web settings list also moves 1% per step.
+
+Warmth is front-loaded. **10% warmth is about a third of the warm LED**, not a tenth, so low settings are actually yellow. **100% warmth turns the cool LED fully off.** That is as yellow as this hardware can go. There is no yellower mix past 100%. A yellower look than that only comes from lowering the brightness, which cuts whatever cool light is still on.
+
+An optional file, `/.crosspoint/frontlight.json`, overrides the compiled curves. If the file is missing, unreadable, empty, or not a JSON object, the compiled curves are used. Out-of-range numbers are clamped. Delete the file to go back. Unknown keys are ignored.
+
+| Key | Default | Accepted |
+| --- | --- | --- |
+| `brightnessGamma` | 1.6554 | 1.0–2.5. The curve from 30% up. Leave it alone unless you want mid and high brightness to change. |
+| `lowGamma` | 1.8 | 1.2–3.0. How fast the bottom of the scale climbs up to 30%. |
+| `brightnessJoinPercent` | 30 | 10–50. Where the low curve meets the old gamma. |
+| `warmthLowPercent` / `warmthLowShare` | 10 / 333 | Interior anchor. Share is thousandths of the warm LED (1–999). |
+| `warmthMidPercent` / `warmthMidShare` | 40 / 560 | Must sit strictly between the low and tail anchors. |
+| `warmthTailPercent` / `warmthTailShare` | 90 / 780 | 90% still leaves cool light on, so the last part of the slider keeps getting yellower. |
+| `warmEfficacy` | 1.0 | 0.5–2.0. 1.0 adds no extra warm duty. There is no measured efficacy for these LEDs; raise it only if warm looks dimmer than cool at the same setting. |
+
+A warmth override that is not strictly increasing is ignored and the compiled warmth curve is kept. 100% warmth is always the warm LED alone, whatever the file says.
+
 ---
 
 ## 2. Power & Startup
