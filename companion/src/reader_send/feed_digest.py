@@ -267,7 +267,8 @@ def build_digest(volume: Volume, tz_name: str = DEFAULT_TZ, *, digest_id: str | 
     nav, toc, order = [], [], 2
     for head, indexes in groups:
         name = html.escape(head.author, quote=False)
-        contents.append(f"<h2>{name} <span>@{head.handle}</span></h2><ol>")
+        label = f"@{head.handle}" if head.author == head.handle else f"{name} <span>@{head.handle}</span>"
+        contents.append(f"<h2>{label}</h2><ol>")
         children = []
         first_order = order
         for index in indexes:
