@@ -8,12 +8,10 @@
 
 #include <algorithm>
 #include <cstdio>
-#include <iterator>
 
 #include "CrossPointSettings.h"
 #include "MappedInputManager.h"
 #include "components/UITheme.h"
-#include "components/UIThemeTokens.h"
 #include "components/icons/customListIcons.h"
 #include "components/icons/listIcons.h"
 
@@ -27,16 +25,7 @@ constexpr fui::ActionId ACTION_BRIGHTNESS_STEP = 4;
 constexpr fui::ActionId ACTION_WARMTH_STEP = 5;
 constexpr fui::ActionId ACTION_TILE = 6;  // value = tile index
 
-// iOS-style geometry. The panel is a card hanging from the top of the screen:
-// a grabber, full-width slider pills, then a 2-column tile grid. The chrome
-// itself is fui::sheet / fui::sliderRow / fui::tileGrid; these constants only
-// size the bands, and computePanelBottom() mirrors them.
-constexpr int16_t kPanelSideMargin = 16;
-constexpr int16_t kGrabberHeight = 5;     // fui::SheetProps default, mirrored here
-constexpr int16_t kSliderRowHeight = 56;  // the pill itself (finger-sized)
-constexpr int16_t kTileHeight = 84;
-constexpr int16_t kTileGap = 16;
-constexpr int kTileCols = 2;
+constexpr int16_t kSliderRowHeight = 48;
 // One percent per press, on the -/+ buttons and on the physical Left/Right keys
 // alike (both repeat while held), so a level can be set exactly.
 constexpr int BRIGHTNESS_STEP = 1;
@@ -267,32 +256,6 @@ void FrontlightPanelActivity::loop() {
                                        [this] { adjustBrightness(BRIGHTNESS_STEP); });
 }
 
-int FrontlightPanelActivity::computePanelBottom() const {
-  const auto tokens = uiThemeTokens(uiTarget);
-  const auto& metrics = UITheme::getInstance().getMetrics();
-  const int16_t lineHeight = uiTarget.lineHeight(tokens.smallText.font);
-  // Slim battery band + the air around it (mirrors buildPanelScreen).
-  const int y0 = std::max<int>(metrics.batteryHeight, lineHeight);
-  int y = tokens.spaceMd + y0 + tokens.spaceMd;
-  if (Frontlight.present()) {
-    // Screen::sliderRow reserves caption + spaceMd + control band, then a
-    // spaceMd gap; addSliderRow() adds one more spaceMd of air after each row.
-    y += lineHeight + tokens.spaceMd + kSliderRowHeight + 2 * tokens.spaceMd;  // brightness
-    if (Frontlight.hasColorTemperature()) {
-      y += lineHeight + tokens.spaceMd + kSliderRowHeight + 2 * tokens.spaceMd;  // warmth
-    }
-    y += tokens.spaceSm;
-  }
-  // Tiles are touch targets, so a buttons-only board gets no grid and the
-  // sheet is exactly the frontlight controls.
-  const int tileCount = mappedInput.hasTouch() ? kTileCount : 0;
-  y += fui::tileGridHeight(static_cast<uint16_t>(tileCount), kTileCols, kTileHeight, kTileGap);
-  // The sheet's grabber band: content margin + grabber + air to the edge.
-  // buildPanelScreen() feeds the same theme spacings into SheetProps.
-  y += tokens.spaceLg + kGrabberHeight + tokens.spaceLg + tokens.spaceMd;
-  return y;
-}
-
 void FrontlightPanelActivity::panelScreen(UiScreen& screen, void* user) {
   static_cast<FrontlightPanelActivity*>(user)->buildPanelScreen(screen);
 }
@@ -305,12 +268,11 @@ void FrontlightPanelActivity::addSliderRow(UiScreen& screen, const char* label, 
   char pct[8];
   snprintf(pct, sizeof(pct), "%u%%", static_cast<unsigned>(value));
 
-  // rowProps is a member (fui::SliderRowProps embeds a 324-byte StyleSet, well
-  // past the 256-byte budget a local gets — AGENTS.md). Every field that
-  // varies between the two rows is reassigned here; the rest keep their
-  // constructed defaults, which already match the panel's card language.
-  rowProps.label = label;
-  rowProps.value = pct;
+  const auto& theme = screen.theme();
+  // Draw the caption in separate lanes so long translations cannot reach
+  // the live value; sliderRow owns the identical control/hit geometry.
+  rowProps.label = nullptr;
+  rowProps.value = nullptr;
   rowProps.sliderValue = value;
   rowProps.sliderAction = sliderAction;
   rowProps.decrement = stepAction;
@@ -326,41 +288,65 @@ void FrontlightPanelActivity::addSliderRow(UiScreen& screen, const char* label, 
     rowProps.toggleAction = fui::NO_ACTION;
     rowProps.toggleIcon = fui::BitmapRef{};
   }
-  screen.sliderRow(rowProps, kSliderRowHeight);
-  // The wrapper's own trailing gap is one spaceMd; double it so the rows
-  // breathe — a control band this tall reads cramped at the list cadence.
-  screen.spacer(screen.theme().spaceMd);
+  // The Warmth row keeps the lamp column empty so its track and +/- line up
+  // with the Brightness row above it, in portrait and landscape alike.
+  rowProps.reserveToggleSlot = !showToggle;
+  const fui::Rect row = screen.takeTop(fui::sliderRowHeight(screen.target(), rowProps, kSliderRowHeight),
+                                       theme.spaceLg);
+  const int16_t lineH = screen.target().lineHeight(rowProps.labelText.font);
+  const int16_t valueW = screen.target().measureText(theme.smallText.font, "100%", theme.smallText).width;
+  const int16_t labelW = std::max<int16_t>(0, row.width - valueW - theme.spaceMd);
+  fui::TextStyle labelStyle = rowProps.labelText;
+  labelStyle.align = UITheme::isRtl() ? fui::TextAlign::Right : fui::TextAlign::Left;
+  fui::TextStyle valueStyle = theme.smallText;
+  valueStyle.align = UITheme::isRtl() ? fui::TextAlign::Left : fui::TextAlign::Right;
+  screen.target().text(fui::Rect{UITheme::isRtl() ? static_cast<int16_t>(row.right() - labelW) : row.x,
+                                 row.y, labelW, lineH}, label, labelStyle);
+  screen.target().text(fui::Rect{UITheme::isRtl() ? row.x : static_cast<int16_t>(row.right() - valueW),
+                                 row.y, valueW, lineH}, pct, valueStyle);
+  fui::sliderRow(screen.frame(), row, rowProps);
 }
 
 void FrontlightPanelActivity::buildPanelScreen(UiScreen& screen) {
   const auto& theme = screen.theme();
 
-  // Sheet chrome first: the card body, the 2px rule along its bottom edge, and
-  // the grabber on the edge the sheet is dragged from. Screen::sheet() also
-  // clamps the content area to the sheet, so every band below lays out inside
-  // it. (No header: the panel is a floating card, and its own grabber says
-  // what it is.)
+  const fui::Rect safe = screen.frame().safeRect();
+  const auto& metrics = UITheme::getInstance().getMetrics();
+  const int16_t headerH = static_cast<int16_t>(metrics.topPadding + metrics.headerHeight);
+  rowProps.labelText = theme.bodyText;
+  rowProps.valueText = theme.smallText;
+  rowProps.buttonText = theme.bodyText;
+  rowProps.buttonStyles = theme.button;
+  rowProps.captionGap = theme.spaceMd;
+  rowProps.gap = theme.spaceMd;
+  rowProps.buttonRadius = theme.controlRadius;
+  rowProps.capsuleRadius = theme.capsuleRadius;
+  rowProps.stroke = 1;
+  const int sliderCount = Frontlight.present() ? (Frontlight.hasColorTemperature() ? 2 : 1) : 0;
+  const int16_t sliderH = fui::sliderRowHeight(screen.target(), rowProps, kSliderRowHeight);
+  const int columns = safe.width > safe.height ? kTileCount : 2;
+  const int16_t tileH = std::max<int16_t>(48, 2 * screen.target().lineHeight(theme.smallText.font) +
+                                               2 * theme.spaceSm);
+  const int16_t tileGap = theme.spaceMd;
+  const int16_t gridH = mappedInput.hasTouch()
+      ? fui::tileGridHeight(kTileCount, static_cast<uint8_t>(columns), tileH, tileGap) : 0;
   fui::SheetProps sheetProps;
-  // A roomy band above the bottom rule: the grabber gets a full spaceLg of
-  // air on both sides so the last row of content never crowds the sheet edge.
-  sheetProps.grabberMargin = theme.spaceLg;
-  sheetProps.grabberInset = static_cast<int16_t>(theme.spaceLg + theme.spaceMd);
-  screen.sheet(sheetProps, static_cast<int16_t>(panelBottom));
-  screen.insetContent(fui::Insets{0, kPanelSideMargin, 0, kPanelSideMargin});
+  sheetProps.ruleWidth = 1;
+  sheetProps.grabberHeight = 2;
+  sheetProps.grabberMargin = theme.spaceMd;
+  sheetProps.grabberInset = theme.spaceMd;
+  const int16_t grabberBand = static_cast<int16_t>(
+      sheetProps.grabberMargin + sheetProps.grabberHeight + sheetProps.grabberInset);
+  const int16_t sheetH = static_cast<int16_t>(headerH + theme.spaceMd +
+      sliderCount * (sliderH + theme.spaceLg) + gridH + grabberBand);
+  screen.sheet(sheetProps, sheetH);
+  panelBottom = safe.y + sheetH;
 
-  // Reuse the exact battery renderer and header rectangle used by Home. Call
-  // the base implementation directly because RoundedRaff suppresses its
-  // untitled Home header.
-  {
-    const auto& metrics = UITheme::getInstance().getMetrics();
-    screen.spacer(theme.spaceMd);
-    const int16_t bandH = std::max<int16_t>(static_cast<int16_t>(metrics.batteryHeight),
-                                            screen.target().lineHeight(theme.smallText.font));
-    screen.takeTop(bandH, theme.spaceMd);
-    UITheme::getInstance().getTheme().BaseTheme::drawHeader(
-        renderer, Rect{0, metrics.topPadding, renderer.getScreenWidth(), metrics.homeTopPadding - metrics.topPadding},
-        nullptr);
-  }
+  const fui::Rect header = screen.takeTop(headerH, theme.spaceMd);
+  GUI.drawHeader(renderer,
+                 Rect{header.x, header.y + metrics.topPadding, header.width, metrics.headerHeight},
+                 tr(STR_CAT_CONTROLS));
+  screen.insetContent(fui::Insets{0, theme.headerSidePadding, 0, theme.headerSidePadding});
 
   if (Frontlight.present()) {
     addSliderRow(screen, tr(STR_BRIGHTNESS), brightness, ACTION_BRIGHTNESS, ACTION_BRIGHTNESS_STEP,
@@ -368,12 +354,10 @@ void FrontlightPanelActivity::buildPanelScreen(UiScreen& screen) {
     if (Frontlight.hasColorTemperature()) {
       addSliderRow(screen, tr(STR_WARMTH), warmth, ACTION_WARMTH, ACTION_WARMTH_STEP, /*showToggle=*/false);
     }
-    screen.spacer(theme.spaceSm);
   }
 
-  // Quick-setting tiles. Two columns of finger-sized cards; a tile whose
-  // setting is currently on draws filled (StateChecked -> selected style).
-  // Touch boards only — the tiles are touch targets.
+  // Quiet two-column actions in portrait, one row in landscape. A solid
+  // underline marks a checked setting without inverting an entire tile.
   if (mappedInput.hasTouch()) {
     static constexpr StrId kOrientNames[4] = {StrId::STR_PORTRAIT, StrId::STR_LANDSCAPE_CW,
                                               StrId::STR_ORIENTATION_INVERTED, StrId::STR_LANDSCAPE_CCW};
@@ -388,31 +372,37 @@ void FrontlightPanelActivity::buildPanelScreen(UiScreen& screen) {
              I18N.get(touchOn ? StrId::STR_STATE_ON : StrId::STR_STATE_OFF));
 
     const char* labels[kTileCount] = {tr(STR_NIGHT_MODE), tr(STR_FORCE_REFRESH), orientLabel, touchLabel};
-    const fui::State states[kTileCount] = {SETTINGS.screenInverted ? fui::StateChecked : fui::StateNormal,
-                                           fui::StateNormal, fui::StateNormal,
-                                           // Filled when touch reader controls are OFF — the non-default,
-                                           // attention-worthy state.
-                                           touchOn ? fui::StateNormal : fui::StateChecked};
-
+    const bool checked[kTileCount] = {SETTINGS.screenInverted != 0, false, false, !touchOn};
+    const fui::Rect grid = screen.takeTop(gridH);
+    const int16_t tileW = static_cast<int16_t>((grid.width - (columns - 1) * tileGap) / columns);
+    fui::TextStyle text = theme.smallText;
+    text.align = UITheme::isRtl() ? fui::TextAlign::Right : fui::TextAlign::Left;
+    text.maxLines = 2;
+    const fui::Paint ink = fui::Paint::solid(fui::Color::Black);
     for (int id = 0; id < kTileCount; ++id) {
-      gridItems[id].label = labels[id];
-      gridItems[id].value = static_cast<int16_t>(id);
-      gridItems[id].state = states[id];
+      const int column = UITheme::isRtl() ? columns - 1 - id % columns : id % columns;
+      const fui::Rect tile{static_cast<int16_t>(grid.x + column * (tileW + tileGap)),
+                           static_cast<int16_t>(grid.y + (id / columns) * (tileH + tileGap)), tileW, tileH};
+      const fui::Rect labelRect =
+          tile.inset(fui::Insets{theme.spaceSm, theme.spaceSm, theme.spaceSm, theme.spaceSm});
+      fui::TextStyle lineStyle = text;
+      lineStyle.align = fui::TextAlign::Left;
+      lineStyle.maxLines = 1;
+      fui::layoutText(screen.target(), labelRect, labels[id], text, [&](const char* line, fui::Rect rect) {
+        screen.target().text(rect, line, lineStyle);
+      });
+      if (checked[id]) {
+        screen.target().fill(fui::Rect{static_cast<int16_t>(tile.x + theme.spaceSm),
+                                       static_cast<int16_t>(tile.bottom() - 2),
+                                       static_cast<int16_t>(tile.width - 2 * theme.spaceSm), 2}, ink);
+      }
+      screen.frame().hit(tile, ACTION_TILE, static_cast<int16_t>(id), fui::InputTouch);
     }
-    gridProps.items = gridItems;
-    gridProps.count = static_cast<uint16_t>(kTileCount);
-    gridProps.action = ACTION_TILE;
-    gridProps.tileHeight = kTileHeight;
-    gridProps.gap = kTileGap;
-    screen.tileGrid(gridProps);
   }
 }
 
 void FrontlightPanelActivity::render(RenderLock&&) {
-  panelBottom = computePanelBottom();
-
-  // fui::sheet draws the card body, its bottom rule, and the grabber during
-  // renderUi(); the battery band at the card's top is part of the screen build.
+  // The sheet publishes the same measured geometry for paint and touch.
   renderUi();
 
   // A tile that rewrote the whole frame (night mode) re-drives every pixel

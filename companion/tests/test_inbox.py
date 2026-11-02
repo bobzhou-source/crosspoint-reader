@@ -2,12 +2,13 @@ import io
 import json
 import tempfile
 import unittest
+from email.message import Message
 from pathlib import Path
 from unittest.mock import Mock, patch
 
 from reader_send.cache import Cache
 from reader_send.cli import main
-from reader_send.common import ReaderError
+from reader_send.common import MAX_HTML_BYTES, ReaderError
 from reader_send.epub import build_epub
 from reader_send.extract import Article, extract
 from reader_send.model import ReadingItem, source_id
@@ -20,6 +21,14 @@ FEED = b'''<rss version="2.0"><channel><title>Selected publication</title>
 <item><guid>post-two</guid><title>Second post</title><link>https://example.com/two</link></item>
 <item><guid>post-one</guid><title>First post</title><link>https://example.com/one</link></item>
 </channel></rss>'''
+
+
+class HTTPResult(io.BytesIO):
+    def __init__(self, body: bytes, url: str):
+        super().__init__(body)
+        self.url = url
+        self.status = 200
+        self.headers = Message()
 
 
 def thread_export():
@@ -72,6 +81,42 @@ class InboxTest(unittest.TestCase):
             self.assertFalse(second["items"])
             self.assertEqual(client.get.call_count, 4)
             self.assertEqual(len(cache.entries()), 2)
+
+    def test_public_sync_reads_feeds_above_two_mib_under_the_html_bound(self):
+        padding = b"<description>" + b"x" * (3 * 1024 * 1024) + b"</description>"
+        large = (b'<rss version="2.0"><channel><title>Large publication</title><item><guid>large-post</guid>'
+                 b"<title>Large post</title><link>https://example.com/large</link>" + padding +
+                 b"</item></channel></rss>")
+        self.assertGreater(len(large), 2 * 1024 * 1024)
+        self.assertLessEqual(len(large), MAX_HTML_BYTES)
+        with tempfile.TemporaryDirectory() as temporary:
+            cache = Cache(Path(temporary))
+            add(cache, "large", "https://example.com/feed", "")
+            client = PublicHTTP()
+            with patch.object(client.opener, "open", side_effect=[
+                    HTTPResult(b"User-agent: *\nDisallow: /private\n", "https://example.com/robots.txt"),
+                    HTTPResult(large, "https://example.com/feed"),
+                    HTTPResult(b"<article><h1>Large post</h1><p>Readable text.</p></article>", "https://example.com/large")]):
+                result = sync(cache, client, no_images=True)
+            self.assertFalse(result["errors"])
+            self.assertEqual([item["source_id"] for item in result["items"]], ["url:https://example.com/large"])
+            self.assertEqual(len(cache.entries()), 1)
+
+    def test_public_sync_rejects_feeds_above_the_bound_before_parsing(self):
+        oversized = (b'<rss version="2.0"><channel><item><guid>huge</guid><link>https://example.com/huge</link>'
+                     b"<description>" + b"x" * MAX_HTML_BYTES + b"</description></item></channel></rss>")
+        with tempfile.TemporaryDirectory() as temporary:
+            cache = Cache(Path(temporary))
+            add(cache, "huge", "https://example.com/feed", "")
+            client = PublicHTTP()
+            with patch.object(client.opener, "open", side_effect=[
+                    HTTPResult(b"User-agent: *\nDisallow: /private\n", "https://example.com/robots.txt"),
+                    HTTPResult(oversized, "https://example.com/feed"),
+                    AssertionError("oversized feed must not reach article fetching")]):
+                result = sync(cache, client, no_images=True)
+            self.assertEqual([error["stage"] for error in result["errors"]], ["feed"])
+            self.assertIn("exceeds", result["errors"][0]["error"])
+            self.assertEqual(cache.entries(), [])
 
     def test_local_export_updates_preserve_source_read_progress(self):
         with tempfile.TemporaryDirectory() as temporary:

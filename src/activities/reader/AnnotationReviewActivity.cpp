@@ -11,6 +11,7 @@
 #include "AnnotationEditorActivity.h"
 #include "AnnotationNavigation.h"
 #include "AnnotationStore.h"
+#include "ReaderTextSlices.h"
 #include "components/UITheme.h"
 
 namespace fui = freeink::ui;
@@ -45,33 +46,27 @@ void AnnotationReviewActivity::onExit() {
 
 void AnnotationReviewActivity::appendText(const char* heading, const char* text) {
   if (!text || !*text) text = tr(STR_REVIEW_NOT_RECORDED);
-  size_t remaining = strlen(text);
-  while (remaining > 0 && rowCount < rows.size()) {
-    size_t length = std::min(remaining, ROW_BYTES);
-    while (length < remaining && length > 0 && (static_cast<unsigned char>(text[length]) & 0xc0) == 0x80) --length;
-    if (length == 0) break;
-    rows[rowCount++] = {text, heading, static_cast<uint8_t>(length)};
-    text += length;
-    remaining -= length;
-    heading = nullptr;
-  }
-  if (remaining != 0) {
-    LOG_ERR("STUDY", "Review text exceeded bounded row budget");
-    loaded = false;
-  }
+  if (fieldCount < fields.size()) fields[fieldCount++] = {text, heading, 0};
 }
 
 void AnnotationReviewActivity::rebuildRows() {
   rowCount = 0;
+  fieldCount = 0;
+  rowsDirty = true;
   const auto* entry = source();
   loaded = entry && static_cast<uint8_t>(entry->kind) < 3;
   if (!loaded) return;
-  if (card) appendText(tr(STR_STUDY_FRONT), card->front.c_str());
+  if (card) {
+    appendText(revealed ? tr(STR_STUDY_ANSWER) : tr(STR_ANNOTATION_QUESTION),
+               revealed ? entry->excerpt.c_str() : card->front.c_str());
+  }
   appendText(tr(STR_ANNOTATION_KIND), I18N.get(KIND_LABELS[static_cast<uint8_t>(entry->kind)]));
   appendText(tr(STR_REVIEW_SOURCE_TITLE), entry->sourceTitle.c_str());
   appendText(tr(STR_CHAPTER), entry->chapterTitle.c_str());
   if (!card || revealed) {
-    appendText(entry->pageContext ? tr(STR_ANNOTATION_PAGE_CONTEXT) : tr(STR_ANNOTATION_EXCERPT), entry->excerpt.c_str());
+    if (!card) {
+      appendText(entry->pageContext ? tr(STR_ANNOTATION_PAGE_CONTEXT) : tr(STR_ANNOTATION_EXCERPT), entry->excerpt.c_str());
+    }
     appendText(tr(STR_ANNOTATION_NOTE), entry->note.empty() ? tr(STR_REVIEW_NO_NOTE) : entry->note.c_str());
   }
   appendText(tr(STR_REVIEW_SOURCE_PATH), entry->sourcePath.c_str());
@@ -97,34 +92,63 @@ void AnnotationReviewActivity::provideRow(void* context, const uint16_t index, f
   } else if (index == 2) {
     item.label = self.card ? tr(STR_STUDY_DELETE) : tr(STR_REVIEW_EDIT);
   } else if (index - 3 < self.rowCount) {
-    const auto& row = self.rows[index - 3];
-    memcpy(self.rowText, row.text, row.length);
-    self.rowText[row.length] = '\0';
-    item.label = self.rowText;
-    item.sectionHeading = row.heading;
+    size_t rowIndex = index - 3;
+    for (size_t i = 0; i < self.fieldCount; ++i) {
+      auto& field = self.fields[i];
+      if (rowIndex >= field.rowCount) {
+        rowIndex -= field.rowCount;
+        continue;
+      }
+      ReaderTextSlices::copyRow(*self.textTarget, field.text, self.textStyle, self.textWidth,
+                               rowIndex, self.rowText, sizeof(self.rowText), field.cursor);
+      item.label = self.rowText;
+      item.sectionHeading = rowIndex == 0 ? field.heading : nullptr;
+      break;
+    }
   }
 }
 
 void AnnotationReviewActivity::buildScreen(UiScreen& screen) {
-  const auto& metrics = UITheme::getInstance().getMetrics();
-  const Rect safe = UITheme::getInstance().getScreenSafeArea(renderer, true, false);
+  const Rect body = UITheme::getContentBounds(renderer);
   screen.setContentMarginFromScreen(
-      fui::Insets{static_cast<int16_t>(safe.y + metrics.topPadding + metrics.headerHeight),
-                  static_cast<int16_t>(renderer.getScreenWidth() - (safe.x + safe.width)),
-                  static_cast<int16_t>(renderer.getScreenHeight() - (safe.y + safe.height) + metrics.buttonHintsHeight),
-                  static_cast<int16_t>(safe.x)});
-  screen.spacer(static_cast<int16_t>(metrics.verticalSpacing));
+      fui::Insets{static_cast<int16_t>(body.y),
+                  static_cast<int16_t>(renderer.getScreenWidth() - (body.x + body.width)),
+                  static_cast<int16_t>(renderer.getScreenHeight() - (body.y + body.height)),
+                  static_cast<int16_t>(body.x)});
   if (!loaded) {
-    screen.centeredText(tr(STR_ANNOTATION_LOAD_FAILED), screen.theme().bodyText);
+    auto style = screen.theme().bodyText;
+    style.align = fui::TextAlign::Center;
+    style.maxLines = 4;
+    screen.target().text(screen.body(), tr(STR_ANNOTATION_LOAD_FAILED), style);
     return;
   }
   fui::ListProps props;
   props.rowProvider = &AnnotationReviewActivity::provideRow;
   props.rowProviderCtx = this;
-  props.count = static_cast<uint16_t>(listCount());
+  props.labelText = screen.theme().bodyText;
+  props.labelText.maxLines = ReaderTextSlices::LINES;
   props.action = ACTION_ROW;
   props.inputMask = fui::InputTouch;
-  props.labelText.maxLines = 3;
+  props.rowInset = 0;
+  props = screen.resolveListProps(props);
+  const int16_t strip = props.scrollIndicator
+                            ? std::max(0, props.scrollIndicatorWidth + props.scrollIndicatorInset + 2 - props.rowInset)
+                            : 0;
+  const int16_t width = static_cast<int16_t>(screen.body().width - 2 * (props.rowInset + props.sidePadding) - strip);
+  textTarget = &screen.target();
+  if (rowsDirty || width != textWidth || textStyle.font != props.labelText.font) {
+    textWidth = std::max<int16_t>(1, width);
+    textStyle = props.labelText;
+    rowCount = 0;
+    for (size_t i = 0; i < fieldCount; ++i) {
+      fields[i].cursor = {};
+      fields[i].rowCount = static_cast<uint16_t>(
+          ReaderTextSlices::count(*textTarget, fields[i].text, textStyle, textWidth));
+      rowCount += fields[i].rowCount;
+    }
+    rowsDirty = false;
+  }
+  props.count = static_cast<uint16_t>(listCount());
   syncListViewport(screen, props);
   screen.list(props);
 }

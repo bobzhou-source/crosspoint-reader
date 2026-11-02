@@ -7,6 +7,7 @@
 #include <cstring>
 
 #include "AnnotationStore.h"
+#include "ReaderTextSlices.h"
 #include "activities/util/KeyboardEntryActivity.h"
 #include "components/UITheme.h"
 
@@ -26,18 +27,7 @@ void AnnotationEditorActivity::onEnter() {
   if (entry) {
     initialNote = entry->note;
     initialKind = entry->kind;
-    // Fixed chunks let the full captured context scroll, including on landscape
-    // screens. No giant row that can be taller than the list viewport.
-    size_t offset = 0;
-    while (offset < entry->excerpt.size() && contextRowCount < contextRows.size()) {
-      size_t end = std::min(offset + CONTEXT_ROW_BYTES, entry->excerpt.size());
-      while (end < entry->excerpt.size() && end > offset &&
-             (static_cast<unsigned char>(entry->excerpt[end]) & 0xc0) == 0x80) --end;
-      auto& row = contextRows[contextRowCount++];
-      memcpy(row.data(), entry->excerpt.data() + offset, end - offset);
-      row[end - offset] = '\0';
-      offset = end;
-    }
+    contextWidth = 0;
   }
   UiListActivity::onEnter();
 }
@@ -54,7 +44,7 @@ int AnnotationEditorActivity::listCount() const {
 const char* AnnotationEditorActivity::headerTitle() const { return tr(STR_ANNOTATIONS); }
 
 void AnnotationEditorActivity::provideRow(void* context, const uint16_t index, fui::ListItem& item) {
-  const auto& self = *static_cast<AnnotationEditorActivity*>(context);
+  auto& self = *static_cast<AnnotationEditorActivity*>(context);
   if (!self.entry) return;
   item.actionValue = static_cast<int16_t>(index);
   if (index == 0) {
@@ -67,7 +57,9 @@ void AnnotationEditorActivity::provideRow(void* context, const uint16_t index, f
     item.label = tr(STR_EDIT_NOTE);
     item.subtitle = self.entry->note.empty() ? nullptr : self.entry->note.c_str();
   } else if (index < 3 + self.contextRowCount) {
-    item.label = self.contextRows[index - 3].data();
+    ReaderTextSlices::copyRow(*self.contextTarget, self.entry->excerpt.c_str(), self.contextStyle,
+                             self.contextWidth, index - 3, self.contextText, sizeof(self.contextText), self.contextCursor);
+    item.label = self.contextText;
     if (index == 3) {
       item.sectionHeading = self.entry->pageContext ? tr(STR_ANNOTATION_PAGE_CONTEXT) : tr(STR_ANNOTATION_EXCERPT);
     }
@@ -77,25 +69,41 @@ void AnnotationEditorActivity::provideRow(void* context, const uint16_t index, f
 }
 
 void AnnotationEditorActivity::buildScreen(UiScreen& screen) {
-  const auto& metrics = UITheme::getInstance().getMetrics();
-  const Rect safe = UITheme::getInstance().getScreenSafeArea(renderer, true, false);
+  const Rect body = UITheme::getContentBounds(renderer);
   screen.setContentMarginFromScreen(
-      fui::Insets{static_cast<int16_t>(safe.y + metrics.topPadding + metrics.headerHeight),
-                  static_cast<int16_t>(renderer.getScreenWidth() - (safe.x + safe.width)),
-                  static_cast<int16_t>(renderer.getScreenHeight() - (safe.y + safe.height) + metrics.buttonHintsHeight),
-                  static_cast<int16_t>(safe.x)});
-  screen.spacer(static_cast<int16_t>(metrics.verticalSpacing));
+      fui::Insets{static_cast<int16_t>(body.y),
+                  static_cast<int16_t>(renderer.getScreenWidth() - (body.x + body.width)),
+                  static_cast<int16_t>(renderer.getScreenHeight() - (body.y + body.height)),
+                  static_cast<int16_t>(body.x)});
   if (!entry) {
-    screen.centeredText(tr(STR_ANNOTATION_LOAD_FAILED), screen.theme().bodyText);
+    auto style = screen.theme().bodyText;
+    style.align = fui::TextAlign::Center;
+    style.maxLines = 4;
+    screen.target().text(screen.body(), tr(STR_ANNOTATION_LOAD_FAILED), style);
     return;
   }
   fui::ListProps props;
   props.rowProvider = &AnnotationEditorActivity::provideRow;
   props.rowProviderCtx = this;
-  props.count = static_cast<uint16_t>(listCount());
+  props.labelText = screen.theme().bodyText;
+  props.labelText.maxLines = ReaderTextSlices::LINES;
+  props.subtitleText = screen.theme().smallText;
   props.action = ACTION_ROW;
   props.inputMask = fui::InputTouch;
-  props.labelText.maxLines = 3;
+  props.rowInset = 0;
+  props = screen.resolveListProps(props);
+  const int16_t strip = props.scrollIndicator
+                            ? std::max(0, props.scrollIndicatorWidth + props.scrollIndicatorInset + 2 - props.rowInset)
+                            : 0;
+  const int16_t width = static_cast<int16_t>(screen.body().width - 2 * (props.rowInset + props.sidePadding) - strip);
+  contextTarget = &screen.target();
+  if (width != contextWidth || contextStyle.font != props.labelText.font) {
+    contextWidth = std::max<int16_t>(1, width);
+    contextStyle = props.labelText;
+    contextCursor = {};
+    contextRowCount = ReaderTextSlices::count(*contextTarget, entry->excerpt.c_str(), contextStyle, contextWidth);
+  }
+  props.count = static_cast<uint16_t>(listCount());
   props.subtitleText.maxLines = 3;
   syncListViewport(screen, props);
   screen.list(props);

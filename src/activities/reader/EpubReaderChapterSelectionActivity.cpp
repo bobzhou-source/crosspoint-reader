@@ -1,9 +1,11 @@
 #include "EpubReaderChapterSelectionActivity.h"
 
+#include <Benchmark.h>
 #include <FontCacheManager.h>
 #include <GfxRenderer.h>
 #include <I18n.h>
 
+#include <algorithm>
 #include <string>
 
 #include "MappedInputManager.h"
@@ -15,10 +17,10 @@ namespace fui = freeink::ui;
 EpubReaderChapterSelectionActivity::EpubReaderChapterSelectionActivity(GfxRenderer& renderer,
                                                                        MappedInputManager& mappedInput,
                                                                        const std::shared_ptr<Epub>& epub,
-                                                                       const int currentSpineIndex)
+                                                                       const int currentTocIndex)
     : UiListActivity("EpubReaderChapterSelection", renderer, mappedInput),
       epub(epub),
-      currentSpineIndex(currentSpineIndex) {}
+      currentTocIndex(currentTocIndex) {}
 
 void EpubReaderChapterSelectionActivity::onEnter() {
   UiListActivity::onEnter();
@@ -40,7 +42,7 @@ void EpubReaderChapterSelectionActivity::onEnter() {
   // Start with the current chapter at the top of the viewport; the first
   // screen build pulls the viewport to it (ListNav follow-on-build) and
   // materializes the row window there (refreshTocWindow in buildScreen).
-  int tocIndex = epub->getTocIndexForSpineIndex(currentSpineIndex);
+  int tocIndex = currentTocIndex;
   if (tocIndex == -1) {
     tocIndex = 0;
   }
@@ -53,11 +55,22 @@ void EpubReaderChapterSelectionActivity::onEnter() {
 // CJK fallback glyphs -- one bounded SD pass per list page; repaints inside
 // the window stay RAM-only.
 void EpubReaderChapterSelectionActivity::refreshTocWindow(const int start) {
+  const uint64_t rowLoadStarted = benchmark::start();
   const int total = listCount();
+  const int visibleEnd = std::min(total, start + std::max(1, nav.visibleRows));
+  if (windowStart >= 0 && start >= windowStart && visibleEnd <= windowStart + windowCount) {
+    benchmark::span(benchmark::EventType::NavRows, rowLoadStarted,
+                    static_cast<uint32_t>(benchmark::NavRowsScreen::Contents), 1, 0);
+    return;
+  }
   int clamped = start;
   if (clamped > total - TOC_WINDOW) clamped = total - TOC_WINDOW;
   if (clamped < 0) clamped = 0;
-  if (clamped == windowStart) return;
+  if (clamped == windowStart) {
+    benchmark::span(benchmark::EventType::NavRows, rowLoadStarted,
+                    static_cast<uint32_t>(benchmark::NavRowsScreen::Contents), 1, 0);
+    return;
+  }
 
   windowCount = total - clamped < TOC_WINDOW ? total - clamped : TOC_WINDOW;
   for (int i = 0; i < windowCount; i++) {
@@ -66,10 +79,13 @@ void EpubReaderChapterSelectionActivity::refreshTocWindow(const int start) {
     windowLabels[i] = indent + tocItem.title;
     fui::ListItem item;
     item.label = windowLabels[i].c_str();
+    if (clamped + i == currentTocIndex) item.value = tr(STR_CURRENT_CHAPTER);
     item.actionValue = static_cast<int16_t>(clamped + i);
     windowItems[i] = item;
   }
   windowStart = clamped;
+  benchmark::span(benchmark::EventType::NavRows, rowLoadStarted,
+                  static_cast<uint32_t>(benchmark::NavRowsScreen::Contents), 0, static_cast<uint32_t>(windowCount));
 
   struct PrewarmCtx {
     const std::string* labels;
@@ -139,7 +155,10 @@ void EpubReaderChapterSelectionActivity::buildScreen(UiScreen& screen) {
     return;
   }
   if (listCount() == 0) {
-    screen.centeredText(tr(STR_NO_CHAPTERS), screen.theme().bodyText);
+    auto style = screen.theme().bodyText;
+    style.align = fui::TextAlign::Center;
+    style.maxLines = 4;
+    screen.target().text(screen.body().inset(fui::Insets{0, 20, 0, 20}), tr(STR_NO_CHAPTERS), style);
     return;
   }
 
@@ -147,6 +166,9 @@ void EpubReaderChapterSelectionActivity::buildScreen(UiScreen& screen) {
   props.count = static_cast<uint16_t>(listCount());
   props.action = ACTION_ROW;
   props.inputMask = fui::InputTouch;  // physical buttons stay in loop()
+  props.labelText = screen.theme().bodyText;
+  props.valueText = screen.theme().smallText;
+  props.labelText.maxLines = 2;
   syncListViewport(screen, props);
   // Materialize the row window for the final viewport (syncListViewport just
   // applied follow/clamping to nav.top) and hand list() the window with its
@@ -154,6 +176,7 @@ void EpubReaderChapterSelectionActivity::buildScreen(UiScreen& screen) {
   refreshTocWindow(nav.top);
   props.items = windowItems;
   props.itemsWindowFirst = static_cast<uint16_t>(windowStart);
+  props.itemsWindowCount = static_cast<uint16_t>(windowCount);
   screen.list(props);
 }
 

@@ -22,16 +22,11 @@ constexpr fui::ActionId ACTION_NEXT = 4;     // scrub row: next chapter
 constexpr fui::ActionId ACTION_SCRUB = 5;    // progress track: dragPermille along the book
 constexpr fui::ActionId ACTION_ROW = 6;      // panel list row, value = row index
 
-// Scrub row: two small round-cornered chapter buttons flanking a thin progress
-// track with a round knob -- the reading page's chrome is light, so the
-// controls stay slim rather than control-center sized.
-constexpr int16_t kScrubButton = 36;  // chapter step buttons (square)
-constexpr int16_t kScrubKnob = 16;    // round knob on the 2px progress track
-constexpr int16_t kScrubGap = 12;     // air between the buttons and the track
-// Tool row: a 24px glyph centred in each slot, the active slot in an outline
-// pill. The whole slot is the tap target; the row height sets its size.
-constexpr int16_t kToolRowH = 80;
-constexpr int16_t kToolPillInset = 10;
+// The visible progress track stays light; every touch band is at least 48px.
+constexpr int16_t kScrubButton = 48;
+constexpr int16_t kScrubKnob = 16;
+constexpr int16_t kScrubGap = 12;
+constexpr int16_t kToolInset = 8;
 constexpr int kToolCount = 3;
 // Bottom sheet height for the panels. ListNav fits whole rows in the remaining
 // list area; any spare pixels stay between the list and the switcher.
@@ -42,7 +37,7 @@ constexpr int kPanelHeightMaxPercent = 72;
 constexpr int kLandscapePanelHeightPercent = 88;
 }  // namespace
 
-ReaderToolbarUi::ReaderToolbarUi(GfxRenderer& renderer) : UiAppHost(renderer) {}
+ReaderToolbarUi::ReaderToolbarUi(GfxRenderer& renderer) : UiAppHost(renderer), renderer_(renderer) {}
 
 void ReaderToolbarUi::begin() {
   resetUi();
@@ -97,33 +92,57 @@ void ReaderToolbarUi::screenFn(UiScreen& screen, void* user) {
   }
 }
 
-// The Contents / Text / More row: three equal slots, an icon centred in each,
-// the active one inside an outline pill (the theme's control radius). Each
-// slot is registered as one tap target, so the row stays light (no filled
-// tiles, no labels -- the glyphs carry the meaning).
+std::string ReaderToolbarUi::rowValue(const int index) const {
+  if (model_.rowValue) return model_.rowValue(index);
+  return index == model_.currentRow ? std::string(tr(STR_CURRENT_CHAPTER)) : std::string();
+}
+
+int16_t ReaderToolbarUi::toolRowHeight(UiScreen& screen) const {
+  const auto& tokens = screen.theme();
+  const fui::Rect safe = screen.frame().safeRect();
+  const int16_t lineH = screen.target().lineHeight(tokens.smallText.font);
+  return safe.width > safe.height ? std::max<int16_t>(48, lineH + 2 * tokens.spaceSm)
+                                 : static_cast<int16_t>(24 + 2 * lineH + 3 * tokens.spaceSm);
+}
+
+// Paint and touch use the same full slots, including the final remainder.
 void ReaderToolbarUi::buildToolRow(UiScreen& screen, const fui::LayoutAnchor anchor, const int16_t sideInset) {
   const auto& tokens = screen.theme();
   const fui::BitmapRef icons[kToolCount] = {fui::bitmapFromIcon(icon_reader_contents_24),
                                             fui::bitmapFromIcon(icon_reader_text_24),
                                             fui::bitmapFromIcon(icon_reader_more_24)};
-  // sideInset absorbs the difference between the two hosts' content bands
-  // (the toolbar's is spaceLg-inset, the panel's is full width): the slots
-  // must land on the same x either way, or the icons jump when a tap swaps
-  // the toolbar for a panel.
-  const fui::Rect row = screen.take(anchor, kToolRowH).inset(fui::Insets{0, sideInset, 0, sideInset});
-  const int16_t slotW = static_cast<int16_t>(row.width / kToolCount);
-  // Theme radius as-is (the frontlight panel pattern); the fill clamps to
-  // the shape's own height so round themes cannot overshoot.
-  const uint8_t pillRadius = tokens.controlRadius;
+  constexpr StrId labels[kToolCount] = {StrId::STR_TOOL_CONTENTS, StrId::STR_TOOL_TEXT, StrId::STR_TOOL_MORE};
+  const bool landscape = screen.frame().safeRect().width > screen.frame().safeRect().height;
+  fui::TextStyle labelStyle = tokens.smallText;
+  labelStyle.align = fui::TextAlign::Center;
+  labelStyle.maxLines = landscape ? 1 : 2;
+  const fui::Rect row = screen.take(anchor, toolRowHeight(screen)).inset(fui::Insets{0, sideInset, 0, sideInset});
+  const fui::Paint ink = fui::Paint::solid(fui::Color::Black);
+  screen.target().fill(fui::Rect{row.x, row.y, row.width, 1}, ink);
   for (int i = 0; i < kToolCount; ++i) {
-    const fui::Rect slot{static_cast<int16_t>(row.x + slotW * i), row.y, slotW, row.height};
+    const int column = UITheme::isRtl() ? kToolCount - 1 - i : i;
+    const int16_t left = static_cast<int16_t>(row.x + row.width * column / kToolCount);
+    const int16_t right = static_cast<int16_t>(row.x + row.width * (column + 1) / kToolCount);
+    const fui::Rect slot{left, row.y, static_cast<int16_t>(right - left), row.height};
     if (i == model_.activeTool) {
-      screen.target().stroke(slot.inset(fui::Insets{4, kToolPillInset, 4, kToolPillInset}),
-                             fui::Paint::solid(fui::Color::Black), 2, pillRadius);
+      screen.target().fill(fui::Rect{static_cast<int16_t>(slot.x + kToolInset),
+                                     static_cast<int16_t>(slot.bottom() - 2),
+                                     static_cast<int16_t>(slot.width - 2 * kToolInset), 2}, ink);
     }
-    const fui::Rect iconRect{static_cast<int16_t>(slot.x + (slot.width - 24) / 2),
-                             static_cast<int16_t>(slot.y + (slot.height - 24) / 2), 24, 24};
+    fui::Rect textRect = slot.inset(fui::Insets{tokens.spaceSm, kToolInset, tokens.spaceSm, kToolInset});
+    fui::Rect iconRect{static_cast<int16_t>(slot.x + (slot.width - 24) / 2),
+                       static_cast<int16_t>(slot.y + tokens.spaceSm), 24, 24};
+    if (landscape) {
+      iconRect.x = UITheme::isRtl() ? static_cast<int16_t>(textRect.right() - 24) : textRect.x;
+      iconRect.y = static_cast<int16_t>(slot.y + (slot.height - 24) / 2);
+      textRect.width = static_cast<int16_t>(textRect.width - 24 - tokens.spaceSm);
+      if (!UITheme::isRtl()) textRect.x = static_cast<int16_t>(textRect.x + 24 + tokens.spaceSm);
+    } else {
+      textRect.y = static_cast<int16_t>(iconRect.bottom() + tokens.spaceSm);
+      textRect.height = static_cast<int16_t>(slot.bottom() - tokens.spaceSm - textRect.y);
+    }
     screen.target().bitmap(iconRect, icons[i], fui::BitmapMode::Center);
+    screen.target().text(textRect, I18N.get(labels[i]), labelStyle);
     screen.frame().hit(slot, ACTION_TOOL, static_cast<int16_t>(i), fui::InputTouch);
   }
 }
@@ -136,19 +155,18 @@ void ReaderToolbarUi::buildToolbar(UiScreen& screen) {
   // track and its chapter buttons don't crowd the meta line).
   const int16_t metaH = screen.target().lineHeight(tokens.smallText.font);
   const int16_t contentH = static_cast<int16_t>(tokens.spaceMd + kScrubButton + tokens.spaceLg + metaH +
-                                                tokens.spaceSm + kToolRowH + tokens.spaceSm);
+                                                tokens.spaceSm + toolRowHeight(screen) + tokens.spaceSm);
   fui::SheetProps sheetProps;
   sheetProps.anchor = fui::SheetEdge::Bottom;
   sheetProps.dismissAction = ACTION_DISMISS;
-  // Grabber air matches the frontlight panel's card language (spaceLg around
-  // the grabber, spaceMd more toward the free edge) so the two sheets read as
-  // the same family.
-  sheetProps.grabberMargin = tokens.spaceLg;
-  sheetProps.grabberInset = static_cast<int16_t>(tokens.spaceLg + tokens.spaceMd);
+  sheetProps.ruleWidth = 1;
+  sheetProps.grabberHeight = 2;
+  sheetProps.grabberMargin = tokens.spaceMd;
+  sheetProps.grabberInset = tokens.spaceMd;
   const int16_t grabberBand =
       static_cast<int16_t>(sheetProps.grabberMargin + sheetProps.grabberHeight + sheetProps.grabberInset);
   screen.sheet(sheetProps, static_cast<int16_t>(contentH + grabberBand));
-  screen.insetContent(fui::Insets{0, tokens.spaceLg, 0, tokens.spaceLg});
+  screen.insetContent(fui::Insets{0, tokens.headerSidePadding, 0, tokens.headerSidePadding});
   screen.spacer(tokens.spaceMd);
 
   // Scrub row: < [progress track + knob: tap/drag to jump] >
@@ -158,57 +176,50 @@ void ReaderToolbarUi::buildToolbar(UiScreen& screen) {
     stepProps_.icon = fui::bitmapFromIcon(icon_reader_back_24);
     stepProps_.action = ACTION_PREV;
     stepProps_.inputMask = fui::InputTouch;
-    stepProps_.styles.explicitlySet = true;
-    stepProps_.styles.normal.background = fui::Paint::solid(fui::Color::White);
-    stepProps_.styles.normal.foreground = fui::Paint::solid(fui::Color::Black);
-    stepProps_.styles.normal.border = fui::Paint::solid(fui::Color::Black);
-    stepProps_.styles.normal.borderWidth = 1;
-    stepProps_.styles.normal.radius = tokens.controlRadius;
-    stepProps_.styles.selected = stepProps_.styles.normal;
-    stepProps_.styles.focused = stepProps_.styles.normal;
-    stepProps_.styles.disabled = stepProps_.styles.normal;
-    stepProps_.styles.active = stepProps_.styles.normal;
-    stepProps_.styles.active.background = fui::Paint::solid(fui::Color::Black);
-    stepProps_.styles.active.foreground = fui::Paint::solid(fui::Color::White);
+    stepProps_.styles = tokens.button;
     screen.button(stepProps_, fui::Rect{band.x, band.y, kScrubButton, kScrubButton});
     stepProps_.icon = fui::bitmapFromIcon(icon_reader_next_24);
     stepProps_.action = ACTION_NEXT;
     screen.button(stepProps_,
                   fui::Rect{static_cast<int16_t>(band.right() - kScrubButton), band.y, kScrubButton, kScrubButton});
 
-    // Progress: a 2px track with a solid round knob at the book position (the
-    // fill edge IS the handle, so nothing else is drawn), the scrub hit rect
-    // spanning the whole band height so a finger a little off the line still
-    // scrubs. Tap-to-jump / drag arrive as dragPermille along this rect.
+    // The full-height drag band shares its horizontal endpoints with the
+    // thin track; the square handle marks book position without a fill slab.
     const int16_t trackX = static_cast<int16_t>(band.x + kScrubButton + kScrubGap);
     const int16_t trackW = static_cast<int16_t>(band.width - 2 * (kScrubButton + kScrubGap));
     const int16_t trackY = static_cast<int16_t>(band.y + band.height / 2);
     const fui::Paint ink = fui::Paint::solid(fui::Color::Black);
     screen.target().fill(fui::Rect{trackX, static_cast<int16_t>(trackY - 1), trackW, 2}, ink);
     const int permille = std::clamp(model_.progressPermille, 0, 1000);
-    const int16_t knobX = static_cast<int16_t>(trackX + (static_cast<int32_t>(trackW - 1) * permille) / 1000);
-    screen.target().fill(fui::Rect{static_cast<int16_t>(knobX - kScrubKnob / 2),
-                                   static_cast<int16_t>(trackY - kScrubKnob / 2), kScrubKnob, kScrubKnob},
-                         ink, static_cast<uint8_t>(kScrubKnob / 2));
+    const int16_t knobX =
+        static_cast<int16_t>(trackX + (static_cast<int32_t>(trackW - kScrubKnob) * permille) / 1000);
+    screen.target().fill(fui::Rect{knobX, static_cast<int16_t>(trackY - kScrubKnob / 2),
+                                   kScrubKnob, kScrubKnob},
+                         ink, tokens.controlRadius);
     screen.frame().hit(fui::Rect{trackX, band.y, trackW, band.height}, ACTION_SCRUB, 0,
                        fui::InputTouch | fui::InputDrag);
   }
 
-  // Meta line: chapter title (left), chapter page / book percent (right).
+  // Chapter title and progress have separate, mirrored lanes.
   {
     const fui::Rect line = screen.takeTop(metaH, tokens.spaceSm);
     fui::TextStyle titleStyle = tokens.smallText;
-    titleStyle.bold = true;
+    titleStyle.align = UITheme::isRtl() ? fui::TextAlign::Right : fui::TextAlign::Left;
     fui::TextStyle infoStyle = tokens.smallText;
-    infoStyle.align = fui::TextAlign::Right;
-    const int16_t infoW =
-        model_.pageInfo ? screen.target().measureText(infoStyle.font, model_.pageInfo, infoStyle).width : 0;
-    const fui::Rect titleRect{line.x, line.y, static_cast<int16_t>(line.width - infoW - tokens.spaceMd), line.height};
+    infoStyle.align = UITheme::isRtl() ? fui::TextAlign::Left : fui::TextAlign::Right;
+    const int16_t infoW = model_.pageInfo
+        ? std::min<int16_t>(line.width / 2, screen.target().measureText(infoStyle.font, model_.pageInfo, infoStyle).width)
+        : 0;
+    const int16_t titleW = std::max<int16_t>(0, line.width - infoW - tokens.spaceMd);
+    const fui::Rect titleRect{UITheme::isRtl() ? static_cast<int16_t>(line.right() - titleW) : line.x,
+                              line.y, titleW, line.height};
+    const fui::Rect infoRect{UITheme::isRtl() ? line.x : static_cast<int16_t>(line.right() - infoW),
+                             line.y, infoW, line.height};
     if (model_.chapterTitle) screen.target().text(titleRect, model_.chapterTitle, titleStyle);
-    if (model_.pageInfo) screen.target().text(line, model_.pageInfo, infoStyle);
+    if (model_.pageInfo) screen.target().text(infoRect, model_.pageInfo, infoStyle);
   }
 
-  buildToolRow(screen, fui::LayoutAnchor::Top, 0);  // content band already spaceLg-inset
+  buildToolRow(screen, fui::LayoutAnchor::Top, 0);
 }
 
 void ReaderToolbarUi::buildPanel(UiScreen& screen) {
@@ -218,25 +229,34 @@ void ReaderToolbarUi::buildPanel(UiScreen& screen) {
   fui::SheetProps sheetProps;
   sheetProps.anchor = fui::SheetEdge::Bottom;
   sheetProps.dismissAction = ACTION_DISMISS;  // tap the page above the sheet = back to the toolbar
-  // Same grabber air as the toolbar sheet / frontlight panel.
-  sheetProps.grabberMargin = tokens.spaceLg;
-  sheetProps.grabberInset = static_cast<int16_t>(tokens.spaceLg + tokens.spaceMd);
+  sheetProps.ruleWidth = 1;
+  sheetProps.grabberHeight = 2;
+  sheetProps.grabberMargin = tokens.spaceMd;
+  sheetProps.grabberInset = tokens.spaceMd;
 
-  // Size the sheet to an exact number of list rows instead of a fixed screen
-  // share: a percentage leaves up to a row's height of dead space above the
-  // switcher, and a short list (Text, More) leaves empty row slots. Chrome =
-  // everything in the sheet that is not the list; the row count starts from
-  // the target share, grows one row when that still fits the cap, and shrinks
-  // to the item count when the list is shorter than the space.
-  const int16_t titleH = screen.target().lineHeight(tokens.titleText.font);
-  const int16_t rowH =
-      model_.denseRows ? static_cast<int16_t>(UITheme::getInstance().getMetrics().listRowHeight) : tokens.rowHeight;
+  // Size the sheet to whole list rows instead of a fixed screen share: a
+  // percentage leaves up to a row's height of dead space above the switcher,
+  // and a short list (Text, More) leaves empty row slots. Chrome = everything
+  // in the sheet that is not the list; the row count starts from the target
+  // share and grows one row when that still fits the cap. A list that fits
+  // shrinks to its rows' measured (wrapped) heights.
+  uiTarget.setFont(fui::GfxRendererTarget::FONT_TITLE, GUI.titleFontId(renderer_, model_.panelTitle));
+  fui::TextStyle titleStyle = tokens.titleText;
+  titleStyle.bold = false;
+  titleStyle.align = UITheme::isRtl() ? fui::TextAlign::Right : fui::TextAlign::Left;
+  titleStyle.maxLines = 2;
+  const int16_t indicatorW = screen.target().measureText(tokens.smallText.font, "999/999", tokens.smallText).width;
+  const int16_t titleW = static_cast<int16_t>(safe.width - 2 * tokens.headerSidePadding - indicatorW - tokens.spaceMd);
+  const int16_t titleH = std::max(screen.target().lineHeight(titleStyle.font),
+                                 fui::measureWrappedText(screen.target(), model_.panelTitle, titleStyle, titleW).height);
+  const int16_t rowH = std::max<int16_t>(
+      48, model_.denseRows ? static_cast<int16_t>(UITheme::getInstance().getMetrics().listRowHeight) : tokens.rowHeight);
   const int16_t rowGap = model_.denseRows ? tokens.listRowGap : std::max(tokens.listRowGap, tokens.listTouchRowGap);
   const int16_t rowStride = static_cast<int16_t>(rowH + rowGap);
   const int16_t grabberBand =
       static_cast<int16_t>(sheetProps.grabberMargin + sheetProps.grabberHeight + sheetProps.grabberInset);
   const int16_t chrome =
-      static_cast<int16_t>(grabberBand + titleH + tokens.spaceMd + tokens.spaceSm + kToolRowH + tokens.spaceSm);
+      static_cast<int16_t>(grabberBand + titleH + tokens.spaceMd + tokens.spaceSm + toolRowHeight(screen) + tokens.spaceSm);
   const bool landscape = safe.width > safe.height;
   const int16_t target =
       static_cast<int16_t>((safe.height * (landscape ? kLandscapePanelHeightPercent : kPanelHeightPercent)) / 100);
@@ -244,45 +264,76 @@ void ReaderToolbarUi::buildPanel(UiScreen& screen) {
       static_cast<int16_t>((safe.height * (landscape ? kLandscapePanelHeightPercent : kPanelHeightMaxPercent)) / 100);
   int sheetRows = (target - chrome + rowGap) / rowStride;
   if (static_cast<int16_t>(chrome + (sheetRows + 1) * rowStride - rowGap) <= cap) ++sheetRows;
-  if (model_.itemCount > 0 && sheetRows > model_.itemCount) sheetRows = model_.itemCount;
+  const int count = std::max(0, model_.itemCount);
+  if (count > 0 && sheetRows > count) sheetRows = count;
   if (sheetRows < 1) sheetRows = 1;
-  screen.sheet(sheetProps, static_cast<int16_t>(chrome + sheetRows * rowStride - rowGap));
+
+  listProps_.count = static_cast<uint16_t>(count);
+  listProps_.action = ACTION_ROW;
+  listProps_.inputMask = fui::InputTouch;  // physical buttons stay with the reader
+  listProps_.rowHeight = rowH;
+  listProps_.rowGap = rowGap;
+  listProps_.labelText = tokens.bodyText;
+  listProps_.labelText.maxLines = 2;
+  listProps_.valueText = tokens.smallText;
+  listProps_.sidePadding = 0;
+  listProps_.rowInset = tokens.headerSidePadding;
+
+  // A two-line label grows its row by one line. The band always holds one
+  // such row; a row taller than the band could never be drawn or reached.
+  const int16_t labelLh = screen.target().lineHeight(listProps_.labelText.font);
+  const int16_t tallestRow = static_cast<int16_t>(2 * labelLh > rowH ? rowH + labelLh : rowH);
+  int16_t listH = std::max<int16_t>(static_cast<int16_t>(sheetRows * rowStride - rowGap), tallestRow);
+  // Rows materialised into window slots 0.. while sizing; the window reuses them.
+  int sizedRows = 0;
+  if (count > 0 && count == sheetRows && count <= kMaxWindow) {
+    // Measure at list()'s row width: band minus row insets and the scroll
+    // strip a nav-managed list always reserves.
+    const int16_t strip = listProps_.scrollIndicator
+                              ? static_cast<int16_t>(std::max(
+                                    0, tokens.listScrollWidth + tokens.listScrollInset + 2 - listProps_.rowInset))
+                              : 0;
+    const int16_t rowW = static_cast<int16_t>(safe.width - 2 * listProps_.rowInset - strip);
+    const int16_t room = std::max<int16_t>(static_cast<int16_t>(cap - chrome), tallestRow);
+    int16_t fitted = 0;
+    bool clipped = false;
+    for (int i = 0; i < count; ++i) {
+      windowLabels_[i] = model_.rowText ? model_.rowText(i) : std::string();
+      windowValues_[i] = rowValue(i);
+      fui::ListItem item;
+      item.label = windowLabels_[i].c_str();
+      item.value = windowValues_[i].empty() ? nullptr : windowValues_[i].c_str();
+      const int16_t next = static_cast<int16_t>(
+          fitted + (i > 0 ? rowGap : 0) + fui::measureListRow(screen.target(), nullptr, rowW, listProps_, item).height);
+      if (next > room) clipped = true;
+      if (!clipped) fitted = next;
+    }
+    sizedRows = count;
+    // Rows past the cap scroll; the band still holds at least the first row.
+    listH = clipped ? std::max(fitted, tallestRow) : fitted;
+  }
+  screen.sheet(sheetProps, static_cast<int16_t>(chrome + listH));
   // No blanket side inset: Screen::list() draws in the content band, and the
   // scroll track must reach the sheet's edge like a full-screen list's does.
   // The title insets itself; the rows inset via rowInset below.
 
   // Title line: panel name left, page position right when the list spans pages.
   {
-    fui::TextStyle titleStyle = tokens.titleText;
-    titleStyle.bold = true;
-    const fui::Rect line =
-        screen.takeTop(titleH, tokens.spaceMd).inset(fui::Insets{0, tokens.spaceLg, 0, tokens.spaceLg});
-    screen.target().text(line, model_.panelTitle, titleStyle);
-    // Filled in below once the viewport is known; reserve the rect now.
-    pageIndicatorRect_ = line;
+    const fui::Rect line = screen.takeTop(titleH, tokens.spaceMd).inset(
+        fui::Insets{0, tokens.headerSidePadding, 0, tokens.headerSidePadding});
+    const fui::Rect titleRect{UITheme::isRtl() ? static_cast<int16_t>(line.right() - titleW) : line.x,
+                              line.y, titleW, line.height};
+    screen.target().text(titleRect, model_.panelTitle, titleStyle);
+    pageIndicatorRect_ = fui::Rect{UITheme::isRtl() ? line.x : static_cast<int16_t>(line.right() - indicatorW),
+                                   line.y, indicatorW, line.height};
   }
 
   // Switcher row along the sheet's bottom edge; the list takes what is left.
   screen.spacer(tokens.spaceSm, fui::LayoutAnchor::Bottom);
-  buildToolRow(screen, fui::LayoutAnchor::Bottom, tokens.spaceLg);  // full-width band
+  buildToolRow(screen, fui::LayoutAnchor::Bottom, tokens.headerSidePadding);
   screen.spacer(tokens.spaceSm, fui::LayoutAnchor::Bottom);
 
-  listProps_.count = static_cast<uint16_t>(std::max(0, model_.itemCount));
-  listProps_.action = ACTION_ROW;
-  listProps_.inputMask = fui::InputTouch;  // physical buttons stay with the reader
-  listProps_.rowHeight = rowH;
-  listProps_.rowGap = rowGap;
-  // The label column starts flush with the panel title (no list-side padding
-  // on top of the sheet's own inset). Body-size text: small reads condensed
-  // and the taller row doubles as the tap target.
-  listProps_.labelText = tokens.bodyText;
-  listProps_.sidePadding = 0;
-  // The list band spans the sheet's full width -- the scroll track hugs the
-  // panel edge (theme bezel inset included) exactly like a full-screen list.
-  // rowInset pulls the rows back to the title's spaceLg alignment.
-  listProps_.rowInset = tokens.spaceLg;
   const fui::Rect listRect = screen.body();
-  const int count = std::max(0, model_.itemCount);
   // The nav owns selection + viewport (same fui::ListNav idiom as the list
   // menu screens). A shown cursor re-follows into view on every build; a
   // hidden one (-1, touch) leaves the viewport where scrolling put it.
@@ -295,8 +346,10 @@ void ReaderToolbarUi::buildPanel(UiScreen& screen) {
   const int windowCount = std::min({nav_.visibleRows, count - nav_.top, kMaxWindow});
   for (int i = 0; i < windowCount; ++i) {
     const int index = nav_.top + i;
-    windowLabels_[i] = model_.rowText ? model_.rowText(index) : std::string();
-    windowValues_[i] = model_.rowValue ? model_.rowValue(index) : std::string();
+    if (index != i || i >= sizedRows) {
+      windowLabels_[i] = model_.rowText ? model_.rowText(index) : std::string();
+      windowValues_[i] = rowValue(index);
+    }
     fui::ListItem item;
     item.label = windowLabels_[i].c_str();
     item.value = windowValues_[i].empty() ? nullptr : windowValues_[i].c_str();
@@ -306,8 +359,6 @@ void ReaderToolbarUi::buildPanel(UiScreen& screen) {
   listProps_.items = windowItems_;
   listProps_.itemsWindowFirst = static_cast<uint16_t>(nav_.top);
   listProps_.itemsWindowCount = static_cast<uint16_t>(std::max(0, windowCount));
-  listProps_.valueText = tokens.bodyText;
-  listProps_.valueText.bold = true;
   if (count > 0) {
     screen.list(listProps_);
   }
@@ -318,7 +369,7 @@ void ReaderToolbarUi::buildPanel(UiScreen& screen) {
     char buf[16];
     snprintf(buf, sizeof(buf), "%d/%d", nav_.top / pageRows + 1, totalPages);
     fui::TextStyle pageStyle = tokens.smallText;
-    pageStyle.align = fui::TextAlign::Right;
+    pageStyle.align = UITheme::isRtl() ? fui::TextAlign::Left : fui::TextAlign::Right;
     screen.target().text(pageIndicatorRect_, buf, pageStyle);
   }
 }

@@ -23,7 +23,7 @@ inline freeink::ui::ThemeTokens uiThemeTokens(const freeink::ui::GfxRendererTarg
   tokens.listSidePadding = static_cast<int16_t>(metrics.listSidePadding);
   tokens.listSelectionStyle = static_cast<fui::SelectionStyle>(metrics.listSelectionStyle);
   tokens.listScrollWidth = static_cast<int16_t>(metrics.listScrollWidth);
-  tokens.listScrollSide = static_cast<uint8_t>(metrics.listScrollSide);
+  tokens.listScrollSide = static_cast<uint8_t>(UITheme::isRtl() ? 1 - metrics.listScrollSide : metrics.listScrollSide);
   // No extra scroll-track inset: the bezel is already compensated once at the
   // frame level (GfxRendererTarget::deviceContext() feeds the board's
   // viewable insets into the fui safe area, and every list band derives from
@@ -37,11 +37,28 @@ inline freeink::ui::ThemeTokens uiThemeTokens(const freeink::ui::GfxRendererTarg
   tokens.headerSidePadding = static_cast<int16_t>(metrics.headerSidePadding);
   tokens.headerUnderline = static_cast<uint8_t>(metrics.headerUnderlineSize);
   tokens.headerTitleAlign = static_cast<fui::TextAlign>(metrics.headerTitleAlign);
+  if (UITheme::isRtl() && tokens.headerTitleAlign == fui::TextAlign::Left) {
+    tokens.headerTitleAlign = fui::TextAlign::Right;
+  }
   // Control-panel shape (sheet corners, tiles, step buttons, capsule slider),
   // so the control center follows the theme like every list and header does.
   tokens.controlRadius = static_cast<uint8_t>(metrics.controlRadius);
   tokens.sheetRadius = static_cast<uint8_t>(metrics.sheetRadius);
   tokens.capsuleRadius = static_cast<uint8_t>(metrics.capsuleRadius);
   tokens.bodyText.bold = metrics.listTitleBold;
+  tokens.titleText.bold = false;
+  tokens.smallText.bold = false;
+  if (metrics.listSelectionStyle == static_cast<int>(fui::SelectionStyle::Underline)) {
+    tokens.listMinRowHeight = static_cast<int16_t>(metrics.listRowHeight);
+    tokens.listTouchRowGap = 0;
+    tokens.button.focused = tokens.button.selected;
+    tokens.button.disabled = tokens.button.normal;
+    tokens.key.focused = tokens.key.selected;
+    tokens.key.disabled = tokens.key.normal;
+    tokens.listRow.focused = tokens.listRow.normal;
+    tokens.listRow.disabled = tokens.listRow.normal;
+    tokens.textField.focused = tokens.textField.selected;
+    tokens.textField.disabled = tokens.textField.normal;
+  }
   return tokens;
 }

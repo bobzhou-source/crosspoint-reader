@@ -67,9 +67,15 @@ struct FilePathResult {
   std::string path;
 };
 
+enum class BenchmarkOutcome : uint8_t { Complete, Cancelled, LoadFailed, RenderFailed, NoProgress, Timeout, RecorderFailed };
+
+struct BenchmarkResult {
+  BenchmarkOutcome outcome = BenchmarkOutcome::Cancelled;
+};
+
 using ResultVariant =
     std::variant<std::monostate, WifiResult, KeyboardResult, MenuResult, ChapterResult, PercentResult, IntervalResult,
-                 PageResult, ProgressChangeResult, NetworkModeResult, FootnoteResult, FilePathResult>;
+                 PageResult, ProgressChangeResult, NetworkModeResult, FootnoteResult, FilePathResult, BenchmarkResult>;
 
 struct ActivityResult {
   bool isCancelled = false;

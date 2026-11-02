@@ -15,16 +15,17 @@ import time
 import uuid
 from dataclasses import dataclass
 from pathlib import Path
-from urllib.parse import urlsplit
+from urllib.parse import parse_qs, urlsplit
 
 from .cache import Cache
 from .common import ReaderError, atomic_write, bounded_read, digest
 
 DEFAULT_ORIGIN = "https://robertzhou.dev"
-MAX_EPUB = 1024 * 1024
+MAX_EPUB = 8 * 1024 * 1024
 MAX_METADATA = 16 * 1024
 MAX_ANNOTATION_BODY = 64 * 1024
 MAX_RESPONSE = 12 * 1024 * 1024
+MAX_GONE_BODY = 256
 MAX_SAFE_INTEGER = 2**53 - 1
 UUID_PATTERN = re.compile(r"[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}")
 HEX_PATTERN = re.compile(r"[0-9a-f]{64}")
@@ -119,7 +120,7 @@ def validate_item(item: dict) -> dict:
 
 def validate_epub(data: bytes) -> None:
     if len(data) > MAX_EPUB:
-        raise ReaderError("Cloud EPUB exceeds 1 MiB; use LocalSend/USB instead. Bytes are never truncated or recompressed")
+        raise ReaderError("Cloud EPUB exceeds 8 MiB; use LocalSend/USB instead. Bytes are never truncated or recompressed")
     if (len(data) < 58 or data[:4] != b"PK\x03\x04" or struct.unpack_from("<H", data, 6)[0] & 1
             or struct.unpack_from("<H", data, 8)[0] != 0 or struct.unpack_from("<HH", data, 26) != (8, 0)
             or data[30:58] != b"mimetypeapplication/epub+zip"):
@@ -132,7 +133,7 @@ def prepare_push(cache: Cache, cache_id: str, source_path: str | None = None) ->
         raise ReaderError("No cached article with this ID; convert/fetch locally before cloud push")
     path = Path(record["path"])
     if path.stat().st_size > MAX_EPUB:
-        raise ReaderError("Cloud EPUB exceeds 1 MiB; use LocalSend/USB instead. Bytes are never truncated or recompressed")
+        raise ReaderError("Cloud EPUB exceeds 8 MiB; use LocalSend/USB instead. Bytes are never truncated or recompressed")
     data = bounded_read(path, MAX_EPUB)
     validate_epub(data)
     checksum = digest(data)
@@ -167,8 +168,12 @@ def https_request(origin: str, method: str, route: str, body: bytes, headers: di
         response = connection.getresponse()
         response_headers = {key.lower(): value for key, value in response.getheaders()}
         if response.status >= 300:
-            # Error bodies (including large WAF pages) are neither needed nor echoed.
-            return Response(response.status, {}, b"")
+            # Error bodies (including large WAF pages) are neither needed nor echoed. Only a 410
+            # keeps a body, and only a complete one of at most MAX_GONE_BODY bytes, so the caller
+            # can tell the server's "content released" confirmation from any other 410. One byte
+            # more is read to detect an overlong body, which is dropped, never truncated.
+            body = response.read(MAX_GONE_BODY + 1) if response.status == 410 else b""
+            return Response(response.status, {}, body if len(body) <= MAX_GONE_BODY else b"")
         limit = max_bytes
         length = response_headers.get("content-length")
         if length is not None and (len(length) > 16 or not length.isascii() or not length.isdecimal() or int(length) > limit):
@@ -188,6 +193,33 @@ def https_request(origin: str, method: str, route: str, body: bytes, headers: di
         connection.close()
 
 
+def _items_query_route(route: str) -> bool:
+    """Allow only the bounded item-list query parameters used for pagination."""
+    if not route.startswith("/reader/items?"):
+        return False
+    query = route.split("?", 1)[1]
+    params = parse_qs(query, keep_blank_values=True)
+    if set(params) - {"after", "limit", "state"} or any(len(values) != 1 for values in params.values()):
+        return False
+    if "state" in params and params["state"][0] not in {"active", "ready", "uploading", "consumed", "all"}:
+        return False
+    if "limit" in params and not re.fullmatch(r"[1-9][0-9]*", params["limit"][0]):
+        return False
+    if "after" in params and not re.fullmatch(r"[0-9a-f-]{36}", params["after"][0]):
+        return False
+    return True
+
+
+# The reader server answers GET .../content with exactly this 410 body only when the item is
+# consumed: another client acknowledged it, the server released its bytes, and only the
+# metadata receipt remains.
+CONTENT_RELEASED = {"error": "content released"}
+
+
+class CloudContentReleased(ReaderError):
+    """The server confirmed an item listed as ready was acknowledged before its download."""
+
+
 class CloudClient:
     def __init__(self, origin=DEFAULT_ORIGIN, timeout=30, *, transport=None, clock=None, nonce=None):
         self.origin = origin_url(origin)
@@ -201,10 +233,12 @@ class CloudClient:
         self._transport = transport or https_request
         self._clock = clock or time.time
         self._nonce = nonce or (lambda: secrets.token_hex(16))
+        self.requests = 0  # authenticated requests sent; callers budget against the server's 60/minute allowance
 
     def request(self, method, route, body=b"", content_type=None, *, expected=(200,), max_bytes=MAX_RESPONSE):
         if (method not in {"GET", "POST", "PUT", "DELETE"}
-                or not re.fullmatch(r"/reader/(?:items(?:/[0-9a-f-]{36}(?:/(?:content|ack))?)?|annotations(?:/export)?)(?:\?after=(?:0|[1-9][0-9]*)&limit=[1-9][0-9]*)?", route)
+                or not (re.fullmatch(r"/reader/(?:items(?:/[0-9a-f-]{36}(?:/(?:content|ack))?)?|annotations(?:/export)?)(?:\?after=(?:0|[1-9][0-9]*)&limit=[1-9][0-9]*)?|/reader/links(?:\?limit=(?:[1-9]|[1-5][0-9]|6[0-4]))?|/reader/links/[0-9a-f]{64}/ack", route)
+                        or _items_query_route(route))
                 or type(body) is not bytes):
             raise ReaderError("Invalid cloud request method, route or byte body")
         timestamp = str(int(self._clock()))
@@ -219,6 +253,7 @@ class CloudClient:
                    "Content-Length": str(len(body))}
         if content_type:
             headers["Content-Type"] = content_type
+        self.requests += 1
         response = self._transport(self.origin, method, route, body, headers, self.timeout, max_bytes)
         if 300 <= response.status < 400:
             raise ReaderError("Cloud redirect refused; verify --origin. Credentials were not forwarded")
@@ -248,16 +283,43 @@ class CloudClient:
             raise ReaderError("Cloud response must be a JSON object")
         return value
 
-    def items(self, *, ready_only=False) -> list[dict]:
-        records = self.json_request("GET", "/reader/items").get("items")
-        if not isinstance(records, list) or len(records) > 64:
-            raise ReaderError("Invalid cloud inbox list (expected at most 64 items)")
-        seen = set()
-        for record in records:
-            validate_item(record)
-            if record.get("state") not in ("uploading", "ready", "consumed") or record["id"] in seen:
-                raise ReaderError("Cloud inbox has invalid states or duplicate IDs")
-            seen.add(record["id"])
+    def items(self, *, ready_only=False, include_all=False) -> list[dict]:
+        records: list[dict] = []
+        seen_items: set[str] = set()
+        used_cursors: set[str] = set()
+        after = None
+        state = "all" if include_all else "active"
+        while True:
+            route = f"/reader/items?state={state}&limit=64"
+            if after is not None:
+                route = f"/reader/items?after={after}&limit=64&state={state}"
+            payload = self.json_request("GET", route)
+            batch = payload.get("items")
+            has_more = payload.get("has_more")
+            next_after = payload.get("next_after")
+            if not isinstance(batch, list) or len(batch) > 64:
+                raise ReaderError("Invalid cloud inbox list (expected at most 64 items)")
+            if not isinstance(has_more, bool):
+                raise ReaderError("Invalid cloud inbox pagination state")
+            for record in batch:
+                validate_item(record)
+                if record.get("state") not in ("uploading", "ready", "consumed") or record["id"] in seen_items:
+                    raise ReaderError("Cloud inbox has invalid states or duplicate IDs")
+                seen_items.add(record["id"])
+                records.append(record)
+                if len(records) > 4096:
+                    raise ReaderError("Cloud inbox has more than 4096 items; narrow the inbox before syncing")
+            if not has_more:
+                if next_after is not None:
+                    raise ReaderError("Cloud inbox pagination returned a cursor without more items")
+                break
+            if isinstance(next_after, str) and next_after in used_cursors:
+                raise ReaderError("Cloud inbox pagination repeated a cursor")
+            if (not batch or not isinstance(next_after, str) or UUID_PATTERN.fullmatch(next_after) is None
+                    or next_after != batch[-1]["id"]):
+                raise ReaderError("Cloud inbox pagination did not return the last item as its next cursor")
+            used_cursors.add(next_after)
+            after = next_after
         return [record for record in records if record["state"] == "ready"] if ready_only else records
 
     def push(self, metadata: dict, data: bytes) -> dict:
@@ -268,7 +330,9 @@ class CloudClient:
         raw = json_bytes(metadata)
         if len(raw) > MAX_METADATA:
             raise ReaderError("Cloud metadata exceeds 16 KiB")
-        self._item_response(self.json_request("POST", "/reader/items", raw, expected=(200, 201)), metadata)
+        item = self._item_response(self.json_request("POST", "/reader/items", raw, expected=(200, 201)), metadata)
+        if item.get("state") == "consumed":
+            return item
         response = self.request("PUT", f"/reader/items/{metadata['id']}/content", data, "application/epub+zip", expected=(200, 201))
         item = self._item_response(parse_json(response.data), metadata)
         if item.get("state") not in {"ready", "consumed"}:
@@ -283,20 +347,33 @@ class CloudClient:
             raise ReaderError("Cloud returned different immutable item metadata")
         return item
 
-    def pull(self, item_id: str, output_dir: Path, *, overwrite=False) -> dict:
+    def pull(self, item_id: str, output_dir: Path, *, overwrite=False, item: dict | None = None) -> dict:
         identifier(item_id)
         output_dir = output_dir.expanduser()
         destination = output_dir / (item_id + ".epub")
         sidecar = output_dir / (item_id + ".json")
         if not overwrite and any(path.exists() or path.is_symlink() for path in (destination, sidecar)):
             raise ReaderError("Cloud pull output exists; choose another directory or use --force")
-        item = next((item for item in self.items() if item["id"] == item_id), None)
-        if item is None or item["state"] == "uploading":
+        if item is None:
+            item = next((candidate for candidate in self.items() if candidate["id"] == item_id), None)
+            if item is None:
+                raise ReaderError("Cloud EPUB is not active or not ready; it may have been consumed and its content released")
+        if item["id"] != item_id or item["state"] == "uploading":
             raise ReaderError("Cloud EPUB is missing or not ready; complete its original push first")
-        response = self.request("GET", f"/reader/items/{item_id}/content", max_bytes=MAX_EPUB)
+        response = self.request("GET", f"/reader/items/{item_id}/content", expected=(200, 410), max_bytes=MAX_EPUB)
+        if response.status == 410:
+            try:
+                released = parse_json(response.data) == CONTENT_RELEASED
+            except ReaderError:
+                released = False
+            if not released:
+                raise ReaderError("Cloud HTTP 410 without the server's content-released confirmation: Unexpected API response; check server availability and compatibility. No automatic retry")
+            raise CloudContentReleased("Cloud content was released after acknowledgement; it cannot be downloaded, but its local receipt remains")
+        header_sha = response.headers.get("x-reader-sha256")
+        header_length = response.headers.get("content-length")
         if (len(response.data) != item["size"] or digest(response.data) != item["sha256"]
-                or response.headers.get("x-reader-sha256") != item["sha256"]
-                or response.headers.get("content-length") != str(item["size"])):
+                or header_sha != item["sha256"]
+                or (header_length is not None and header_length != str(item["size"]))):
             raise ReaderError("Cloud EPUB SHA-256/size verification failed; no file installed and no acknowledgement sent")
         validate_epub(response.data)
         atomic_write(destination, response.data, overwrite=overwrite)
@@ -315,3 +392,61 @@ class CloudClient:
         identifier(item_id)
         self.request("DELETE", f"/reader/items/{item_id}", expected=(204,))
         return {"deleted": item_id, "annotations_preserved": True}
+
+    def links(self, *, limit: int = 32) -> list[dict]:
+        integer(limit, "limit", 1, 64)
+        records = self.json_request("GET", f"/reader/links?limit={limit}").get("links")
+        if not isinstance(records, list) or len(records) > 64:
+            raise ReaderError("Invalid shared-link list (expected at most 64 links)")
+        seen = set()
+        for record in records:
+            validate_link(record)
+            if record["id"] in seen:
+                raise ReaderError("Shared-link list has duplicate IDs")
+            seen.add(record["id"])
+        return records
+
+    def ack_link(self, link_id: str, *, item_id: str | None = None, error: str | None = None) -> dict:
+        if not isinstance(link_id, str) or not re.fullmatch(r"[0-9a-f]{64}", link_id):
+            raise ReaderError("Shared-link ID must be 64 lowercase hex characters")
+        if (item_id is None) == (error is None):
+            raise ReaderError("Shared-link ack requires exactly one of item_id or error")
+        if item_id is not None:
+            identifier(item_id, "item_id")
+            payload = {"status": "succeeded", "item_id": item_id}
+        else:
+            payload = {"status": "failed", "error": text(error, "error", 1024)}
+        result = self.json_request("POST", f"/reader/links/{link_id}/ack", json_bytes(payload))
+        link = result.get("link") if isinstance(result, dict) else None
+        validate_link(link)
+        if link["id"] != link_id:
+            raise ReaderError("Shared-link ack returned a different link")
+        if item_id is not None and (link["status"] != "succeeded" or link["result_item_id"] != item_id):
+            raise ReaderError("Shared-link ack did not record the successful item")
+        if error is not None and link["status"] != "failed":
+            raise ReaderError("Shared-link ack did not record the failure")
+        return link
+
+
+def validate_link(link: dict) -> dict:
+    if not isinstance(link, dict):
+        raise ReaderError("Shared link must be an object")
+    if not isinstance(link.get("id"), str) or not re.fullmatch(r"[0-9a-f]{64}", link["id"]):
+        raise ReaderError("Shared-link ID must be 64 lowercase hex characters")
+    url = text(link.get("url"), "link url", 2048)
+    try:
+        parsed = urlsplit(url)
+        if parsed.scheme != "https" or not parsed.hostname or parsed.username is not None or parsed.password is not None:
+            raise ValueError
+        parsed.port
+    except ValueError as exc:
+        raise ReaderError("Shared link must be an HTTPS URL without embedded credentials") from exc
+    if link.get("title") is not None:
+        text(link["title"], "link title", 512)
+    if link.get("status") not in ("pending", "succeeded", "failed"):
+        raise ReaderError("Shared link has an invalid status")
+    if link.get("result_item_id") is not None:
+        identifier(link["result_item_id"], "result_item_id")
+    if link.get("error") is not None:
+        text(link["error"], "link error", 1024)
+    return link

@@ -1,7 +1,10 @@
 #include "LibraryListActivity.h"
 
+#include <Arduino.h>
+#include <Benchmark.h>
 #include <FreeInkUIIcon.h>
 #include <GfxRenderer.h>
+#include <HalPowerManager.h>
 #include <HalStorage.h>
 #include <I18n.h>
 #include <LibraryBuilder.h>
@@ -9,8 +12,11 @@
 #include <Logging.h>
 #include <Memory.h>
 #include <Utf8.h>
+#include <freertos/FreeRTOS.h>
+#include <freertos/task.h>
 
 #include <algorithm>
+#include <atomic>
 #include <cstdio>
 
 #include "CrossPointSettings.h"
@@ -29,7 +35,6 @@
 namespace fui = freeink::ui;
 
 namespace {
-constexpr int SIDE_PADDING = 12;
 constexpr unsigned long LONG_PRESS_MS = 1000;
 
 constexpr int RECENT_TAB = 0;
@@ -63,47 +68,134 @@ const char* tabLabelFor(const int tab) {
   return tr(STR_LIBRARY_TAB_RECENT);
 }
 
+// Background index refresh. Priority 1 is the loop and render tasks' level
+// (ReaderSync's worker runs there too); the walk blocks on the card constantly,
+// so it yields to both. The stack is an ordinary internal-heap stack like
+// ReaderSync's: no task in this codebase uses a PSRAM stack.
+#ifdef BOARD_HAS_PSRAM
+constexpr uint32_t BUILD_TASK_STACK_BYTES = 16384;
+#else
+constexpr uint32_t BUILD_TASK_STACK_BYTES = 12288;
+#endif
+constexpr UBaseType_t BUILD_TASK_PRIORITY = 1;
+// E-ink repaints for the progress counters: rare while a shelf is browsable,
+// a little more often on the blank progress screen.
+constexpr uint32_t BUILD_REPAINT_BROWSABLE_MS = 5000;
+constexpr uint32_t BUILD_REPAINT_BLANK_MS = 2000;
+// The task normally starts once the first paint has finished; if that never
+// signals, start anyway after this long.
+constexpr uint32_t BUILD_START_FALLBACK_MS = 5000;
+// Automatic follow-up refreshes per visit when a transfer re-dirtied the index
+// during a walk. Bounded so a stuck dirty marker cannot spin the card.
+constexpr uint8_t BUILD_MAX_FOLLOWUPS = 2;
+}  // namespace
+
+// Shared between the loop task (owner) and the worker. The worker only writes
+// these fields and sets `done` last; see the contract in the header.
+struct LibraryBuildJob {
+  std::atomic<uint16_t> scanned{0};
+  std::atomic<uint16_t> parsed{0};
+  std::atomic<uint16_t> reused{0};
+  std::atomic<bool> cancel{false};
+  std::atomic<bool> done{false};
+  bool readMetadata = false;
+  bool ok = false;
+  library::BuildStats stats;
+};
+
+namespace {
+// Called on the worker between work units, never under a RenderLock.
+bool serviceBuild(void* context, const uint16_t scanned, const uint16_t parsed, const uint16_t reused) {
+  auto* job = static_cast<LibraryBuildJob*>(context);
+  job->scanned.store(scanned, std::memory_order_relaxed);
+  job->parsed.store(parsed, std::memory_order_relaxed);
+  job->reused.store(reused, std::memory_order_relaxed);
+  return !job->cancel.load(std::memory_order_relaxed);
+}
+
+void buildTaskEntry(void* arg) {
+  auto* job = static_cast<LibraryBuildJob*>(arg);
+  {
+    HalPowerManager::Lock power;  // full CPU speed for the walk
+    library::BuildControl control;
+    control.context = job;
+    control.service = &serviceBuild;
+    control.deferInstall = true;  // publish from the UI task, under RenderLock
+    job->ok = library::buildLibraryIndex("/", job->stats, job->readMetadata, &control);
+  }
+  // Last access to the job: the owner frees it as soon as it observes this.
+  job->done.store(true, std::memory_order_release);
+  vTaskDelete(nullptr);
+}
 }  // namespace
 
 LibraryListActivity::LibraryListActivity(GfxRenderer& renderer, MappedInputManager& mappedInput)
-    : UiTabListActivity("Library", renderer, mappedInput, true) {
-  // Three short tab labels: a full-slot pill would stretch across a third of
-  // the screen, so cap it at the label plus padding (slots stay put).
-  tabPillMaxPad = 16;
+    : UiTabListActivity("Library", renderer, mappedInput, true) {}
+
+// A worker still running here would outlive the job it points at; onExit()
+// normally joined it already, so this is the backstop.
+LibraryListActivity::~LibraryListActivity() { stopBuild(); }
+
+void LibraryListActivity::prepareEnter() {
+  if (entryPreparation != EntryPreparation::None) return;
+  const uint64_t started = benchmark::start();
+  preparedRecentsRevision = RECENT_BOOKS.getRevision();
+  preparedMissingMask = RECENT_BOOKS.missingMask();
+  entryPreparation = EntryPreparation::NeedsPrune;
+  // No shared-store mutation while the outgoing Home owns RenderLock. Only
+  // open the long-lived reader if there is no pending recents persistence.
+  if (preparedMissingMask == 0) {
+    loadEntryIndex();
+    entryPreparation = EntryPreparation::Ready;
+  }
+  benchmark::span(benchmark::EventType::NavRows, started,
+                  static_cast<uint32_t>(benchmark::NavRowsScreen::LibraryPrepare), 0, index.bookCount());
+}
+
+void LibraryListActivity::loadEntryIndex() {
+  const bool readMetadata = SETTINGS.libraryUseMetadata != 0;
+  const bool opened = index.open(library::libraryIndexPath());
+  buildPending = !opened || library::isLibraryIndexDirty() || index.header().metadataEnabled != readMetadata;
+  if (!opened) index.close();
+  degraded = index.isOpen() && index.ranksDegraded();
+  if (index.isOpen() && index.dedupDegraded()) {
+    LOG_ERR("LIB", "index was built without duplicate detection");
+  }
+  resolvePinned();
 }
 
 void LibraryListActivity::onEnter() {
   // One lock across the base lifecycle AND the data phase: the base onEnter
   // schedules a paint, and the render task must not read the index or the
-  // filter before they are in place. The rebuild also needs the lock: the
-  // render task's SD-loaded fonts read glyph data at draw time, and the walk
-  // needs the card to itself.
+  // filter before they are in place.
   RenderLock lock(*this);
   UiTabListActivity::onEnter();
   app.on(ACTION_SEARCH, &LibraryListActivity::searchActionTrampoline, this);
   app.on(ACTION_REBUILD, &LibraryListActivity::rebuildActionTrampoline, this);
   app.on(ACTION_BACK, &LibraryListActivity::backActionTrampoline, this);
 
-  // Recent is backed by the resident store. Prune before opening the index so
-  // its persistence write never overlaps the long-lived index reader.
-  if (RECENT_BOOKS.pruneMissing()) RECENT_BOOKS.saveToFile();
-
-  // Rebuild when the index is missing, invalid, or was built with the other
-  // metadata mode. Otherwise entering the screen stays instant.
-  const bool readMetadata = SETTINGS.libraryUseMetadata != 0;
-  const bool rebuildNeeded = library::isLibraryIndexDirty() || !index.open(library::libraryIndexPath()) ||
-                             index.header().metadataEnabled != readMetadata;
-  if (rebuildNeeded) {
+  // Prepared pins/missing positions are valid only for that exact store
+  // revision. Invalidation closes the reader before any persistence write.
+  if (entryPreparation != EntryPreparation::None && preparedRecentsRevision != RECENT_BOOKS.getRevision()) {
     index.close();
-    GUI.drawPopup(renderer, tr(STR_LIBRARY_REBUILDING));
-    rebuildIndex();
-    if (!index.open(library::libraryIndexPath())) LOG_ERR("LIB", "cannot open library index");
+    entryPreparation = EntryPreparation::None;
   }
-  degraded = index.isOpen() && index.ranksDegraded();
-  if (index.isOpen() && index.dedupDegraded()) {
-    LOG_ERR("LIB", "index was built without duplicate detection");
-  }
-  resolvePinned();
+  const bool pruned = entryPreparation == EntryPreparation::None
+                          ? RECENT_BOOKS.pruneMissing()
+                          : RECENT_BOOKS.pruneMissing(preparedMissingMask);
+  if (pruned) RECENT_BOOKS.saveToFile();
+  if (entryPreparation != EntryPreparation::Ready) loadEntryIndex();
+  entryPreparation = EntryPreparation::None;
+  preparedMissingMask = 0;
+
+  // A missing/dirty index still starts its worker only after the first paint.
+  buildFailed = false;
+  buildHeld = false;
+  buildRounds = 0;
+  enteredMs = millis();
+  firstPainted.store(false, std::memory_order_release);
+  syncRebuildFlag();
+  // The private preparation above never publishes UI state or starts a worker.
 
   // Entered while Confirm was still held (typical when launched from the home
   // menu): ignore its release, or we would open whatever sits at row 0.
@@ -112,24 +204,183 @@ void LibraryListActivity::onEnter() {
 }
 
 void LibraryListActivity::onExit() {
+  stopBuild();  // join before the activity (and the job) go away
   index.close();
   Activity::onExit();
 }
 
-bool LibraryListActivity::rebuildIndex() {
-  library::BuildStats stats;
-  const bool ok = library::buildLibraryIndex("/", stats, SETTINGS.libraryUseMetadata != 0);
-  if (!ok) {
-    LOG_ERR("LIB", "index build failed");
-    return false;
+void LibraryListActivity::syncRebuildFlag() {
+  rebuildActive.store(buildPending || build != nullptr, std::memory_order_relaxed);
+}
+
+bool LibraryListActivity::rebuildStatusText(char* out, const size_t size) const {
+  if (!rebuildActive.load(std::memory_order_relaxed)) return false;
+  const unsigned scanned = progressScanned.load(std::memory_order_relaxed);
+  const unsigned done = progressDone.load(std::memory_order_relaxed);
+  if (scanned == 0) {
+    snprintf(out, size, "%s", tr(STR_LIBRARY_REBUILDING));
+  } else if (done == 0) {
+    snprintf(out, size, "%s %u", tr(STR_LIBRARY_REBUILDING), scanned);
+  } else {
+    snprintf(out, size, "%s %u (%u)", tr(STR_LIBRARY_REBUILDING), scanned, done);
   }
+  return true;
+}
+
+// Manual refresh and post-delete refresh: queue it; pollBuild starts it. A
+// refresh already queued or running covers the request.
+void LibraryListActivity::queueRebuild() {
+  if (build || buildPending) return;
+  buildFailed = false;
+  buildRounds = 0;
+  buildPending = true;
+  syncRebuildFlag();
+  requestUpdate();
+}
+
+void LibraryListActivity::startBuild() {
+  if (build) return;
+  auto job = makeUniqueNoThrow<LibraryBuildJob>();
+  if (job) {
+    job->readMetadata = SETTINGS.libraryUseMetadata != 0;
+    if (xTaskCreate(&buildTaskEntry, "LibraryBuild", BUILD_TASK_STACK_BYTES, job.get(), BUILD_TASK_PRIORITY, nullptr) ==
+        pdPASS) {
+      // The worker may already be running; it only touches `job`, which this
+      // unique_ptr keeps alive and unmoved in memory.
+      build = std::move(job);
+      buildPending = false;
+      progressScanned.store(0, std::memory_order_relaxed);
+      progressDone.store(0, std::memory_order_relaxed);
+      paintedScanned = 0;
+      lastStatusPaintMs = millis();
+      syncRebuildFlag();
+      return;
+    }
+  }
+  LOG_ERR("LIB", "cannot start index refresh task");
+  buildPending = false;
+  buildFailed = true;
+  syncRebuildFlag();
+  requestUpdate();
+}
+
+// Cancel and join. The builder polls the cancel flag between work units, so
+// the wait is bounded by one unit (at worst a single book's metadata parse);
+// when it returns the worker has made its last SdFat call and is only
+// deleting itself. A build that already finished is discarded too: installing
+// it here could reorder rows under an action that is about to read them. The
+// refresh stays queued and its journal keeps the metadata already parsed.
+void LibraryListActivity::stopBuild() {
+  if (!build) return;
+  build->cancel.store(true, std::memory_order_relaxed);
+  while (!build->done.load(std::memory_order_acquire)) vTaskDelay(1);
+  build.reset();
+  buildPending = true;
+  progressScanned.store(0, std::memory_order_relaxed);
+  progressDone.store(0, std::memory_order_relaxed);
+  syncRebuildFlag();
+}
+
+void LibraryListActivity::holdBuild() {
+  buildHeld = true;
+  stopBuild();
+}
+
+void LibraryListActivity::cancelBuildAsync() {
+  if (build) build->cancel.store(true, std::memory_order_relaxed);
+}
+
+// Top of loop(): the only place the index file is swapped, so button handling
+// later in the same pass always sees one consistent index.
+void LibraryListActivity::pollBuild() {
+  if (!build) {
+    if (!buildPending || buildHeld) return;
+    if (!firstPainted.load(std::memory_order_acquire) && millis() - enteredMs < BUILD_START_FALLBACK_MS) return;
+    startBuild();
+    return;
+  }
+
+  const uint32_t scanned = build->scanned.load(std::memory_order_relaxed);
+  progressScanned.store(scanned, std::memory_order_relaxed);
+  progressDone.store(static_cast<uint32_t>(build->parsed.load(std::memory_order_relaxed)) +
+                         build->reused.load(std::memory_order_relaxed),
+                     std::memory_order_relaxed);
+  if (!build->done.load(std::memory_order_acquire)) {
+    const uint32_t interval = index.isOpen() ? BUILD_REPAINT_BROWSABLE_MS : BUILD_REPAINT_BLANK_MS;
+    if (scanned != paintedScanned && millis() - lastStatusPaintMs >= interval) {
+      paintedScanned = scanned;
+      lastStatusPaintMs = millis();
+      requestUpdate();
+    }
+    return;
+  }
+  // A finished build waits while a row menu is up: swapping the index under it
+  // would reorder the rows it was opened on.
+  if (optionPopup.isActive()) return;
+  completeBuild();
+}
+
+void LibraryListActivity::completeBuild() {
+  const bool cancelled = build->cancel.load(std::memory_order_relaxed);
+  const bool ok = build->ok;
+  const library::BuildStats stats = build->stats;
+  build.reset();
+  progressScanned.store(0, std::memory_order_relaxed);
+  progressDone.store(0, std::memory_order_relaxed);
+  if (cancelled) {  // Back pressed: the screen is already on its way out
+    buildPending = true;
+    syncRebuildFlag();
+    return;
+  }
+  if (!ok) {
+    LOG_ERR("LIB", "index refresh failed");
+    buildPending = false;
+    buildFailed = true;  // the old index, if any, stays; no automatic retry
+    syncRebuildFlag();
+    requestUpdate();
+    return;
+  }
+
   LOG_INF("LIB", "reconciled: %u unchanged, %u added, %u renamed, %u removed, %u enriched (%u dup, %u unreadable)",
           static_cast<unsigned>(stats.unchanged), static_cast<unsigned>(stats.added),
           static_cast<unsigned>(stats.renamed), static_cast<unsigned>(stats.removed),
           static_cast<unsigned>(stats.enriched), static_cast<unsigned>(stats.duplicatesDropped),
           static_cast<unsigned>(stats.unreadableSkipped));
   if (stats.dedupDegraded) LOG_ERR("LIB", "rebuild completed without duplicate detection");
-  return true;
+
+  {
+    // The render task must not read the index (or the filter) while the file is
+    // swapped, and the install renames over the file the reader has open.
+    RenderLock lock(*this);
+    const bool wasOpen = index.isOpen();
+    const uint16_t previousCount = index.bookCount();
+    index.close();
+    if (stats.indexPrepared && !library::installPreparedLibraryIndex()) {
+      LOG_ERR("LIB", "cannot publish the rebuilt index; keeping the previous one");
+    }
+    if (!index.open(library::libraryIndexPath())) LOG_ERR("LIB", "cannot open library index");
+    degraded = index.isOpen() && index.ranksDegraded();
+    // Rows only move when the book set or its text changed. An unchanged
+    // refresh keeps the selection, viewport, filter and pins exactly as they
+    // are; a changed one clamps them like any other rebuild.
+    const bool changed = stats.indexPrepared || !wasOpen || previousCount != index.bookCount();
+    if (changed) {
+      resetAfterRebuild();
+      // The published interaction table still names rows in the old order.
+      // Do not let a pending tap/Confirm open a different book before repaint.
+      closeRouting();
+      firstPainted.store(false, std::memory_order_release);
+      enteredMs = millis();
+    }
+  }
+
+  buildFailed = !index.isOpen();
+  // A transfer finished during the walk re-marks the index dirty; one more
+  // pass picks it up, but never loop on a marker that will not clear.
+  buildPending = !buildFailed && library::isLibraryIndexDirty() && buildRounds < BUILD_MAX_FOLLOWUPS;
+  if (buildPending) buildRounds++;
+  syncRebuildFlag();
+  requestUpdate(true);
 }
 
 void LibraryListActivity::swallowHeldReleases() {
@@ -179,6 +430,7 @@ void LibraryListActivity::resolvePinned() {
 }
 
 void LibraryListActivity::refreshOverlap() {
+  winStart = -1;
   overlapCount = 0;
   const int total = static_cast<int>(index.bookCount());
   for (int i = 0; i < pinnedTotal; i++) {
@@ -212,10 +464,11 @@ void LibraryListActivity::openSelectedBook() {
 
 // Shared by row activation and the options menu: the reader screen this opens
 // has its own surfaces; a lingering tap flash would gray an unrelated element
-// there. The index handle is released first — on hardware only one reader can
-// hold a file open at a time, and the reader is about to open files of its own.
+// there. Release the worker and index before the reader claims their memory
+// and begins its own card access.
 void LibraryListActivity::openBookByPath(const std::string& path) {
   app.clearTapFlash();
+  stopBuild();  // the reader needs the card and the heap to itself
   index.close();
   onSelectBook(path);
 }
@@ -293,29 +546,16 @@ void LibraryListActivity::showRecentBookOptions(const int entry) {
                          if (isStoreRow)
                            promptDeleteBookByPath(path, title);
                          else
-                           promptRebuildIndex();
+                           queueRebuild();
                          break;
                        case 3:
-                         if (isStoreRow) promptRebuildIndex();
+                         if (isStoreRow) queueRebuild();
                          break;
                        default:
                          break;
                      }
                    });
   requestUpdate();
-}
-
-// Manual index refresh, same card discipline as the onEnter rebuild: the walk
-// wants the card to itself, and the render task must not read the index (or
-// the filter) around it.
-void LibraryListActivity::promptRebuildIndex() {
-  RenderLock lock(*this);
-  GUI.drawPopup(renderer, tr(STR_LIBRARY_REBUILDING));
-  index.close();
-  rebuildIndex();
-  if (!index.open(library::libraryIndexPath())) LOG_ERR("LIB", "cannot open library index");
-  resetAfterRebuild();
-  requestUpdate(true);
 }
 
 void LibraryListActivity::resetAfterRebuild() {
@@ -333,17 +573,20 @@ void LibraryListActivity::resetAfterRebuild() {
 }
 
 void LibraryListActivity::promptRemoveRecentBook(const std::string& path, const std::string& title) {
+  holdBuild();
   const bool reopenIndex = index.isOpen();
   index.close();
   auto confirmation =
       makeUniqueNoThrow<ConfirmationActivity>(renderer, mappedInput, tr(STR_REMOVE_FROM_RECENTS), title);
   if (!confirmation) {
     LOG_ERR("LIB", "OOM: recent removal confirmation");
+    buildHeld = false;
     if (reopenIndex && !index.open(library::libraryIndexPath())) LOG_ERR("LIB", "cannot reopen library index");
     return;
   }
 
   startActivityForResult(std::move(confirmation), [this, path, reopenIndex](const ActivityResult& result) {
+    buildHeld = false;
     swallowHeldReleases();
     if (reopenIndex && !index.open(library::libraryIndexPath())) LOG_ERR("LIB", "cannot reopen library index");
     if (!result.isCancelled && RECENT_BOOKS.removeByPath(path)) {
@@ -380,29 +623,33 @@ void LibraryListActivity::promptDeleteBook(const int entry) {
 
 void LibraryListActivity::promptDeleteBookByPath(const std::string& path, const std::string& title) {
   // The dialog and the delete both want the card; reopen when we resume.
+  holdBuild();
   index.close();
   auto confirmation =
       makeUniqueNoThrow<ConfirmationActivity>(renderer, mappedInput, tr(STR_DELETE) + std::string("? "), title);
   if (!confirmation) {
     LOG_ERR("LIB", "OOM: delete confirmation");
+    buildHeld = false;
     if (!index.open(library::libraryIndexPath())) LOG_ERR("LIB", "cannot reopen library index");
     return;
   }
 
   startActivityForResult(std::move(confirmation), [this, path](const ActivityResult& result) {
+    buildHeld = false;
     swallowHeldReleases();
     {
-      // Same lock rationale as onEnter: the walk wants the card to itself, and
-      // the render task must not read the index (or the filter) around the
-      // rebuild.
+      // The render task must not read the index (or the filter) around the
+      // deletion and the reopen.
       RenderLock lock(*this);
       if (!result.isCancelled) {
         LOG_DBG("LIB", "deleting %s", path.c_str());
         clearBookCache(path);
         if (!Storage.remove(path.c_str())) LOG_ERR("LIB", "cannot delete %s", path.c_str());
         if (RECENT_BOOKS.removeByPath(path)) RECENT_BOOKS.saveToFile();
-        GUI.drawPopup(renderer, tr(STR_LIBRARY_REBUILDING));
-        rebuildIndex();
+        // Refresh in the background; the reopened index still lists the book
+        // until it completes. The marker makes an interrupted refresh resume.
+        library::markLibraryIndexDirty();
+        queueRebuild();
       }
       if (!index.open(library::libraryIndexPath())) LOG_ERR("LIB", "cannot reopen library index");
       if (!result.isCancelled) {
@@ -417,6 +664,7 @@ void LibraryListActivity::promptDeleteBookByPath(const std::string& path, const 
 }
 
 void LibraryListActivity::openSearch() {
+  if (!index.isOpen()) return;
   app.clearTapFlash();
   // No key filtering here on purpose. Greying out the letters that lead nowhere
   // was built, tested on device and removed: a letter you can see but cannot
@@ -427,7 +675,9 @@ void LibraryListActivity::openSearch() {
     LOG_ERR("LIB", "OOM: search keyboard");
     return;
   }
+  holdBuild();
   startActivityForResult(std::move(keyboard), [this](const ActivityResult& result) {
+    buildHeld = false;
     swallowHeldReleases();
     if (result.isCancelled) return;
     query = std::get<KeyboardResult>(result.data).text;
@@ -602,6 +852,7 @@ void LibraryListActivity::restoreExpandedList() {
 // array is allocated once with the exact upper bound and fails back to an
 // explicit message rather than letting vector growth abort the firmware.
 void LibraryListActivity::applyFilter() {
+  winStart = -1;
   groupsCollapsed = false;
   groupCount = 0;
   filtered.reset();
@@ -664,6 +915,7 @@ void LibraryListActivity::handleBackAction() {
     nav.selected = 0;
     requestUpdate();
   } else {
+    cancelBuildAsync();
     onGoHome();
   }
 }
@@ -677,16 +929,18 @@ void LibraryListActivity::backActionTrampoline(const fui::ActionEvent&, void* us
 }
 
 void LibraryListActivity::rebuildActionTrampoline(const fui::ActionEvent&, void* user) {
-  static_cast<LibraryListActivity*>(user)->promptRebuildIndex();
+  static_cast<LibraryListActivity*>(user)->queueRebuild();
 }
 
 // Title and author for one entry, read straight from the index. Only ever
 // called for rows about to be drawn, so at most a screenful of strings exists
 // at once.
-bool LibraryListActivity::rowTextFor(const int entry, std::string& title, std::string& author, std::string* fileName) {
+bool LibraryListActivity::rowTextFor(const int entry, std::string& title, std::string& author, std::string* fileName,
+                                     uint32_t* initial) {
   title.clear();
   author.clear();
   if (fileName) fileName->clear();
+  if (initial) *initial = 0;
   if (entry < pinnedCount()) {
     const auto& books = RECENT_BOOKS.getBooks();
     if (entry < 0 || entry >= static_cast<int>(books.size())) return false;
@@ -699,6 +953,7 @@ bool LibraryListActivity::rowTextFor(const int entry, std::string& title, std::s
   const uint16_t ordinal = index.ordinalForRow(sortOrder, static_cast<uint16_t>(rowFor(entry)));
   library::ClixRecord record{};
   if (ordinal != 0xFFFF && index.readRecord(ordinal, record)) {
+    if (initial) *initial = library::foldedGroupInitial(std::string_view(record.fold, record.foldLen));
     // The build already decided both fields — from the book's own metadata when
     // it has any, and with one spelling chosen per author across the library.
     // Re-parsing the name here would throw that away, and only works while the
@@ -799,26 +1054,18 @@ void LibraryListActivity::navigateButtons() {
   });
 }
 
-void LibraryListActivity::buildRows(UiScreen& screen) {
-  auto& nav = activeNav();
+void LibraryListActivity::refreshRowWindow(const int windowStart, const size_t cap) {
+  const uint64_t rowLoadStarted = benchmark::start();
   const int count = listCount();
+  if (winStart == windowStart && winCapacity == cap && winCount == count && winCollapsed == groupsCollapsed) {
+    LOG_DBG("LIB", "row-window hit top=%d cap=%u", windowStart, static_cast<unsigned>(cap));
+    benchmark::span(benchmark::EventType::NavRows, rowLoadStarted,
+                    static_cast<uint32_t>(benchmark::NavRowsScreen::Library), 1, 0);
+    return;
+  }
+  LOG_DBG("LIB", "row-window miss top=%d cap=%u", windowStart, static_cast<unsigned>(cap));
   const bool authorGrouped = isAuthorSort(sortOrder);
   const bool grouped = !isRecentSort(sortOrder);
-
-  fui::ListProps props;
-  props.count = static_cast<uint16_t>(count);
-  props.action = ACTION_ROW;
-  props.inputMask = fui::InputTouch | fui::InputLongPress;
-  props.labelText = screen.theme().bodyText;
-  props.labelText.maxLines = 1;
-  // Breathing room between rows; the dense theme default packs the two-line
-  // rows edge-to-edge.
-  props.rowGap = std::max<int16_t>(screen.theme().listRowGap, 6);
-  props.headerUnderline = false;
-  syncTabListViewport(screen, props);
-
-  // Keep one extra entry in the reusable window for a clipped trailing row.
-  const size_t cap = static_cast<size_t>(nav.visibleRows > 0 ? nav.visibleRows : 1) + 1;
   if (winTitles.size() < cap) winTitles.resize(cap);
   if (winAuthors.size() < cap) winAuthors.resize(cap);
   if (!groupsCollapsed && winHeaders.size() < cap) winHeaders.resize(cap);
@@ -830,8 +1077,7 @@ void LibraryListActivity::buildRows(UiScreen& screen) {
   uint32_t previousInitial = 0;
   std::string rowFile;
   rowFile.reserve(128);
-  // Capture this after syncTabListViewport(), which may clamp nav.top.
-  const int windowStart = static_cast<int>(props.topIndex);
+  // The caller has already resolved selection-follow and clamped the viewport.
   for (int entry = windowStart; entry < count && rows < static_cast<int>(cap); entry++) {
     std::string& title = winTitles[static_cast<size_t>(rows)];
     std::string& author = winAuthors[static_cast<size_t>(rows)];
@@ -845,13 +1091,12 @@ void LibraryListActivity::buildRows(UiScreen& screen) {
         formatInitialHeading(titleInitialFor(bookEntry), title);
       }
     } else {
-      if (!rowTextFor(entry, title, author, &rowFile)) continue;
       uint32_t initial = 0;
+      if (!rowTextFor(entry, title, author, &rowFile, grouped && !authorGrouped ? &initial : nullptr)) continue;
       bool startsGroup = false;
       if (authorGrouped) {
         startsGroup = rows == 0 || author != winAuthors[static_cast<size_t>(rows - 1)];
       } else if (grouped) {
-        initial = titleInitialFor(entry);
         startsGroup = rows == 0 || initial != previousInitial;
         previousInitial = initial;
       }
@@ -873,11 +1118,36 @@ void LibraryListActivity::buildRows(UiScreen& screen) {
     winItems.push_back(item);
     rows++;
   }
+  winStart = index.ioFailed() ? -1 : windowStart;
+  winCapacity = cap;
+  winCount = count;
+  winCollapsed = groupsCollapsed;
+  benchmark::span(benchmark::EventType::NavRows, rowLoadStarted,
+                  static_cast<uint32_t>(benchmark::NavRowsScreen::Library), 0, static_cast<uint32_t>(winItems.size()));
+}
+
+void LibraryListActivity::buildRows(UiScreen& screen) {
+  auto& nav = activeNav();
+  fui::ListProps props;
+  props.count = static_cast<uint16_t>(listCount());
+  props.action = ACTION_ROW;
+  props.inputMask = fui::InputTouch | fui::InputLongPress;
+  props.labelText = screen.theme().bodyText;
+  props.labelText.maxLines = 1;
+  props.subtitleText = screen.theme().smallText;
+  props.headerText = screen.theme().smallText;
+  props.headerUnderline = false;
+  syncTabListViewport(screen, props);
+
+  const size_t cap = static_cast<size_t>(nav.visibleRows > 0 ? nav.visibleRows : 1);
+  const int windowStart = static_cast<int>(props.topIndex);
+  refreshRowWindow(windowStart, cap);
 
   props.items = winItems.data();
   props.itemsWindowFirst = static_cast<uint16_t>(windowStart);
   props.itemsWindowCount = static_cast<uint16_t>(winItems.size());
   screen.list(props);
+  const int rows = static_cast<int>(winItems.size());
   const int next = nav.drawnRows;
   const auto body = screen.body();
   LOG_DBG("LIB", "page tab=%d top=%d full=%d loaded=%d body=%d..%d next=%d title=%s", activeTabIndex, windowStart,
@@ -912,16 +1182,19 @@ void LibraryListActivity::buildHeader(UiScreen& screen) {
   const auto& theme = screen.theme();
   fui::HeaderProps header;
   header.title = headerTitle();
+  uiTarget.setFont(fui::GfxRendererTarget::FONT_TITLE, GUI.titleFontId(renderer, header.title));
   header.titleText = theme.titleText;
   header.titleText.align = theme.headerTitleAlign;
   header.sidePadding = theme.headerSidePadding;
   header.minTouchSize = theme.minTouchSize;
   header.styles = theme.popup;
-  if (header.styles.normal.border.kind == fui::PaintKind::None && theme.headerUnderline > 0) {
-    header.styles.normal.border = fui::Paint::solid(fui::Color::Black);
-    header.styles.normal.borderWidth = theme.headerUnderline;
-  }
-  header.trailingStyles = fui::plainStyles(fui::Paint::solid(fui::Color::Black));
+  header.styles.normal.radius = 0;
+  header.styles.normal.border = fui::Paint::solid(fui::Color::Black);
+  header.styles.normal.borderWidth = theme.headerUnderline;
+  header.leadingStyles = fui::plainStyles(fui::Paint::solid(fui::Color::Black));
+  header.trailingStyles = header.leadingStyles;
+  header.leadingRadius = 0;
+  header.trailingRadius = 0;
   header.borderEdges = fui::EdgeBottom;
   // Same battery/clock band as every GUI.drawHeader screen; the header
   // heights are unified across themes, so the buttons derive from the band.
@@ -929,6 +1202,7 @@ void LibraryListActivity::buildHeader(UiScreen& screen) {
   if (mappedInput.hasTouch()) {
     header.leadingIcon = fui::bitmapFromIcon(icon_header_back_32);
     header.leadingAction = ACTION_BACK;
+    if (!UITheme::isRtl()) header.leftReserve = 14;
   }
   if (!degraded) {
     // Keep both touch actions together on the right; button boards reach
@@ -942,10 +1216,9 @@ void LibraryListActivity::buildHeader(UiScreen& screen) {
     // Vertical placement comes from applyHeaderStatus: buttons center on the
     // unified band.
   }
-  const auto frameRect = screen.frame().screen();
-  // Header and tabs share a screen-relative boundary, independent of bezel insets.
+  const auto frameRect = screen.frame().safeRect();
   fui::header(screen.frame(),
-              fui::Rect{frameRect.x, static_cast<int16_t>(metrics.topPadding), frameRect.width,
+              fui::Rect{frameRect.x, static_cast<int16_t>(frameRect.y + metrics.topPadding), frameRect.width,
                         static_cast<int16_t>(metrics.headerHeight)},
               header);
 }
@@ -956,18 +1229,24 @@ void LibraryListActivity::buildScreen(UiScreen& screen) {
   // it.
   const int16_t readoutReserved = static_cast<int16_t>(renderer.getLineHeight(SMALL_FONT_ID) + metrics.verticalSpacing);
   buildHeader(screen);
-  screen.setContentMarginFromScreen(fui::Insets{static_cast<int16_t>(metrics.topPadding + metrics.headerHeight), 0,
-                                                static_cast<int16_t>(metrics.buttonHintsHeight + readoutReserved), 0});
+  screen.setContentMargin(fui::Insets{static_cast<int16_t>(metrics.topPadding + metrics.headerHeight), 0,
+                                     static_cast<int16_t>(metrics.buttonHintsHeight + readoutReserved), 0});
 
   if (!degraded) buildTabBar(screen);
+  else screen.spacer(static_cast<int16_t>(metrics.verticalSpacing));
   if (bookRowCount() == 0) {
+    char status[96];
     const char* message = tr(STR_LIBRARY_NO_RESULTS);
-    if (filterFailed) {
+    if (!index.isOpen()) {
+      // No index to browse yet: show the build's progress, and the failure text
+      // only once it has stopped.
+      message = rebuildStatusText(status, sizeof(status)) ? status : tr(STR_LIBRARY_REBUILD_FAILED);
+    } else if (filterFailed) {
       message = tr(STR_LIBRARY_SEARCH_UNAVAILABLE);
     } else if (query.empty()) {
       message = tr(STR_LIBRARY_EMPTY);
     }
-    screen.centeredText(message);
+    buildListMessage(screen, message);
     return;
   }
   buildRows(screen);
@@ -983,14 +1262,26 @@ void LibraryListActivity::drawPositionReadout() const {
   const int count = listCount();
   if (count <= 0) return;
 
-  char buf[32];
+  char buf[96];
   const char* positionFormat = groupsCollapsed ? tr(STR_LIBRARY_GROUP_POSITION) : tr(STR_LIBRARY_POSITION);
   snprintf(buf, sizeof(buf), positionFormat, selectedEntry() + 1, count);
   const auto& metrics = UITheme::getInstance().getMetrics();
-  const int width = renderer.getTextWidth(SMALL_FONT_ID, buf);
-  const int x = renderer.getScreenWidth() - width - SIDE_PADDING;
-  const int y = renderer.getScreenHeight() - metrics.buttonHintsHeight - renderer.getLineHeight(SMALL_FONT_ID);
-  renderer.drawText(SMALL_FONT_ID, x, y, buf, true);
+  const auto safe = uiTarget.deviceContext().safeArea;
+  const int left = safe.left + metrics.contentSidePadding;
+  const int right = renderer.getScreenWidth() - safe.right - metrics.contentSidePadding;
+  const int width = mappedInput.hasTouch() ? right - left : (right - left - metrics.verticalSpacing) / 2;
+  const int x = UITheme::isRtl() ? left : right - width;
+  const int height = renderer.getLineHeight(SMALL_FONT_ID);
+  const int y = renderer.getScreenHeight() - safe.bottom - metrics.buttonHintsHeight - height;
+  fui::TextStyle text;
+  text.font = fui::GfxRendererTarget::FONT_LABEL;
+  text.align = UITheme::isRtl() ? fui::TextAlign::Left : fui::TextAlign::Right;
+  fui::layoutText(uiTarget,
+                  fui::Rect{static_cast<int16_t>(x), static_cast<int16_t>(y),
+                            static_cast<int16_t>(width), static_cast<int16_t>(height)},
+                  buf, text, [&](const char* line, const fui::Rect run) {
+                    renderer.drawText(SMALL_FONT_ID, run.x, run.y, line);
+                  });
 }
 
 const char* LibraryListActivity::headerTitle() const {
@@ -999,9 +1290,15 @@ const char* LibraryListActivity::headerTitle() const {
 }
 
 void LibraryListActivity::drawHoldHelp() const {
-  if (mappedInput.hasTouch() || groupsCollapsed) return;
+  // A queued or running refresh owns this line, even on touch boards that
+  // otherwise show no help; without an index the body shows it instead.
+  char status[96];
   const char* help = nullptr;
-  if (tabsFocused() && !degraded)
+  if (index.isOpen() && rebuildStatusText(status, sizeof(status)))
+    help = status;
+  else if (mappedInput.hasTouch() || groupsCollapsed)
+    return;
+  else if (tabsFocused() && !degraded)
     help = tr(STR_LIBRARY_HOLD_SORT);
   else if (!tabsFocused() && isRecentSort(sortOrder) && listCount() > 0)
     help = tr(STR_LIBRARY_HOLD_OPTIONS);  // recent rows: hold opens the row menu
@@ -1013,8 +1310,13 @@ void LibraryListActivity::drawHoldHelp() const {
 
   const auto& metrics = UITheme::getInstance().getMetrics();
   const int lineHeight = renderer.getLineHeight(SMALL_FONT_ID);
-  const int y = renderer.getScreenHeight() - metrics.buttonHintsHeight - lineHeight;
-  GUI.drawHelpText(renderer, Rect{SIDE_PADDING, y, renderer.getScreenWidth() / 2 - SIDE_PADDING, lineHeight}, help);
+  const auto safe = uiTarget.deviceContext().safeArea;
+  const int left = safe.left + metrics.contentSidePadding;
+  const int right = renderer.getScreenWidth() - safe.right - metrics.contentSidePadding;
+  const int width = (right - left - metrics.verticalSpacing) / 2;
+  const int x = UITheme::isRtl() ? right - width : left;
+  const int y = renderer.getScreenHeight() - safe.bottom - metrics.buttonHintsHeight - lineHeight;
+  GUI.drawHelpText(renderer, Rect{x, y, width, lineHeight}, help);
 }
 
 // OptionPopup is a self-contained modal: it owns the whole frame (hints
@@ -1022,6 +1324,14 @@ void LibraryListActivity::drawHoldHelp() const {
 void LibraryListActivity::render(RenderLock&& lock) {
   if (optionPopup.processRender(renderer, mappedInput)) return;
   UiTabListActivity::render(std::move(lock));
+  // The first completed paint releases the queued background refresh.
+  firstPainted.store(true, std::memory_order_release);
+}
+
+void LibraryListActivity::loop() {
+  pollBuild();
+  if (!firstPainted.load(std::memory_order_acquire)) return;
+  UiTabListActivity::loop();
 }
 
 void LibraryListActivity::drawFooter() {

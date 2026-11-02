@@ -5,6 +5,7 @@
 
 #include "AnnotationEntry.h"
 #include "StudyCardStore.h"
+#include "ReaderTextSlices.h"
 #include "activities/UiListActivity.h"
 #include "components/OptionPopup.h"
 
@@ -20,21 +21,26 @@ class AnnotationReviewActivity final : public UiListActivity {
   void render(RenderLock&& lock) override;
 
  private:
-  static constexpr size_t ROW_BYTES = 64;
-  static constexpr size_t MAX_ROWS = 80;
-  struct TextRow {
+  static constexpr size_t MAX_FIELDS = 10;
+  struct TextField {
     const char* text = nullptr;
     const char* heading = nullptr;
-    uint8_t length = 0;
+    uint16_t rowCount = 0;
+    ReaderTextSlices::Cursor cursor;
   };
   std::unique_ptr<AnnotationEntry> annotation;
   std::unique_ptr<StudyCardEntry> card;
-  std::array<TextRow, MAX_ROWS> rows{};
+  std::array<TextField, MAX_FIELDS> fields{};
+  size_t fieldCount = 0;
+  bool rowsDirty = true;
+  int16_t textWidth = 0;
+  freeink::ui::TextStyle textStyle{};
+  const freeink::ui::DrawTarget* textTarget = nullptr;
   size_t rowCount = 0;
   bool revealed = false;
   bool loaded = true;
   OptionPopup popup;
-  char rowText[ROW_BYTES + 1] = {};
+  char rowText[AnnotationEntry::MAX_EXCERPT_BYTES + 1] = {};
   char savedAt[32] = {};
 
   const AnnotationEntry* source() const;

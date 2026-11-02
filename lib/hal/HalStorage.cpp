@@ -1,7 +1,9 @@
 #include "HalStorage.h"
 
+#include <Benchmark.h>
 #include <FS.h>  // need to be included before SdFat.h for compatibility with FS.h's File class
 #include <Logging.h>
+#include <Memory.h>
 #include <SDCardManager.h>
 #if FREEINK_CAP_USB_MSC
 #include <UsbMassStorage.h>
@@ -44,7 +46,15 @@ class HalStorage::StorageLock {
   ~StorageLock() { xSemaphoreGiveRecursive(HalStorage::getInstance().storageMutex); }
 };
 
+uint64_t HalStorage::freeBytes() {
+  StorageLock lock;
+  const uint64_t total = SDCard.sdTotalBytes();
+  const uint64_t used = SDCard.sdUsedBytes();
+  return total == 0 ? UINT64_MAX : (total > used ? total - used : 0);
+}
+
 void HalStorage::prepareForDeepSleep() {
+  benchmark::stop(benchmark::StopReason::Sleep);
   StorageLock lock;
   SDCard.shutdown();
 }
@@ -55,6 +65,7 @@ void HalStorage::prepareForDeepSleep() {
 
 bool HalStorage::beginUsbDrive() {
 #if FREEINK_CAP_USB_MSC
+  benchmark::stop(benchmark::StopReason::UsbDrive);
   StorageLock lock;
   auto* const blockDevice = SDCard.detachFilesystemForRawAccess();
   if (!blockDevice) {
@@ -170,7 +181,11 @@ HalFile& HalFile::operator=(HalFile&&) = default;
 
 HalFile HalStorage::open(const char* path, const oflag_t oflag) {
   StorageLock lock;  // ensure thread safety for the duration of this function
-  return HalFile(std::make_unique<HalFile::Impl>(SDCard.open(path, oflag)));
+  // The diagnostic session opens once and retains this handle; allocation failure
+  // must disable recording, not abort normal reading.
+  auto impl = makeUniqueNoThrow<HalFile::Impl>(SDCard.open(path, oflag));
+  if (!impl) LOG_ERR("SD", "Cannot allocate file handle");
+  return HalFile(std::move(impl));
 }
 
 bool HalStorage::mkdir(const char* path, const bool pFlag) { HAL_STORAGE_WRAPPED_CALL(mkdir, path, pFlag); }
@@ -232,7 +247,9 @@ bool HalStorage::removeDir(const char* path) { HAL_STORAGE_WRAPPED_CALL(removeDi
   return impl->file.method(__VA_ARGS__);
 
 void HalFile::flush() { HAL_FILE_WRAPPED_CALL(flush, ); }
+bool HalFile::sync() { HAL_FILE_WRAPPED_CALL(sync, ); }
 size_t HalFile::getName(char* name, size_t len) { HAL_FILE_WRAPPED_CALL(getName, name, len); }
+uint32_t HalFile::dirIndex() const { HAL_FILE_FORWARD_CALL(dirIndex, ); }
 size_t HalFile::size() { HAL_FILE_FORWARD_CALL(size, ); }              // already thread-safe, no need to wrap
 size_t HalFile::fileSize() { HAL_FILE_FORWARD_CALL(fileSize, ); }      // already thread-safe, no need to wrap
 uint64_t HalFile::fileSize64() { HAL_FILE_FORWARD_CALL(fileSize, ); }  // already thread-safe, no need to wrap

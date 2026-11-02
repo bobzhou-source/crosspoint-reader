@@ -1,16 +1,20 @@
 #pragma once
 
+#include <AdaptiveRefreshPolicy.h>
 #include <CrossPointSettings.h>
 #include <GfxRenderer.h>
 #include <HalGPIO.h>
 #include <HalTiltSensor.h>
 #include <Logging.h>
+#include <I18n.h>
 
 #include <cctype>
 #include <string_view>
 
 #include "MappedInputManager.h"
 #include "activities/ActivityManager.h"
+#include "components/UITheme.h"
+#include "fontIds.h"
 
 namespace ReaderUtils {
 
@@ -19,6 +23,15 @@ constexpr unsigned long GO_BACK_OR_HOME_MS = GO_HOME_MS;
 constexpr unsigned long SKIP_HOLD_MS = 700;
 constexpr unsigned long BOOKMARK_HOLD_MS = 400;
 constexpr unsigned long BOOKMARK_MESSAGE_DURATION_MS = 2500;
+
+inline void drawState(GfxRenderer& renderer, const MappedInputManager& input, const char* title, const char* message) {
+  const auto& metrics = UITheme::getInstance().getMetrics();
+  GUI.drawHeader(renderer, Rect{0, metrics.topPadding, renderer.getScreenWidth(), metrics.headerHeight},
+                 title && *title ? title : tr(STR_BOOK));
+  UITheme::drawCenteredWrappedText(renderer, UITheme::getContentBounds(renderer), UI_12_FONT_ID, message, 6);
+  const auto labels = input.mapLabels(tr(STR_BACK), "", "", "");
+  GUI.drawButtonHints(renderer, labels.btn1, labels.btn2, labels.btn3, labels.btn4);
+}
 
 inline bool gestureAllowsSwipe(const uint8_t gesture) {
   return gesture == CrossPointSettings::TAP_AND_SWIPE || gesture == CrossPointSettings::SWIPE_ONLY;
@@ -53,6 +66,17 @@ inline void applyOrientation(GfxRenderer& renderer, const uint8_t orientation) {
       break;
     default:
       break;
+  }
+}
+
+// Orientation of the non-reader screens (Home/Library/Settings and what they
+// open): portrait, or the reading orientation when "Rotate menus like reader"
+// is on. The reader hands back to this on exit.
+inline void applyMenuOrientation(GfxRenderer& renderer) {
+  if (SETTINGS.rotateMenusWithReader) {
+    applyOrientation(renderer, SETTINGS.orientation);
+  } else {
+    renderer.setOrientation(GfxRenderer::Orientation::Portrait);
   }
 }
 
@@ -172,42 +196,66 @@ inline bool isTouchMenuGesture(const GfxRenderer& renderer, const MappedInputMan
   return isTouchMenuTap(renderer, input);
 }
 
+// Grayscale text is worth rendering only when the panel can show it: inverted
+// (night) output and B/W-only controllers report no grayscale capability, so
+// their LSB/MSB passes would be discarded.
+inline bool textAntiAliasingVisible(const GfxRenderer& renderer) {
+  return SETTINGS.textAntiAliasing && renderer.grayscaleCapabilities().supported();
+}
+
+inline HalDisplay::RefreshMode refreshModeFor(const AdaptiveRefreshPolicy::Refresh refresh) {
+  return refresh == AdaptiveRefreshPolicy::Refresh::Clear ? HalDisplay::HALF_REFRESH : HalDisplay::FAST_REFRESH;
+}
+
+// Measures the composed B/W page in the framebuffer and asks the reader's
+// policy whether this frame needs a clearing refresh. Call after the whole
+// page (including overlays) is drawn and before any grayscale plane overwrites
+// the framebuffer; commit the refresh that actually ran afterwards.
+inline AdaptiveRefreshPolicy::Refresh decideRefresh(const GfxRenderer& renderer, AdaptiveRefreshPolicy& policy,
+                                                    const bool hasImage, const bool visibleGrayscale) {
+  AdaptiveRefreshPolicy::Inputs inputs;
+  inputs.frame = renderer.measureFrameChange();
+  inputs.hasImage = hasImage;
+  inputs.visibleGrayscale = visibleGrayscale;
+  inputs.externalClearPending = renderer.hasPendingClearingRefresh();
+  const auto decision = policy.decide(inputs);
+  LOG_DBG("READER", "Refresh %s: reason=%u debt=%lu fast=%u changed=%lu exact=%d",
+          decision.refresh == AdaptiveRefreshPolicy::Refresh::Clear ? "clear" : "fast",
+          static_cast<unsigned>(decision.reason), static_cast<unsigned long>(policy.debtPixels()),
+          static_cast<unsigned>(policy.fastSinceClear()), static_cast<unsigned long>(inputs.frame.changedPixels),
+          inputs.frame.historyValid ? 1 : 0);
+  return decision.refresh;
+}
+
 // One helper, blocking or deferred: the async form starts the refresh and
 // returns so the caller can overlap CPU work with the panel's refresh time.
 // Async callers must not touch the framebuffer until
 // renderer.waitRefreshComplete() and must rebuild the differential baseline
 // before the next page turn (the tiled grayscale cleanup does).
-inline void displayWithRefreshCycle(const GfxRenderer& renderer, int& pagesUntilFullRefresh, bool async = false) {
-  const auto mode = (pagesUntilFullRefresh <= 1) ? HalDisplay::HALF_REFRESH : HalDisplay::FAST_REFRESH;
+inline void displayAdaptive(const GfxRenderer& renderer, AdaptiveRefreshPolicy& policy, const bool hasImage = false,
+                            const bool async = false) {
+  const auto refresh = decideRefresh(renderer, policy, hasImage, /*visibleGrayscale=*/false);
   if (async) {
-    renderer.displayBufferAsync(mode);
+    renderer.displayBufferAsync(refreshModeFor(refresh));
   } else {
-    renderer.displayBuffer(mode);
+    renderer.displayBuffer(refreshModeFor(refresh));
   }
-  if (pagesUntilFullRefresh <= 1) {
-    pagesUntilFullRefresh = SETTINGS.getRefreshFrequency();
-  } else {
-    pagesUntilFullRefresh--;
-  }
+  policy.commit(refresh);
 }
 
-// Display the B/W base of a page whose grayscale pass follows. Panels that
-// combine the base (Paper Mono) defer the activation so base + gray planes go
-// out as one waveform — displaying the base separately makes the gray pass
+// Display the B/W base of a text page whose grayscale pass follows. Panels
+// that combine the base (Paper Mono) defer the activation so base + gray planes
+// go out as one waveform — displaying the base separately makes the gray pass
 // re-drive the whole text body (a visible flash). Other panels display
-// normally. Same refresh-cadence bookkeeping as displayWithRefreshCycle.
-inline void displayBaseWithRefreshCycle(const GfxRenderer& renderer, int& pagesUntilFullRefresh) {
-  if (renderer.grayscaleCapabilities().base != HalDisplay::GrayscaleBase::Combined) {
-    displayWithRefreshCycle(renderer, pagesUntilFullRefresh);
-    return;
-  }
-  const auto mode = (pagesUntilFullRefresh <= 1) ? HalDisplay::HALF_REFRESH : HalDisplay::FAST_REFRESH;
-  renderer.displayGrayscaleBase(mode);
-  if (pagesUntilFullRefresh <= 1) {
-    pagesUntilFullRefresh = SETTINGS.getRefreshFrequency();
+// normally. Only call when textAntiAliasingVisible() holds.
+inline void displayAdaptiveGrayscaleBase(const GfxRenderer& renderer, AdaptiveRefreshPolicy& policy) {
+  const auto refresh = decideRefresh(renderer, policy, /*hasImage=*/false, /*visibleGrayscale=*/true);
+  if (renderer.grayscaleCapabilities().base == HalDisplay::GrayscaleBase::Combined) {
+    renderer.displayGrayscaleBase(refreshModeFor(refresh));
   } else {
-    pagesUntilFullRefresh--;
+    renderer.displayBuffer(refreshModeFor(refresh));
   }
+  policy.commit(refresh);
 }
 
 // Grayscale anti-aliasing pass. Renders content twice (LSB + MSB) to build
@@ -215,14 +263,14 @@ inline void displayBaseWithRefreshCycle(const GfxRenderer& renderer, int& pagesU
 // and other overlays should be drawn before calling this.
 // Kept as a template to avoid std::function overhead; instantiated once per reader type.
 template <typename RenderFn>
-void renderAntiAliased(GfxRenderer& renderer, RenderFn&& renderFn) {
+bool renderAntiAliased(GfxRenderer& renderer, RenderFn&& renderFn) {
   if (!renderer.storeBwBuffer()) {
     LOG_ERR("READER", "Failed to store BW buffer for anti-aliasing");
     // A combined-base panel may still hold a deferred B/W activation; flush it
     // so the page reaches the panel even without its grays.
     if (renderer.grayscaleCapabilities().base == HalDisplay::GrayscaleBase::Combined)
       renderer.cleanupGrayscaleWithFrameBuffer();
-    return;
+    return false;
   }
 
   renderer.clearScreen(0x00);
@@ -239,6 +287,7 @@ void renderAntiAliased(GfxRenderer& renderer, RenderFn&& renderFn) {
   renderer.setRenderMode(GfxRenderer::BW);
 
   renderer.restoreBwBuffer();
+  return true;
 }
 
 struct BackNavCallback {

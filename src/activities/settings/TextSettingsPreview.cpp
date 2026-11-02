@@ -23,9 +23,9 @@ PreviewLayout::~PreviewLayout() = default;
 
 namespace {
 
-// Map the paragraph-alignment setting to the engine's CssTextAlign (BOOK_STYLE = justified)
+// The sample has no embedded alignment; Book style uses the reader's left fallback.
 CssTextAlign toCssAlign(uint8_t align) {
-  if (align == CrossPointSettings::BOOK_STYLE) return CssTextAlign::Justify;
+  if (align == CrossPointSettings::BOOK_STYLE) return CssTextAlign::Left;
   return static_cast<CssTextAlign>(align);
 }
 
@@ -83,8 +83,9 @@ void renderPreview(const GfxRenderer& renderer, PreviewLayout& layout, int previ
   const int lineH = renderer.getTextHeight(fontId);
   if (lineH <= 0) return;
 
-  const int textLeft = left + SETTINGS.screenMargin;
-  const int textWidth = width - 2 * SETTINGS.screenMargin;
+  const uint8_t margin = SETTINGS.readerMargin(renderer.getScreenWidth() > renderer.getScreenHeight());
+  const int textLeft = left + margin;
+  const int textWidth = width - 2 * margin;
   if (textWidth <= 0) return;
 
   const float compression = SETTINGS.getReaderLineCompression();
@@ -99,7 +100,7 @@ void renderPreview(const GfxRenderer& renderer, PreviewLayout& layout, int previ
   // FontCacheManager::PrewarmScope, used solely by the reader/dictionary activities.
   const PreviewKey key{.fontId = fontId,
                        .fontPointSize = SETTINGS.fontPointSize,
-                       .screenMargin = SETTINGS.screenMargin,
+                       .screenMargin = margin,
                        .textWidth = textWidth,
                        .lineCompression = compression,
                        .alignment = SETTINGS.paragraphAlignment,

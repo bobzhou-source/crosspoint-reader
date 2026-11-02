@@ -1,8 +1,8 @@
 #pragma once
+#include <CheckedTable.h>
 #include <Print.h>
 
 #include <algorithm>
-#include <deque>
 #include <vector>
 
 #include "Epub.h"
@@ -46,7 +46,7 @@ class ContentOpfParser final : public Print {
     uint16_t idLen;       // length for collision reduction
     uint32_t fileOffset;  // offset in .items.bin
   };
-  std::deque<ItemIndexEntry> itemIndex;
+  CheckedTable<ItemIndexEntry> itemIndex;
   bool useItemIndex = false;
 
   // FNV-1a hash function

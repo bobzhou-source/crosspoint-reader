@@ -422,11 +422,15 @@ void TextSettingsActivity::confirmLayoutRow(int row) {
       break;
     case LayoutRow::ScreenMargin: {
       std::vector<std::string> options;
-      options.reserve((MARGIN_MAX - MARGIN_MIN) / MARGIN_STEP + 1);
+      options.reserve((MARGIN_MAX - MARGIN_MIN) / MARGIN_STEP + 2);
+      options.emplace_back(tr(STR_AUTO));
       for (int m = MARGIN_MIN; m <= MARGIN_MAX; m += MARGIN_STEP) options.push_back(std::to_string(m));
-      const int cur = (std::clamp<int>(SETTINGS.screenMargin, MARGIN_MIN, MARGIN_MAX) - MARGIN_MIN) / MARGIN_STEP;
+      const int cur = SETTINGS.screenMargin == CrossPointSettings::SCREEN_MARGIN_AUTO
+                          ? 0
+                          : 1 + (std::clamp<int>(SETTINGS.screenMargin, MARGIN_MIN, MARGIN_MAX) - MARGIN_MIN) / MARGIN_STEP;
       optionPopup_.show(StrId::STR_SCREEN_MARGIN, options, cur, [](int idx) {
-        SETTINGS.screenMargin = static_cast<uint8_t>(MARGIN_MIN + idx * MARGIN_STEP);
+        SETTINGS.screenMargin = idx == 0 ? CrossPointSettings::SCREEN_MARGIN_AUTO
+                                        : static_cast<uint8_t>(MARGIN_MIN + (idx - 1) * MARGIN_STEP);
         SETTINGS.saveToFile();
       });
       requestUpdate();
@@ -458,7 +462,8 @@ std::string TextSettingsActivity::layoutValueText(int row) const {
                                                   : I18N.get(StrId::STR_SPACING_ZERO);
     }
     case LayoutRow::ScreenMargin:
-      return std::to_string(SETTINGS.screenMargin);
+      return SETTINGS.screenMargin == CrossPointSettings::SCREEN_MARGIN_AUTO ? tr(STR_AUTO)
+                                                                           : std::to_string(SETTINGS.screenMargin);
 
     default:
       return "";

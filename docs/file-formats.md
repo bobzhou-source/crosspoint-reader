@@ -4,6 +4,18 @@ These formats describe the SD-card cache files under `/.crosspoint/epub_<hash>/`
 All POD fields are written in the ESP32 little-endian representation used by
 `Serialization.h`; strings are length-prefixed UTF-8.
 
+The EPUB cache key is `std::hash<std::string>` of the original document path.
+Native EPUB callers use that same path whether they supply it explicitly or let
+the constructor default it; converted documents retain their original source
+path rather than the temporary EPUB path. Reader, Home, sleep-cover and per-book
+cache clearing must therefore resolve the same directory.
+
+Per-book clearing removes only the selected book's cache directory. Older
+firmware could incorrectly share the empty-path hash among two-argument EPUB
+callers. That directory is not migrated or deleted by this operation: its
+contents cannot be attributed reliably to a particular book. Any separate
+cleanup must first confirm that no retained cache references still use it.
+
 ## `book.bin`
 
 ### Version 10
@@ -89,6 +101,19 @@ if (parsedSize != fileSize) {
 ```
 
 ## `section.bin`
+
+### Version 50
+
+The serialized layout is unchanged. Cached pages are rebuilt because justification
+expansion is bounded, line-breaking whitespace handling is corrected, and `<br>`
+continues the same paragraph without adding the user's paragraph gap or clearing
+its text style. Ordinary HTML whitespace collapses across inline nodes; explicit
+nonbreaking spaces remain preserved.
+
+### Version 49
+
+Book-style paragraphs without an explicit alignment fall back to left alignment
+instead of justification. The serialized layout is unchanged.
 
 ### Version 48
 
@@ -200,7 +225,7 @@ import std.mem;
 import std.string;
 import std.core;
 
-#define EXPECTED_VERSION 48
+#define EXPECTED_VERSION 50
 #define MAX_STRING_LENGTH 65535
 #define FOOTNOTE_NUMBER_LEN 32
 #define FOOTNOTE_HREF_LEN 256
@@ -489,6 +514,53 @@ If every current record reuses metadata, the old and new counts agree, and no
 unreadable entry was seen, the staging files are discarded and the live index is
 left byte-for-byte unchanged. A normal rebuild action is therefore a freshness
 check, not a forced metadata reread.
+
+### Background refresh and interrupted builds
+
+The Library retains its validated index while a low-priority worker scans the
+card and prepares `library.new`. Only the UI publishes that file, after closing
+the displayed index under the render lock. A small progress readout reports
+scanned entries and completed metadata work. Leaving the screen cancels and joins
+the worker; reopening resumes completed metadata work. Home never builds the index
+just to fill empty cover-grid slots.
+Opening a book also cancels and joins **before** constructing the reader. The
+current metadata parse/checkpoint and staging cleanup finish before the worker
+signals completion. Therefore old-index list moves can be measured during a
+dirty rebuild, and book-open latency can include cancellation, but subsequent
+reader page turns run with indexing paused—not concurrently with that worker.
+
+A build claims `library.dirty` as `library.updating`. Successful publication
+removes only `library.updating`; a new `library.dirty` written by a concurrent
+transfer remains pending. Failure or cancellation leaves a retry marker.
+
+`library.resume` is a bounded, disposable metadata journal, not a second index.
+Its records contain a version, complete-path fingerprint, size, nonzero FAT
+mtime, bounded title/author bytes and a checksum. Successful metadata that fits
+the journal's bounds is synced; oversized values and unknown timestamps are
+reparsed after interruption rather than truncated before author normalization.
+After a restart only complete checksummed records with matching identity are
+reused. A torn tail is overwritten. Directory enumeration is always repeated,
+so removed files are dropped even after interruption. Journal memory is bounded
+by 4,096 compact lookup keys and one record; it is released before index sorting.
+The journal is removed after successful publication. CLX1 v2 remains unchanged.
+
+Changed EPUBs read their source OPF rather than trusting the reader's path-keyed
+`book.bin`; only the current index and validated journal supply freshness-aware
+metadata. Parsing stops at the metadata boundary and never decodes a cover or
+builds spine, TOC, CSS or page caches.
+
+Adding N books requires N EPUB parses, not a parse of every unchanged book.
+Discovering removals still requires an O(total entries) directory scan, and
+emitting the packed sorted index still writes O(total entries) bytes. Ordinary
+paging reads only visible records. A fallible 512-byte blob window shares a
+row's filename/title/author reads; allocation failure uses direct reads.
+
+The Library keeps the materialized visible rows in RAM across selection and
+background-progress repaints. Changing the viewport or its capacity, filtering,
+sorting, changing pinned recents, collapsing/expanding groups, or publishing a
+changed index refreshes that window. Reusing it performs no index reads and
+does not change selection/scroll state or the panel refresh policy. The Title
+view derives each heading from the same record read that supplies its row text.
 
 ### Header flags
 

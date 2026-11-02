@@ -5,14 +5,10 @@
 #include "components/UiAppHost.h"
 #include "util/ButtonNavigator.h"
 
-// Top-anchored control center opened by a top-edge down-swipe, a status-bar tap,
-// or a button bound to "Control Center" (iOS Control Center style): a grabber,
-// the frontlight brightness/warmth sliders (on boards with a light), and a grid
-// of quick-setting tiles — night mode, ghost-cleanup refresh, reading
-// orientation, and reader touch controls on/off. The
-// frontlight controls are always there: they are what the panel is for. Pure
-// 1-bit: no dithered fills, selection reads as a filled tile. The grabber sits
-// along the panel's bottom edge, the edge the sheet is dragged from.
+// Top-anchored controls opened by a top-edge down-swipe, a status-bar tap,
+// or the Control Center button action. Brightness and warmth stay live while
+// the sheet is open; quick actions retain their existing settings routes.
+// The sheet's measured free edge is also the outside-tap dismissal boundary.
 class FrontlightPanelActivity final : public Activity, private UiAppHost {
   ButtonNavigator buttonNavigator;
 
@@ -35,19 +31,12 @@ class FrontlightPanelActivity final : public Activity, private UiAppHost {
   uint8_t touchModeRestore = CrossPointSettings::TOUCH_READER_ON;
   int panelBottom = 0;
 
-  // Quick-setting tiles, in grid order (2 columns): night mode, refresh,
-  // orientation, touch. Fixed set — shown on touch boards, absent elsewhere.
+  // Fixed quick-action order: night mode, refresh, orientation, touch.
   static constexpr int kTileCount = 4;
 
-  // fui::SliderRowProps and fui::TileGridProps embed a 324-byte fui::StyleSet,
-  // so the props the render path fills in live here instead of on the stack
-  // (AGENTS.md: locals stay under 256 bytes). The components take them by
-  // const reference and draw immediately, so one instance per call site is
-  // enough — every field either is reassigned on each use or keeps its
-  // constructed default.
+  // SliderRowProps embeds a StyleSet; reuse it rather than putting it on
+  // the constrained render-task stack.
   freeink::ui::SliderRowProps rowProps;
-  freeink::ui::TileGridProps gridProps;
-  freeink::ui::TileGridItem gridItems[kTileCount];
 
   static void panelScreen(UiScreen& screen, void* user);
   static void onBrightnessEvent(const freeink::ui::ActionEvent& event, void* user);
@@ -58,12 +47,10 @@ class FrontlightPanelActivity final : public Activity, private UiAppHost {
   static void onTileEvent(const freeink::ui::ActionEvent& event, void* user);
 
   void buildPanelScreen(UiScreen& screen);
-  // One slider row: a caption line (name + live percentage) above
-  // [-] [draggable 1-bit capsule] [+], plus a lamp on/off button after the +
-  // when showToggle is set (the brightness row).
+  // Caption and value above [-] [draggable level] [+], with a lamp toggle
+  // after the brightness row's +. Painting and routing share the row rect.
   void addSliderRow(UiScreen& screen, const char* label, uint8_t value, freeink::ui::ActionId sliderAction,
                     freeink::ui::ActionId stepAction, bool showToggle);
-  int computePanelBottom() const;
   void adjustBrightness(int delta);
   void adjustWarmth(int delta);
   void toggleLight();

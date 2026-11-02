@@ -185,9 +185,9 @@ class GfxRenderer {
   const std::map<int, SdCardFont*>& getSdCardFonts() const { return sdCardFonts_; }
   bool isSdCardFont(int fontId) const { return sdCardFonts_.count(fontId) > 0; }
   // TTF (vector) fonts rendered via TtfEpdFont/FreeInkFont. Registered like an
-  // ordinary EpdFontFamily (insertFont), plus tracked here so ensureSdCardFontReady()
-  // rebuilds their per-page glyph set on demand — the eager analogue of the SD
-  // font prewarm. The TtfEpdFont is owned by the caller (SdCardFontSystem).
+  // ordinary EpdFontFamily (insertFont), plus tracked here so FontCacheManager
+  // can add render-scan coverage and invalidate/release their retained glyph
+  // caches. The TtfEpdFont is owned by the caller (SdCardFontSystem).
   void registerTtfFont(int fontId, TtfEpdFont* font) { ttfFonts_[fontId] = font; }
   void unregisterTtfFont(int fontId) { ttfFonts_.erase(fontId); }
   const std::map<int, TtfEpdFont*>& getTtfFonts() const { return ttfFonts_; }
@@ -217,15 +217,24 @@ class GfxRenderer {
   int getScreenHeight() const;
   void tapToLogical(float nx, float ny, int& outX, int& outY) const;
   void displayBuffer(HalDisplay::RefreshMode refreshMode = HalDisplay::FAST_REFRESH) const;
-  // One-shot: the next displayBuffer()/displayBufferAsync() call uses `mode`
-  // instead of what its caller asked for, then the override clears itself.
-  // Lets a closing overlay (the control center's refresh tile) hand a
-  // ghost-cleanup waveform to the repaint of whatever screen is underneath,
-  // which it cannot reach directly.
+  // One-shot: the next displayBuffer()/displayBufferAsync()/displayGrayscaleBase()
+  // call uses `mode` instead of what its caller asked for, then the override
+  // clears itself. Lets a closing overlay (the control center's refresh tile)
+  // hand a ghost-cleanup waveform to the repaint of whatever screen is
+  // underneath, which it cannot reach directly.
   void promoteNextRefresh(const HalDisplay::RefreshMode mode) const {
     promotedRefreshPending_ = true;
     promotedRefresh_ = mode;
   }
+  // True while a promotion to a clearing (HALF/FULL) refresh is queued, so a
+  // reader's refresh policy can account the next frame as a clear.
+  bool hasPendingClearingRefresh() const {
+    return promotedRefreshPending_ && promotedRefresh_ != HalDisplay::FAST_REFRESH;
+  }
+  // Read-only pixel statistics of the composed framebuffer against the last
+  // displayed frame; see HalDisplay::measureFrameChange. Call after drawing and
+  // before displaying the frame.
+  HalDisplay::FrameChangeMetrics measureFrameChange() const { return display.measureFrameChange(); }
   // Non-blocking refresh: starts the waveform and returns so CPU work (e.g.
   // grayscale strip rendering) can overlap the panel's refresh time. The
   // framebuffer must stay untouched until waitRefreshComplete(). Falls back to

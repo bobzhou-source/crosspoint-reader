@@ -39,11 +39,23 @@ FontCacheManager::FontCacheManager(const std::map<int, EpdFontFamily>& fontMap,
 
 void FontCacheManager::setFontDecompressor(FontDecompressor* d) { fontDecompressor_ = d; }
 
-void FontCacheManager::clearCache() {
+// Per-render transient state only: the compressed-font page buffers and the
+// SD (.cpfont) mini glyph caches. Deliberately leaves every TTF (vector)
+// face alone — their bounded glyph/kerning working set is the book's, not the
+// page's, and rebuilding it each scope means re-rasterizing through streamed
+// SD reads (see TtfEpdFont.h "Lifetime of cached content").
+void FontCacheManager::resetScopeTransientCaches() {
   if (fontDecompressor_) fontDecompressor_->clearCache();
   for (auto& [id, font] : sdCardFonts_) {
     font->clearCache();
   }
+}
+
+// Explicit invalidation: everything resetScopeTransientCaches() drops, plus
+// every TTF face's cached glyphs/kerning (allocations kept). Used by callers
+// that need a genuinely cold cache and by the render-glyph-cache memory sink.
+void FontCacheManager::clearCache() {
+  resetScopeTransientCaches();
 #if CROSSPOINT_VECTOR_FONTS
   for (auto& [id, font] : ttfFonts_) {
     if (font) font->clearCache();
@@ -66,17 +78,19 @@ void FontCacheManager::releaseSdFontCaches() {
 void FontCacheManager::prewarmCache(int fontId, const char* utf8Text, uint8_t styleMask, bool accumulate) {
   // TTF (vector) font prewarm path. This is the single dispatch every draw path
   // funnels through (reader endScanAndPrewarm, the settings preview, UI text),
-  // so building here covers them all. accumulate=false means "this is the whole
-  // glyph set for this render" → replace; accumulate=true → add incrementally.
-  // styleMask is ignored: a TTF face has no synthesized bold/italic here.
+  // so warming here covers them all. A TTF font always ADDS coverage: its
+  // bounded glyph/kerning cache is a book-level working set that survives
+  // render scopes, so `accumulate=false` (the scan's "complete set for this
+  // render") must not route to TtfEpdFont::build(), which flushes the regular
+  // face and would discard earlier pages' glyphs and any font/style group
+  // already warmed in this scope. Only absent codepoints are rasterized; the
+  // byte/glyph caps still flush inside TtfEpdFont when full. styleMask is
+  // unused: batch coverage targets the regular face and the lazy
+  // bold/italic faces fault on first draw, then are retained the same way.
 #if CROSSPOINT_VECTOR_FONTS
   auto tit = ttfFonts_.find(fontId);
   if (tit != ttfFonts_.end() && tit->second) {
-    if (accumulate) {
-      tit->second->addCoverage(utf8Text);
-    } else {
-      tit->second->build(utf8Text);
-    }
+    tit->second->addCoverage(utf8Text);
     return;
   }
 #endif
@@ -189,7 +203,7 @@ void FontCacheManager::recordText(const char* text, int fontId, EpdFontFamily::S
 
 FontCacheManager::PrewarmScope::PrewarmScope(FontCacheManager& manager) : manager_(&manager) {
   manager_->scanMode_ = ScanMode::Scanning;
-  manager_->clearCache();
+  manager_->resetScopeTransientCaches();
   manager_->resetStats();
   manager_->scanCodepointCount_ = 0;
   manager_->scanFontCount_ = 0;
@@ -226,7 +240,8 @@ void FontCacheManager::PrewarmScope::endScanAndPrewarm() {
 
     const uint8_t fontSlot = static_cast<uint8_t>(group) / 4;
     const uint8_t style = static_cast<uint8_t>(group) & 0x03;
-    // This group is the complete glyph set for one font/style in this render.
+    // This group is the complete glyph set for one font/style in this render:
+    // SD and built-in caches replace with it; a TTF font only adds what it lacks.
     manager_->prewarmCache(manager_->scanFontIds_[fontSlot], utf8Text, 1 << style, /*accumulate=*/false);
   }
 
@@ -238,7 +253,7 @@ void FontCacheManager::PrewarmScope::endScanAndPrewarm() {
 FontCacheManager::PrewarmScope::~PrewarmScope() {
   if (active_) {
     endScanAndPrewarm();  // no-op if already called
-    manager_->clearCache();
+    manager_->resetScopeTransientCaches();
   }
 }
 

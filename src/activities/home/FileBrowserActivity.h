@@ -27,6 +27,7 @@ class FileBrowserActivity final : public UiListActivity {
   std::string basepath = "/";
   std::vector<std::string> files;
   std::unique_ptr<char[]> fileNameBuffer;
+  bool loadFailed = false;
   OptionPopup optionPopup;
 
   // Pull-based rows: the SDK list resolves each drawn row on demand through

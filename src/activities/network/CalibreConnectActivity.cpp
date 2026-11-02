@@ -182,56 +182,65 @@ void CalibreConnectActivity::loop() {
 void CalibreConnectActivity::render(RenderLock&&) {
   const auto& metrics = UITheme::getInstance().getMetrics();
   const auto pageWidth = renderer.getScreenWidth();
-  const auto pageHeight = renderer.getScreenHeight();
 
   renderer.clearScreen();
 
   GUI.drawHeader(renderer, Rect{0, metrics.topPadding, pageWidth, metrics.headerHeight}, tr(STR_CALIBRE_WIRELESS));
-  const auto height = renderer.getLineHeight(UI_10_FONT_ID);
-  const auto top = (pageHeight - height) / 2;
+  const Rect body = UITheme::getContentBounds(renderer);
 
   if (state == CalibreConnectState::SERVER_STARTING) {
-    renderer.drawCenteredText(UI_12_FONT_ID, top, tr(STR_CALIBRE_STARTING));
+    UITheme::drawCenteredWrappedText(renderer, body, UI_12_FONT_ID, tr(STR_CALIBRE_STARTING), 6);
   } else if (state == CalibreConnectState::ERROR) {
-    renderer.drawCenteredText(UI_12_FONT_ID, top, tr(STR_CONNECTION_FAILED), true, EpdFontFamily::BOLD);
+    UITheme::drawCenteredWrappedText(renderer, body, UI_12_FONT_ID, tr(STR_CONNECTION_FAILED), 6, true,
+                                     EpdFontFamily::BOLD);
   } else if (state == CalibreConnectState::SERVER_RUNNING) {
     GUI.drawSubHeader(renderer, Rect{0, metrics.topPadding + metrics.headerHeight, pageWidth, metrics.tabBarHeight},
                       connectedSSID.c_str(), (std::string(tr(STR_IP_ADDRESS_PREFIX)) + connectedIP).c_str());
 
-    int y = metrics.topPadding + metrics.headerHeight + metrics.tabBarHeight + metrics.verticalSpacing * 4;
-    const auto heightText12 = renderer.getTextHeight(UI_12_FONT_ID);
-    renderer.drawText(UI_12_FONT_ID, metrics.contentSidePadding, y, tr(STR_CALIBRE_SETUP), true, EpdFontFamily::BOLD);
-    y += heightText12 + metrics.verticalSpacing * 2;
-
-    renderer.drawText(SMALL_FONT_ID, metrics.contentSidePadding, y, tr(STR_CALIBRE_INSTRUCTION_1));
-    renderer.drawText(SMALL_FONT_ID, metrics.contentSidePadding, y + height, tr(STR_CALIBRE_INSTRUCTION_2));
-    renderer.drawText(SMALL_FONT_ID, metrics.contentSidePadding, y + height * 2, tr(STR_CALIBRE_INSTRUCTION_3));
-    renderer.drawText(SMALL_FONT_ID, metrics.contentSidePadding, y + height * 3, tr(STR_CALIBRE_INSTRUCTION_4));
-
-    y += height * 3 + metrics.verticalSpacing * 4;
-    renderer.drawText(UI_12_FONT_ID, metrics.contentSidePadding, y, tr(STR_CALIBRE_STATUS), true, EpdFontFamily::BOLD);
-    y += heightText12 + metrics.verticalSpacing * 2;
-
+    Rect setup = body;
+    setup.y += metrics.tabBarHeight;
+    setup.height = std::max(0, setup.height - metrics.tabBarHeight);
+    Rect status = setup;
+    if (setup.width > setup.height) {
+      setup.width = (setup.width - 24) / 2;
+      status.x = setup.x + setup.width + 24;
+      status.width = setup.width;
+    } else {
+      setup.height = (setup.height - 24) * 2 / 3;
+      status.y = setup.y + setup.height + 24;
+      status.height = body.y + body.height - status.y;
+    }
+    const int headingHeight = renderer.getLineHeight(UI_12_FONT_ID) * 2;
+    UITheme::drawCenteredWrappedText(renderer, Rect{setup.x, setup.y, setup.width, headingHeight},
+                                     UI_12_FONT_ID, tr(STR_CALIBRE_SETUP), 2, true, EpdFontFamily::BOLD);
+    const char* instructions[] = {tr(STR_CALIBRE_INSTRUCTION_1), tr(STR_CALIBRE_INSTRUCTION_2),
+                                   tr(STR_CALIBRE_INSTRUCTION_3), tr(STR_CALIBRE_INSTRUCTION_4)};
+    const int slotHeight = std::max(0, (setup.height - headingHeight - 8) / 4);
+    for (int i = 0; i < 4; ++i) {
+      UITheme::drawCenteredWrappedText(renderer,
+          Rect{setup.x, setup.y + headingHeight + 8 + i * slotHeight, setup.width, slotHeight},
+          SMALL_FONT_ID, instructions[i], 4);
+    }
+    UITheme::drawCenteredWrappedText(renderer, Rect{status.x, status.y, status.width, headingHeight},
+                                     UI_12_FONT_ID, tr(STR_CALIBRE_STATUS), 2, true, EpdFontFamily::BOLD);
+    int y = status.y + headingHeight + 8;
+    const int endY = status.y + status.height;
     if (lastProgressTotal > 0 && lastProgressReceived <= lastProgressTotal) {
       std::string label = tr(STR_CALIBRE_RECEIVING);
-      if (!currentUploadName.empty()) {
-        label += ": " + currentUploadName;
-        label = renderer.truncatedText(SMALL_FONT_ID, label.c_str(), pageWidth - metrics.contentSidePadding * 2,
-                                       EpdFontFamily::REGULAR);
-      }
-      renderer.drawText(SMALL_FONT_ID, metrics.contentSidePadding, y, label.c_str());
-      GUI.drawProgressBar(renderer,
-                          Rect{metrics.contentSidePadding, y + height + metrics.verticalSpacing,
-                               pageWidth - metrics.contentSidePadding * 2, metrics.progressBarHeight},
+      if (!currentUploadName.empty()) label += ": " + currentUploadName;
+      const int labelHeight = std::min(renderer.getLineHeight(SMALL_FONT_ID) * 2,
+                                       std::max(0, endY - y - metrics.progressBarHeight - 16));
+      UITheme::drawCenteredWrappedText(renderer, Rect{status.x, y, status.width, labelHeight},
+                                       SMALL_FONT_ID, label.c_str(), 2);
+      y += labelHeight + 8;
+      GUI.drawProgressBar(renderer, Rect{status.x, y, status.width, metrics.progressBarHeight},
                           lastProgressReceived, lastProgressTotal);
-      y += height + metrics.verticalSpacing * 2 + metrics.progressBarHeight;
+      y += metrics.progressBarHeight + 8;
     }
-
     if (lastCompleteAt > 0 && (millis() - lastCompleteAt) < 6000) {
-      std::string msg = std::string(tr(STR_CALIBRE_RECEIVED)) + lastCompleteName;
-      msg = renderer.truncatedText(SMALL_FONT_ID, msg.c_str(), pageWidth - metrics.contentSidePadding * 2,
-                                   EpdFontFamily::REGULAR);
-      renderer.drawText(SMALL_FONT_ID, metrics.contentSidePadding, y, msg.c_str());
+      const std::string message = std::string(tr(STR_CALIBRE_RECEIVED)) + lastCompleteName;
+      UITheme::drawCenteredWrappedText(renderer, Rect{status.x, y, status.width, std::max(0, endY - y)},
+                                       SMALL_FONT_ID, message.c_str(), 6);
     }
 
     const auto labels = mappedInput.mapLabels(tr(STR_EXIT), "", "", "");

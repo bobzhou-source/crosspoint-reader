@@ -1,6 +1,7 @@
 #pragma once
 
 #include <Epub/Page.h>
+#include <I18n.h>
 
 #include <cstdint>
 #include <memory>
@@ -9,6 +10,7 @@
 
 #include "activities/Activity.h"
 #include "util/ButtonNavigator.h"
+#include "util/Dictionary.h"
 
 // Paged viewer for one dictionary definition. HTML definitions are laid out
 // through the EPUB chapter parser into styled Pages; anything else (plain
@@ -17,11 +19,16 @@
 class DictionaryDefinitionActivity final : public Activity {
  public:
   explicit DictionaryDefinitionActivity(GfxRenderer& renderer, MappedInputManager& mappedInput, std::string headword,
-                                        std::string definition, bool htmlDefinition = false)
+                                        std::string definition, bool htmlDefinition = false,
+                                        Dictionary* dictionary = nullptr, const char* run = "", uint8_t matchMask = 0)
       : Activity("DictionaryDefinition", renderer, mappedInput),
         headword(std::move(headword)),
         definition(std::move(definition)),
-        htmlDefinition(htmlDefinition) {}
+        htmlDefinition(htmlDefinition),
+        dictionary(dictionary),
+        matchMask(matchMask) {
+    strncpy(cjkRun, run, sizeof(cjkRun) - 1);
+  }
 
   void onEnter() override;
   void onExit() override;
@@ -47,12 +54,19 @@ class DictionaryDefinitionActivity final : public Activity {
   void wrapText();
   int measureSpan(int fontId, const char* text, size_t len) const;
   void drawBody(int fontId, int x, int startY) const;
+  void changeMatch(int direction);
+  void layoutDefinition();
 
-  const std::string headword;
+  std::string headword;
   // Not const: onEnter() normalizes embedded NULs (StarDict multi-type
   // separators) to newlines so C-string APIs see the whole text.
   std::string definition;
   const bool htmlDefinition;
+  Dictionary* dictionary;  // Parent word selector owns it throughout this activity.
+  char cjkRun[CjkDictionary::RUN_BYTES] = {};
+  uint8_t matchMask = 0;
+  bool lookupFailed = false;
+  StrId lookupError = StrId::STR_DICT_ERROR;
   // Styled path: reader-identical Pages laid out from the HTML definition.
   // Empty means the plain-text span path below is active.
   std::vector<std::unique_ptr<Page>> pages;

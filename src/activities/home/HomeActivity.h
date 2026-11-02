@@ -1,4 +1,5 @@
 #pragma once
+#include <atomic>
 #include <functional>
 #include <vector>
 
@@ -6,6 +7,7 @@
 #include "RecentBooksStore.h"
 #include "activities/Activity.h"
 #include "components/CoverGridHomeUi.h"
+#include "components/UITheme.h"
 #include "util/ButtonNavigator.h"
 
 struct Rect;
@@ -13,6 +15,7 @@ struct Rect;
 class HomeActivity final : public Activity {
   std::unique_ptr<CoverGridHomeUi> coverGridUi;
   ButtonNavigator buttonNavigator;
+  int firstMenuRow = 0;
   int selectorIndex = 0;
   bool recentsLoading = false;
   bool recentsLoaded = false;
@@ -33,15 +36,21 @@ class HomeActivity final : public Activity {
   std::vector<RecentBook> recentBooks;
   const HomeMenuItem initialMenuItem;
   const bool cleanInitialRefresh;
+  // A Library transition may prepare private data during the blocking waveform,
+  // but never while Home draws/updates recents or performs post-frame cover I/O.
+  enum class NavigationFramePhase : uint8_t { Idle, Drawing, Waveform, Frozen };
+  std::atomic<NavigationFramePhase> navigationFramePhase{NavigationFramePhase::Idle};
+  std::atomic<uint32_t> feedbackRequested{0};
+  std::atomic<uint32_t> feedbackPrepared{0};
 
   // Convert HomeMenuItem to menu index (used in onEnter)
-  static int menuItemToIndex(HomeMenuItem item, bool hasOpdsUrl) {
+  int menuItemToIndex(HomeMenuItem item, bool hasOpdsUrl) const {
     int i = 0;
-    if (item == HomeMenuItem::FILE_BROWSER) return i;
+    if (item == (coverGridUi ? HomeMenuItem::FILE_BROWSER : HomeMenuItem::LIBRARY)) return i;
     ++i;
-    if (item == HomeMenuItem::LIBRARY) return i;
+    if (item == (coverGridUi ? HomeMenuItem::LIBRARY : HomeMenuItem::READING_INBOX)) return i;
     ++i;
-    if (item == HomeMenuItem::READING_INBOX) return i;
+    if (item == (coverGridUi ? HomeMenuItem::READING_INBOX : HomeMenuItem::FILE_BROWSER)) return i;
     ++i;
     if (item == HomeMenuItem::OPDS_BROWSER) return hasOpdsUrl ? i : 0;
     if (hasOpdsUrl) ++i;
@@ -52,11 +61,11 @@ class HomeActivity final : public Activity {
   }
 
   // Convert menu index to HomeMenuItem (used in loop)
-  static HomeMenuItem indexToMenuItem(int idx, bool hasOpdsUrl) {
+  HomeMenuItem indexToMenuItem(int idx, bool hasOpdsUrl) const {
     int i = 0;
-    if (idx == i++) return HomeMenuItem::FILE_BROWSER;
-    if (idx == i++) return HomeMenuItem::LIBRARY;
-    if (idx == i++) return HomeMenuItem::READING_INBOX;
+    if (idx == i++) return coverGridUi ? HomeMenuItem::FILE_BROWSER : HomeMenuItem::LIBRARY;
+    if (idx == i++) return coverGridUi ? HomeMenuItem::LIBRARY : HomeMenuItem::READING_INBOX;
+    if (idx == i++) return coverGridUi ? HomeMenuItem::READING_INBOX : HomeMenuItem::FILE_BROWSER;
     if (hasOpdsUrl && idx == i++) return HomeMenuItem::OPDS_BROWSER;
     if (idx == i++) return HomeMenuItem::FILE_TRANSFER;
     if (idx == i) return HomeMenuItem::SETTINGS_MENU;
@@ -71,6 +80,16 @@ class HomeActivity final : public Activity {
   void onOpdsBrowserOpen();
 
   int getMenuItemCount() const;
+  struct HomeLayout {
+    Rect header;
+    Rect cover;
+    Rect menu;
+    int menuBase;
+    int firstRow;
+    int visibleRows;
+    int rowHeight;
+  };
+  HomeLayout homeLayout();
   bool storeCoverBuffer();    // Store frame buffer for cover image
   bool restoreCoverBuffer();  // Restore frame buffer from stored cover
   void freeCoverBuffer();     // Free the stored cover buffer
@@ -90,5 +109,8 @@ class HomeActivity final : public Activity {
   void onExit() override;
   void loop() override;
   void render(RenderLock&&) override;
+  // Called only for a committed Home→Library replace, before RenderLock.
+  // False means no classic touch feedback was queued; never waits in that case.
+  bool prepareLibraryTransition();
   bool isHomeActivity() const override { return true; }
 };

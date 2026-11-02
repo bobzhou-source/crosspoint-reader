@@ -9,6 +9,7 @@
 
 #include "Epub/css/CssParser.h"
 #include "Page.h"
+#include "TocPageSelection.h"
 #include "hyphenation/Hyphenator.h"
 #include "parsers/ChapterHtmlSlimParser.h"
 
@@ -54,7 +55,9 @@ namespace {
 // v47: Word and character spacing in the header (cache validation); cached BlockStyle stores only character spacing.
 // v48: Hangul words wrap at spaces; with hyphenation on they may also split at a line end.
 //      Justification no longer stretches between syllables.
-constexpr uint8_t SECTION_FILE_VERSION = 48;
+// v49: Book-style paragraphs without an explicit alignment fall back to left, not justification.
+// v50: Bound justification gaps and preserve paragraph spacing/style across explicit line breaks.
+constexpr uint8_t SECTION_FILE_VERSION = 50;
 // Written into the version field while a build is in progress; patched to
 // SECTION_FILE_VERSION only when the build is finalized. An abandoned /
 // crash-interrupted .bin therefore carries version 0, which loadSectionFile rejects
@@ -511,6 +514,35 @@ std::optional<uint16_t> Section::findAnchor(const std::string& anchor) const {
   // Fall back to the on-disk anchor map: a finalized section, or a partial whose map
   // covers everything up to its watermark (nullopt past it -- build further and retry).
   return getPageForAnchor(anchor);
+}
+
+int Section::currentTocIndex() {
+  const int fallback = epub->getTocIndexForSpineIndex(spineIndex);
+  if (fallback < 0) return fallback;
+  if (tocPagesWatermark != pageCount) {
+    tocPages.clear();
+    int end = fallback;
+    while (end < epub->getTocItemsCount() && epub->getTocItem(end).spineIndex == spineIndex) ++end;
+    if (end <= fallback + 1) {
+      tocPagesWatermark = pageCount;
+      return fallback;
+    }
+    if (!tocPages.reserve(end - fallback)) {
+      LOG_ERR("SCT", "Out of memory resolving chapter titles");
+      return fallback;
+    }
+    for (int i = fallback; i < end; ++i) {
+      const auto entry = epub->getTocItem(i);
+      const auto page = entry.anchor.empty() ? std::optional<uint16_t>(0) : findAnchor(entry.anchor);
+      tocPages.push_back({i, page ? static_cast<int>(*page) : -1});
+    }
+    tocPagesWatermark = pageCount;
+  }
+  TocPageSelection selection(fallback, currentPage);
+  for (const auto& entry : tocPages) {
+    selection.consider(entry.index, entry.page < 0 ? std::nullopt : std::optional<unsigned>(entry.page));
+  }
+  return selection.selected();
 }
 
 uint16_t Section::estimatedTotalPages() const {

@@ -21,6 +21,7 @@
 #include "SettingsList.h"
 #include "WebDAVHandler.h"
 #include "WifiCredentialStore.h"
+#include "ReaderSyncProtocol.h"
 #include "html/FilesPageHtml.generated.h"
 #include "html/FontsPageHtml.generated.h"
 #include "html/HomePageHtml.generated.h"
@@ -79,6 +80,7 @@ String normalizeWebPath(const String& inputPath) {
 }
 
 bool isProtectedItemName(const String& name) {
+  if (reader_sync::privateWebPath(name.c_str())) return true;
   if (name.startsWith(".")) {
     return true;
   }
@@ -453,6 +455,7 @@ void CrossPointWebServer::handleStatus() const {
 }
 
 void CrossPointWebServer::scanFiles(const char* path, const std::function<void(FileInfo)>& callback) const {
+  if (reader_sync::privateWebPath(path)) return;
   HalFile root = Storage.open(path);
   if (!root) {
     LOG_DBG("WEB", "Failed to open directory: %s", path);
@@ -474,7 +477,7 @@ void CrossPointWebServer::scanFiles(const char* path, const std::function<void(F
     auto fileName = String(name);
 
     // Skip hidden items (starting with ".")
-    bool shouldHide = !SETTINGS.showHiddenFiles && fileName.startsWith(".");
+    bool shouldHide = reader_sync::privateWebPath(name) || (!SETTINGS.showHiddenFiles && fileName.startsWith("."));
 
     // Check against explicitly hidden items list
     if (!shouldHide) {
@@ -522,6 +525,10 @@ void CrossPointWebServer::handleFileListData() const {
   if (server->hasArg("path")) {
     currentPath = normalizeWebPath(server->arg("path"));
   }
+  if (reader_sync::privateWebPath(currentPath.c_str())) {
+    server->send(403, "text/plain", "Private system path");
+    return;
+  }
 
   server->setContentLength(CONTENT_LENGTH_UNKNOWN);
   server->send(200, "application/json", "");
@@ -565,6 +572,10 @@ void CrossPointWebServer::handleDownload() const {
   }
 
   String itemPath = normalizeWebPath(server->arg("path"));
+  if (reader_sync::privateWebPath(itemPath.c_str())) {
+    server->send(403, "text/plain", "Private system path");
+    return;
+  }
   if (itemPath.isEmpty() || itemPath == "/") {
     server->send(400, "text/plain", "Invalid path");
     return;
@@ -710,6 +721,10 @@ void CrossPointWebServer::handleUpload(UploadState& state) const {
     String filePath = state.path;
     if (!filePath.endsWith("/")) filePath += "/";
     filePath += state.fileName;
+    if (reader_sync::privateWebPath(filePath.c_str())) {
+      state.error = "Private system path";
+      return;
+    }
 
     // Check if file already exists - SD operations can be slow
     resetTaskWatchdogIfSubscribed();
@@ -851,6 +866,10 @@ void CrossPointWebServer::handleCreateFolder() const {
   String folderPath = parentPath;
   if (!folderPath.endsWith("/")) folderPath += "/";
   folderPath += folderName;
+  if (reader_sync::privateWebPath(folderPath.c_str())) {
+    server->send(403, "text/plain", "Private system path");
+    return;
+  }
 
   LOG_DBG("WEB", "Creating folder: %s", folderPath.c_str());
 
@@ -878,6 +897,10 @@ void CrossPointWebServer::handleRename() const {
 
   String itemPath = normalizeWebPath(server->arg("path"));
   String newName = server->arg("name");
+  if (reader_sync::privateWebPath(itemPath.c_str()) || reader_sync::privateWebPath(newName.c_str())) {
+    server->send(403, "text/plain", "Private system path");
+    return;
+  }
   newName.trim();
 
   if (itemPath.isEmpty() || itemPath == "/") {
@@ -960,6 +983,10 @@ void CrossPointWebServer::handleMove() const {
 
   String itemPath = normalizeWebPath(server->arg("path"));
   String destPath = normalizeWebPath(server->arg("dest"));
+  if (reader_sync::privateWebPath(itemPath.c_str()) || reader_sync::privateWebPath(destPath.c_str())) {
+    server->send(403, "text/plain", "Private system path");
+    return;
+  }
 
   if (itemPath.isEmpty() || itemPath == "/") {
     server->send(400, "text/plain", "Invalid path");
@@ -1088,6 +1115,11 @@ void CrossPointWebServer::handleDelete() const {
 
   for (const auto& p : paths) {
     auto itemPath = normalizeWebPath(p.as<String>());
+    if (reader_sync::privateWebPath(itemPath.c_str())) {
+      allSuccess = false;
+      failedItems += "Private system path; ";
+      continue;
+    }
 
     // Validate path
     if (itemPath.isEmpty() || itemPath == "/") {
@@ -1183,7 +1215,7 @@ void CrossPointWebServer::handleGetSettings() const {
   JsonDocument doc;
 
   for (const auto& s : settings) {
-    if (!s.key) continue;  // Skip ACTION-only entries
+    if (!s.key || !s.webVisible) continue;  // Skip actions and device-owned controls.
 
     doc.clear();
     doc["key"] = s.key;
@@ -1279,7 +1311,7 @@ void CrossPointWebServer::handlePostSettings() {
   int applied = 0;
 
   for (const auto& s : settings) {
-    if (!s.key) continue;
+    if (!s.key || !s.webVisible) continue;
     if (!doc[s.key].is<JsonVariant>()) continue;
 
     switch (s.type) {
@@ -1332,7 +1364,7 @@ void CrossPointWebServer::handlePostSettings() {
     }
   }
 
-  SETTINGS.saveToFile();
+  if (applied > 0) SETTINGS.saveToFile();
 
   LOG_DBG("WEB", "Applied %d setting(s)", applied);
   server->send(200, "text/plain", String("Applied ") + String(applied) + " setting(s)");
@@ -1477,6 +1509,7 @@ void CrossPointWebServer::handleGetWifiNetworks() const {
     // Never expose Wi-Fi passwords over the API — only indicate whether one is set
     doc["hasPassword"] = credentials[i].hasPassword;
     doc["isLastConnected"] = credentials[i].isLastConnected;
+    doc["type"] = credentials[i].enterprise ? "enterprise" : "psk";
 
     const size_t written = serializeJson(doc, output, outputSize);
     if (written >= outputSize) continue;
@@ -1511,6 +1544,11 @@ void CrossPointWebServer::handlePostWifiNetwork() {
     server->send(400, "text/plain", "SSID is required");
     return;
   }
+  const auto targetCredential = WIFI_STORE.findCredential(ssid);
+  if (targetCredential && targetCredential->enterprise) {
+    server->send(400, "text/plain", "Edit enterprise credentials on the reader (forget and reconnect)");
+    return;
+  }
 
   // The password field is optional in the JSON payload. When absent (vs. present but empty),
   // preserve the existing password for updates. Empty passwords are valid for open networks.
@@ -1526,6 +1564,10 @@ void CrossPointWebServer::handlePostWifiNetwork() {
     const auto credential = WIFI_STORE.getCredentialAt(static_cast<size_t>(idx));
     if (!credential) {
       server->send(400, "text/plain", "Invalid network index");
+      return;
+    }
+    if (credential->enterprise) {
+      server->send(400, "text/plain", "Edit enterprise credentials on the reader (forget and reconnect)");
       return;
     }
 
@@ -1673,6 +1715,10 @@ void CrossPointWebServer::onWebSocketEvent(uint8_t num, WStype_t type, uint8_t* 
           String filePath = wsUploadPath;
           if (!filePath.endsWith("/")) filePath += "/";
           filePath += wsUploadFileName;
+          if (reader_sync::privateWebPath(filePath.c_str())) {
+            wsServer->sendTXT(num, "ERROR:Private system path");
+            return;
+          }
 
           resetTaskWatchdogIfSubscribed();
           if (Storage.exists(filePath.c_str())) {

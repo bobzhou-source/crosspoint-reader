@@ -1,4 +1,5 @@
 #pragma once
+#include <CheckedTable.h>
 #include <functional>
 #include <memory>
 #include <optional>
@@ -19,6 +20,12 @@ class Section {
   GfxRenderer& renderer;
   std::string filePath;
   HalFile file;
+  struct TocPage {
+    int index;
+    int page;
+  };
+  CheckedTable<TocPage> tocPages;
+  int tocPagesWatermark = -1;
 
   void writeSectionFileHeader(const ReaderRenderSpec& spec);
   uint32_t onPageComplete(std::unique_ptr<Page> page);
@@ -130,6 +137,8 @@ class Section {
 
   // Look up the page number for an anchor id from the section cache file.
   std::optional<uint16_t> getPageForAnchor(const std::string& anchor) const;
+  // Page-aware chapter identity shared by the footer and Contents highlight.
+  int currentTocIndex();
 
   // Look up an anchor among the pages built so far by the in-progress build, so an anchor jump
   // (TOC / chapter select, usually the chapter top = page 0) can resolve without laying out the

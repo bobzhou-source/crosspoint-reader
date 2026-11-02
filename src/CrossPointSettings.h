@@ -134,17 +134,6 @@ class CrossPointSettings : public PersistableStore<CrossPointSettings> {
     SLEEP_TIMEOUT_COUNT
   };
 
-  // E-ink refresh frequency (pages between full refreshes).
-  enum REFRESH_FREQUENCY {
-    REFRESH_1 = 0,
-    REFRESH_5 = 1,
-    REFRESH_10 = 2,
-    REFRESH_15 = 3,
-    REFRESH_30 = 4,
-    REFRESH_NEVER = 5,
-    REFRESH_FREQUENCY_COUNT
-  };
-
   // Short power button press actions. PWR_CONFIRM is only offered on touch
   // boards (see SettingsList.h).
   enum SHORT_PWRBTN {
@@ -220,9 +209,9 @@ class CrossPointSettings : public PersistableStore<CrossPointSettings> {
 
   // Sleep screen settings
   uint8_t sleepScreen = DARK;
-  // Night mode: inverted output polarity, applied to every activity per
-  // render by ActivityManager. The sleep screen opts out itself.
+  // Night mode is output polarity; custom sleep artwork keeps its own filter.
   uint8_t screenInverted = 0;
+  uint8_t darkMenusWithNightMode = 1;
   // Sleep screen cover mode settings
   uint8_t sleepScreenCoverMode = FIT;
   // Sleep screen cover filter
@@ -274,6 +263,9 @@ class CrossPointSettings : public PersistableStore<CrossPointSettings> {
   // EPUB reading orientation settings
   // 0 = portrait (default), 1 = landscape clockwise, 2 = inverted, 3 = landscape counter-clockwise
   uint8_t orientation = PORTRAIT;
+  // Off (default): Home/Library/Settings and their sub-screens stay portrait.
+  // On: they use the reading orientation above, so the whole device rotates as one.
+  uint8_t rotateMenusWithReader = 0;
   // Button layouts (front layout retained for migration only)
   uint8_t frontButtonLayout = BACK_CONFIRM_LEFT_RIGHT;
   uint8_t sideButtonLayout = PREV_NEXT;
@@ -291,18 +283,20 @@ class CrossPointSettings : public PersistableStore<CrossPointSettings> {
   // available size (and persists the snap) whenever the family changes.
   uint8_t fontPointSize = DEFAULT_FONT_POINT_SIZE;
   uint8_t lineSpacing = NORMAL;
-  uint8_t paragraphAlignment = JUSTIFIED;
+  uint8_t paragraphAlignment = BOOK_STYLE;
   // Auto-sleep timeout setting (default 10 minutes). Legacy sleepTimeout enum values are migration-only.
   uint8_t sleepTimeoutMinutes = 10;
-  // E-ink refresh frequency (default 15 pages)
-  uint8_t refreshFrequency = REFRESH_15;
   uint8_t hyphenationEnabled = 0;
 
   // Reader screen margin settings
+  static constexpr uint8_t SCREEN_MARGIN_AUTO = 0;
   static constexpr uint8_t SCREEN_MARGIN_MIN = 5;
   static constexpr uint8_t SCREEN_MARGIN_MAX = 40;
   static constexpr uint8_t SCREEN_MARGIN_STEP = 5;
-  uint8_t screenMargin = SCREEN_MARGIN_MIN;
+  uint8_t screenMargin = SCREEN_MARGIN_AUTO;
+  uint8_t readerMargin(const bool landscape) const {
+    return screenMargin == SCREEN_MARGIN_AUTO ? (landscape ? 16 : 20) : screenMargin;
+  }
   // OPDS download destination folder ("" = SD root). Global; edited from the
   // OPDS server list. Persisted via a category-less SettingInfo::String in
   // SettingsList.h, so it stays out of the on-device Settings screen.
@@ -342,6 +336,8 @@ class CrossPointSettings : public PersistableStore<CrossPointSettings> {
   uint8_t removeReadBooksFromRecents = 0;
   // Move epub to /Read/ folder on SD card when finished (0 = disabled, 1 = enabled)
   uint8_t moveFinishedToReadFolder = 0;
+  // Edited by the Benchmark submenu; persisted without a duplicate System toggle.
+  uint8_t benchmarkRecord = 0;
   // Short press Back goes to file browser instead of home (0 = disabled, 1 = enabled)
   uint8_t backShortToFileBrowser = 0;
   // Image rendering mode in EPUB reader
@@ -445,7 +441,6 @@ class CrossPointSettings : public PersistableStore<CrossPointSettings> {
 
   float getReaderLineCompression() const;
   unsigned long getSleepTimeoutMs() const;
-  int getRefreshFrequency() const;
 };
 
 // Helper macro to access settings

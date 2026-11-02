@@ -64,6 +64,18 @@ If CrossPoint enables external RAM on your device, copy a `.ttf`, `.otf`, or
 extension becomes the family name. For example, `/fonts/Bookerly.ttf` appears as
 `Bookerly` in **Settings > Reader > Font Family**.
 
+The current embedded FreeType build supports **TrueType (`glyf`) outlines**, not
+CFF/CFF2 outlines. A filename ending in `.otf` is therefore not enough: the
+official Noto Serif CJK and Source Han `.otf` releases use CFF and cannot load
+directly. Use a TrueType version, or convert those files to `.cpfont` with the
+converter below. A `.ttc` collection uses its first face only; there is no
+collection-face selector.
+
+For Chinese reading, `LXGWWenKaiGBScreen.ttf` (霞鹜文楷 GB 屏幕阅读版) is a
+TrueType option with mainland-standard character forms and a heavier reading
+weight. A static 400-weight instance of Google Fonts' `NotoSerifSC[wght].ttf`
+offers a more conventional Song-style alternative.
+
 For a family with separate styles, put its files in one subfolder. The folder
 name becomes the family name. For example:
 
@@ -78,10 +90,57 @@ file in the same family folder takes priority over TTF/OTF/TTC files, so keep
 the two formats in separate folders. If both font roots contain the same family
 name, the copy in `/.fonts/` takes priority.
 
-Direct fonts use the standard reader sizes: 12, 14, 16, and 18 pt. The **Fonts**
+Direct fonts offer integer reading sizes from 8 to 22 pt. The **Fonts**
 tab in File Transfer accepts `.cpfont` files only. Copy direct fonts to the SD
 card instead. To remove a loose font file, delete that file from the SD card.
 The Fonts page can delete families stored in subfolders.
+
+## Font Cache Behavior
+
+Both font back ends remember what they have already measured or rasterized, so
+turning a page only pays for the glyphs that page has not shown before.
+
+### Direct TTF/OTF/TTC fonts
+
+Each style (regular, bold, italic, bold italic) has its own cache of glyph
+metrics, glyph bitmaps and kerning pairs, filled on demand from the font file.
+
+- **Kept across pages.** Starting or finishing a page's render does not empty the
+  cache. A page whose glyphs are all cached costs no FreeType work and no
+  font-file reads.
+- **One FreeType load per new glyph.** The fractional advance (1/16 pixel
+  precision) and the bitmap come from the same glyph load, so line widths and
+  pagination are unchanged.
+- **Prewarm adds to the regular cache.** Preparing a page adds the glyphs it has
+  not seen to the regular style's cache. The bold, italic and bold italic faces
+  load the glyphs they draw the first time they draw them.
+- **Bounded.** Each style cache stops at a glyph-count and byte limit: 4096
+  glyphs and 1 MB with external RAM, 768 glyphs and 32 KB without (interface
+  fallback fonts: 384 glyphs, 16 KB). When a cache is full, the next new glyph
+  empties that style's cache and it refills from the page being drawn, so memory
+  never grows past the limit.
+- **Failed glyphs get a retry.** If a glyph's bitmap cannot be produced (a
+  FreeType error, or no memory to grow the cache), its width is still cached so
+  layout is unaffected, and it draws blank. The next page preparation rebuilds
+  that style's cache so the glyph gets another attempt. A glyph that fails every
+  time keeps its style rebuilding page by page, which costs what that style cost
+  before caches were kept across pages. A glyph too large for the whole byte
+  limit is not a failure and is not retried.
+- **Emptied by:** changing the font family, size, bit depth or source files,
+  `FontCacheManager::clearCache()` (an explicit full flush), a full cache (see
+  above), and memory-pressure releases (Wi-Fi and the web server, image
+  decoding, the dictionary, sleep), which also free the bold, italic and bold
+  italic faces and the cache memory. Everything is rebuilt on demand afterwards.
+
+### `.cpfont` fonts
+
+`.cpfont` glyph advances are cached per style the first time text needs them.
+Preparing a page whose characters are all cached reads nothing from the card and
+allocates nothing, and a page with some new characters looks up only those. Each
+style keeps at most 768 advances (the lowest code points when one build
+overflows); once a style's table is full no more are added, and other
+characters take the slower per-glyph lookup when drawn. The table survives page
+turns and is dropped when the font is unloaded and on memory-pressure releases.
 
 ## CJK in the User Interface
 

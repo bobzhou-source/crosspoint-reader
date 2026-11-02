@@ -229,6 +229,9 @@ class BaseTheme {
  public:
   virtual ~BaseTheme() = default;
 
+  // Serif is opt-in per complete string; unsupported scripts retain the UI fallback.
+  int titleFontId(const GfxRenderer& renderer, const char* text) const;
+
   // Component drawing methods
   static void drawCoverPlaceholder(const GfxRenderer& renderer, Rect rect);
   // Draws a pre-dithered cover thumb 1:1, centered and clipped to fill the
@@ -284,8 +287,7 @@ class BaseTheme {
                              int contentStartX = 0, int contentWidth = 0) const;
   virtual bool showsFileIcons() const { return false; }
   // Thumb generation height for home covers; 0 means use metrics.homeCoverHeight.
-  // Themes with slots wider than 0.6 aspect override this so covers still fill.
-  virtual int homeCoverThumbHeight(const GfxRenderer&) const { return 0; }
+  virtual int homeCoverThumbHeight(const GfxRenderer&, int) const { return 0; }
 
   // Shared constants and helpers for battery drawing (used by all themes)
   static constexpr int batteryPercentSpacing = 4;

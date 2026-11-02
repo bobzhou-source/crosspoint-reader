@@ -7,13 +7,13 @@
 #include <LibraryBuilder.h>
 #include <Logging.h>
 #include <Memory.h>
-#include <WiFi.h>
 
 #include <algorithm>
 #include <cstdio>
 #include <cstring>
 
 #include "AboutActivity.h"
+#include "BenchmarkSettingsActivity.h"
 #include "ButtonRemapActivity.h"
 #include "ClearCacheActivity.h"
 #include "ClockSettingsActivity.h"
@@ -26,13 +26,15 @@
 #include "MappedInputManager.h"
 #include "OpdsServerListActivity.h"
 #include "OtaUpdateActivity.h"
+#include "ReaderSyncSettingsActivity.h"
 #include "SdCardFontSystem.h"
 #include "SdFirmwareUpdateActivity.h"
 #include "SettingsList.h"
-#include "SilentRestart.h"
 #include "StatusBarSettingsActivity.h"
 #include "TextSettingsActivity.h"
 #include "activities/network/WifiSelectionActivity.h"
+#include "activities/reader/ReaderUtils.h"
+#include "activities/reader/ReadingStatsActivity.h"
 #include "activities/util/IntervalSelectionActivity.h"
 #include "components/UITheme.h"
 #include "components/UIThemeTokens.h"
@@ -103,6 +105,9 @@ void SettingsActivity::rebuildSettingsLists() {
     systemSettings.push_back(SettingInfo::Action(StrId::STR_CLOCK, SettingAction::ClockSettings));
   }
   systemSettings.push_back(SettingInfo::Action(StrId::STR_KOREADER_SYNC, SettingAction::KOReaderSync));
+  systemSettings.push_back(SettingInfo::Action(StrId::STR_READER_SYNC, SettingAction::ReaderSync));
+  systemSettings.push_back(SettingInfo::Action(StrId::STR_BENCHMARK, SettingAction::Benchmark));
+  systemSettings.push_back(SettingInfo::Action(StrId::STR_READING_STATS, SettingAction::ReadingStats));
   systemSettings.push_back(SettingInfo::Action(StrId::STR_OPDS_SERVERS, SettingAction::OPDSBrowser));
   systemSettings.push_back(SettingInfo::Action(StrId::STR_CLEAR_READING_CACHE, SettingAction::ClearCache));
   // OTA fetches this board's own release asset (see OtaUpdater); boards whose
@@ -196,8 +201,7 @@ void SettingsActivity::onTabAction(const int index) {
   if (optionPopup.isActive()) return;
   selectCategory(index);
   activeNav().selected = 0;  // tab taps land with the tab bar focused
-  // The switched-to tab repaints as the selected pill; a flash overlay on top
-  // of it just repaints the pill in the focused style.
+  // The active underline and keyboard-focus outline identify the selected tab.
   app.clearTapFlash();
 }
 
@@ -224,6 +228,16 @@ void SettingsActivity::onExit() {
 }
 
 void SettingsActivity::applyUiSettingChange(uint8_t CrossPointSettings::* valuePtr) {
+  // Rotating (or un-rotating) the menus takes effect on this screen at once;
+  // the next repaint lays out for the new orientation.
+  if (valuePtr == &CrossPointSettings::rotateMenusWithReader) {
+    {
+      RenderLock lock;
+      ReaderUtils::applyMenuOrientation(renderer);
+    }
+    resetUi();
+    return;
+  }
   // Theme changes take effect immediately, on this screen — reload the theme
   // and re-derive the app's tokens so the very next repaint is in the new look.
   if (valuePtr != &CrossPointSettings::uiTheme) {
@@ -283,6 +297,7 @@ void SettingsActivity::toggleCurrentSetting() {
   }
 
   const auto& setting = (*currentSettings)[selectedSetting];
+  const auto changedValuePtr = setting.valuePtr;
   const bool sleepScreenChanged = setting.valuePtr == &CrossPointSettings::sleepScreen;
   const bool quickResumeTimeoutChanged = setting.valuePtr == &CrossPointSettings::quickResumeSleepScreen;
 
@@ -370,6 +385,26 @@ void SettingsActivity::toggleCurrentSetting() {
           LOG_ERR("SETTINGS", "OOM: ClockSettingsActivity");
         }
         break;
+      case SettingAction::ReaderSync:
+        if (auto activity = makeUniqueNoThrow<ReaderSyncSettingsActivity>(renderer, mappedInput)) {
+          startActivityForResult(std::move(activity), nullptr);
+        } else {
+          LOG_ERR("SETTINGS", "OOM: Reader sync settings");
+        }
+        break;
+      case SettingAction::ReadingStats:
+        if (auto activity = makeUniqueNoThrow<ReadingStatsActivity>(renderer, mappedInput)) {
+          startActivityForResult(std::move(activity), nullptr);
+        } else
+          LOG_ERR("SETTINGS", "OOM: reading statistics");
+        break;
+      case SettingAction::Benchmark:
+        if (auto activity = makeUniqueNoThrow<BenchmarkSettingsActivity>(renderer, mappedInput)) {
+          startActivityForResult(std::move(activity), nullptr);
+        } else {
+          LOG_ERR("SETTINGS", "OOM: Benchmark settings");
+        }
+        break;
       case SettingAction::KOReaderSync:
         startActivityForResult(std::make_unique<KOReaderSettingsActivity>(renderer, mappedInput), resultHandler);
         break;
@@ -377,25 +412,12 @@ void SettingsActivity::toggleCurrentSetting() {
         startActivityForResult(std::make_unique<OpdsServerListActivity>(renderer, mappedInput), resultHandler);
         break;
       case SettingAction::Network: {
-        auto activity = makeUniqueNoThrow<WifiSelectionActivity>(renderer, mappedInput, false);
+        auto activity = makeUniqueNoThrow<WifiSelectionActivity>(renderer, mappedInput, false, false);
         if (!activity) {
           LOG_ERR("SETTINGS", "OOM: WifiSelectionActivity");
           return;
         }
-        startActivityForResult(std::move(activity), [](const ActivityResult&) {
-          SETTINGS.saveToFile();
-          // Every other WiFi consumer hands the radio to a session it owns;
-          // these rows only save credentials, so nothing here would ever
-          // release the driver's heap. The scan alone brings it up, so tear
-          // down whether or not the user joined a network.
-          if (WiFi.getMode() == WIFI_MODE_NULL) return;
-          WiFi.disconnect(false);
-          delay(30);
-          // Unlike the onExit() teardowns, this runs from the loop task with
-          // no lock held; the restart popup paints straight to the panel.
-          RenderLock lock;
-          silentRestartToSettings();
-        });
+        startActivityForResult(std::move(activity), [](const ActivityResult&) { SETTINGS.saveToFile(); });
         break;
       }
       case SettingAction::ClearCache:
@@ -408,14 +430,14 @@ void SettingsActivity::toggleCurrentSetting() {
         startActivityForResult(std::make_unique<SdFirmwareUpdateActivity>(renderer, mappedInput), resultHandler);
         break;
       case SettingAction::BootOtherSlot: {
-        const char* options[] = {tr(STR_CANCEL), tr(STR_CONFIRM)};
+        const char* options[] = {tr(STR_CANCEL), tr(STR_RESTART)};
         optionPopup.show(tr(STR_BOOT_OTHER_SLOT), tr(STR_BOOT_OTHER_SLOT_CONFIRM), options, 2, 0, [this](int idx) {
           if (idx != 1) return;
           if (ota_boot::switchToOther()) {
             delay(50);
             ESP.restart();
           }
-          const char* ok[] = {tr(STR_CONFIRM)};
+          const char* ok[] = {tr(STR_OK_BUTTON)};
           optionPopup.show(tr(STR_BOOT_OTHER_SLOT), tr(STR_BOOT_OTHER_SLOT_FAILED), ok, 1, 0,
                            [this](int) { requestUpdate(); });
         });
@@ -473,7 +495,7 @@ void SettingsActivity::toggleCurrentSetting() {
   syncQuickResumeTimeoutForSleepScreen(sleepScreenChanged, quickResumeTimeoutChanged);
   SETTINGS.saveToFile();
   rebuildSettingsLists();
-  applyUiSettingChange(setting.valuePtr);
+  applyUiSettingChange(changedValuePtr);
   activeNav().selected = std::min(ringPos(), settingsCount);
 }
 
@@ -557,8 +579,8 @@ std::string SettingsActivity::settingValueText(const SettingInfo& setting) {
 void SettingsActivity::buildScreen(UiScreen& screen) {
   const auto& metrics = UITheme::getInstance().getMetrics();
   // Content below the GUI.drawHeader band, above the button hints.
-  screen.setContentMarginFromScreen(fui::Insets{static_cast<int16_t>(metrics.topPadding + metrics.headerHeight), 0,
-                                                static_cast<int16_t>(metrics.buttonHintsHeight), 0});
+  screen.setContentMargin(fui::Insets{static_cast<int16_t>(metrics.topPadding + metrics.headerHeight), 0,
+                                     static_cast<int16_t>(metrics.buttonHintsHeight), 0});
 
   buildTabBar(screen);
 
@@ -578,14 +600,13 @@ void SettingsActivity::buildScreen(UiScreen& screen) {
   props.count = static_cast<uint16_t>(rowItems_.size());
   props.action = ACTION_ROW;
   props.inputMask = fui::InputTouch;  // physical buttons stay in loop()
-  props.valueInset = 8;               // air between the value and the row edge
-  // Titles match the value's font size (smallText) so both sides of a row
-  // read as one unit; labels that still don't fit wrap onto a second line.
-  // maxLines=2 also marks the style explicitly set (an all-default smallText
-  // fails textStyleUnset and the list would substitute bodyText back); the
-  // common fits-on-one-line case takes the renderer's fast path anyway.
-  props.labelText = screen.theme().smallText;
+  props.valueInset = 0;
+  props.valueMaxWidthPercent = 40;
+  props.labelMinWidthPercent = 55;
+  props.labelText = screen.theme().bodyText;
   props.labelText.maxLines = 2;
+  props.valueText = screen.theme().smallText;
+  props.valueText.maxLines = 2;
   syncTabListViewport(screen, props);
   screen.list(props);
 }
@@ -596,10 +617,10 @@ void SettingsActivity::drawChrome() {
 
   // Header via GUI.drawHeader (already FreeInkUI-themed) for the battery
   // indicator; the rest of the screen renders through the app.
-  // Version rides in the header's trailing label slot: the footer position
-  // conflicts with button hints on non-touch devices.
-  GUI.drawHeader(renderer, Rect{0, metrics.topPadding, pageWidth, metrics.headerHeight}, tr(STR_SETTINGS_TITLE),
-                 CROSSPOINT_VERSION);
+  const auto safe = uiTarget.deviceContext().safeArea;
+  GUI.drawHeader(renderer,
+                 Rect{safe.left, safe.top + metrics.topPadding, pageWidth - safe.left - safe.right, metrics.headerHeight},
+                 tr(STR_SETTINGS_TITLE));
 }
 
 void SettingsActivity::drawFooter() {

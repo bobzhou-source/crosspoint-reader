@@ -11,6 +11,7 @@ class Txt {
   std::string cachePath;
   bool loaded = false;
   size_t fileSize = 0;
+  uint32_t sourceSignature = 0;
 
  public:
   explicit Txt(std::string path, std::string cacheBasePath);
@@ -20,6 +21,8 @@ class Txt {
   [[nodiscard]] const std::string& getCachePath() const { return cachePath; }
   [[nodiscard]] std::string getTitle() const;
   [[nodiscard]] size_t getFileSize() const { return fileSize; }
+  // Fingerprint of the file's modification time and first and last bytes, taken by load().
+  [[nodiscard]] uint32_t getSourceSignature() const { return sourceSignature; }
 
   void setupCacheDir() const;
   bool clearCache() const;
@@ -28,7 +31,4 @@ class Txt {
   [[nodiscard]] std::string getCoverBmpPath() const;
   [[nodiscard]] bool generateCoverBmp() const;
   [[nodiscard]] std::string findCoverImage() const;
-
-  // Read content from file
-  [[nodiscard]] bool readContent(uint8_t* buffer, size_t offset, size_t length) const;
 };

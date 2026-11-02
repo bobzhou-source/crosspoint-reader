@@ -77,14 +77,16 @@ void AnnotationListActivity::buildScreen(UiScreen& screen) {
   screen.setContentMarginFromScreen(
       fui::Insets{static_cast<int16_t>(safe.y + metrics.topPadding + metrics.headerHeight),
                   static_cast<int16_t>(renderer.getScreenWidth() - (safe.x + safe.width)),
-                  static_cast<int16_t>(renderer.getScreenHeight() - (safe.y + safe.height) + metrics.buttonHintsHeight),
+                  static_cast<int16_t>(renderer.getScreenHeight() - (safe.y + safe.height)),
                   static_cast<int16_t>(safe.x)});
   screen.spacer(static_cast<int16_t>(metrics.verticalSpacing));
+  auto stateStyle = screen.theme().bodyText;
+  stateStyle.maxLines = 3;
   if (!loaded) {
-    screen.centeredText(tr(STR_ANNOTATION_LOAD_FAILED), screen.theme().bodyText);
+    screen.centeredText(tr(STR_ANNOTATION_LOAD_FAILED), stateStyle);
   }
   if (loaded && count == 0) {
-    screen.centeredText(tr(STR_NO_ANNOTATIONS), screen.theme().bodyText);
+    screen.centeredText(tr(STR_NO_ANNOTATIONS), stateStyle);
     screen.spacer(static_cast<int16_t>(metrics.verticalSpacing));
   }
   fui::ListProps props;
@@ -93,6 +95,9 @@ void AnnotationListActivity::buildScreen(UiScreen& screen) {
   props.count = static_cast<uint16_t>(listCount());
   props.action = ACTION_ROW;
   props.inputMask = fui::InputTouch;
+  props.labelText = screen.theme().bodyText;
+  props.labelText.maxLines = 2;
+  props.rowHeight = 72;
   syncListViewport(screen, props);
   screen.list(props);
 }

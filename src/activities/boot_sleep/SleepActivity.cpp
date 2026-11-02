@@ -29,6 +29,7 @@
 #include "fontIds.h"
 #include "images/Logo120.h"
 #include "images/MoonIcon.h"
+#include "util/NightMode.h"
 
 namespace {
 
@@ -518,17 +519,7 @@ void SleepActivity::onEnter() {
 
   const bool frameWasInverted = display.isInverted();
 
-  // The remaining sleep screens draw fresh content in normal polarity. This
-  // activity draws directly from onEnter (outside ActivityManager's
-  // per-render polarity resolution), so clear any inversion left over from a
-  // night-mode reader render.
-  display.setInverted(false);
-
   if (SETTINGS.sleepScreen == CrossPointSettings::SLEEP_SCREEN_MODE::TRANSPARENT_CUSTOM) {
-    // Transparent mode retains the current framebuffer. Materialize any
-    // output-level inversion first so the retained content keeps its visible
-    // polarity after the display driver returns to normal.
-    if (frameWasInverted) renderer.invertScreen();
     if (APP_STATE.lastSleepFromReader) {
       ReaderUtils::applyOrientation(renderer, SETTINGS.orientation);
     }
@@ -536,6 +527,10 @@ void SleepActivity::onEnter() {
     if (APP_STATE.lastSleepFromReader) {
       renderer.setOrientation(GfxRenderer::Orientation::Portrait);
     }
+    // The popup used the retained frame's polarity. Materialize it only now,
+    // so custom overlay pixels retain their original colors.
+    if (frameWasInverted) renderer.invertScreen();
+    display.setInverted(false);
     releaseSdFontCachesForDecode(renderer);
     return renderTransparentCustomSleepScreen();
   }
@@ -568,6 +563,7 @@ void SleepActivity::onEnter() {
 }
 
 void SleepActivity::renderCustomSleepScreen() const {
+  display.setInverted(false);
   // Look for sleep.bmp on the root of the sd card to determine if we should
   // render a custom sleep screen instead of the default.
   // This takes priority over the /sleep folder.
@@ -612,11 +608,11 @@ void SleepActivity::renderCustomSleepScreen() const {
   renderDefaultSleepScreen();
 }
 
-// Sleep screens paint with a single HALF refresh (stock parity): the OEM X4
-// firmware's only clean refresh in normal operation is the single-pass 0xD7
-// sequence, used once for the sleep image. It never runs the multi-flash GC
-// waveform (0xF7) that FULL_REFRESH selects (#2471's blinking complaint).
+// HALF is a clean update: SSD1677 uses 0xD7; UltraChip uses an OTP GC scrub
+// that may still visibly flash through intermediate levels.
 void SleepActivity::renderDefaultSleepScreen() const {
+  display.setInverted(night_mode::invertBuiltinSleep(
+      SETTINGS.screenInverted != 0, SETTINGS.sleepScreen == CrossPointSettings::SLEEP_SCREEN_MODE::LIGHT));
   const auto pageWidth = renderer.getScreenWidth();
   const auto pageHeight = renderer.getScreenHeight();
 
@@ -624,11 +620,6 @@ void SleepActivity::renderDefaultSleepScreen() const {
   renderer.drawImage(Logo120, (pageWidth - 120) / 2, (pageHeight - 120) / 2, 120, 120);
   renderer.drawCenteredText(UI_10_FONT_ID, pageHeight / 2 + 70, tr(STR_CROSSPOINT), true, EpdFontFamily::BOLD);
   renderer.drawCenteredText(SMALL_FONT_ID, pageHeight / 2 + 95, tr(STR_SLEEPING));
-
-  // Make sleep screen dark unless light is selected in settings
-  if (SETTINGS.sleepScreen != CrossPointSettings::SLEEP_SCREEN_MODE::LIGHT) {
-    renderer.invertScreen();
-  }
 
   renderer.displayBuffer(HalDisplay::HALF_REFRESH);
 }
@@ -792,6 +783,7 @@ void SleepActivity::renderTransparentCustomSleepScreen() const {
 }
 
 void SleepActivity::renderCoverSleepScreen() const {
+  display.setInverted(false);
   void (SleepActivity::*renderNoCoverSleepScreen)() const;
   switch (SETTINGS.sleepScreen) {
     case (CrossPointSettings::SLEEP_SCREEN_MODE::COVER_CUSTOM):
@@ -889,6 +881,7 @@ void SleepActivity::renderLastScreenSleepScreen() const {
 }
 
 void SleepActivity::renderBlankSleepScreen() const {
+  display.setInverted(SETTINGS.screenInverted != 0);
   renderer.clearScreen();
   renderer.displayBuffer(HalDisplay::HALF_REFRESH);
 }

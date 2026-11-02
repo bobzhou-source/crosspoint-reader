@@ -141,7 +141,7 @@ struct BlockStyle {
     blockStyle.textAlignDefined = cssStyle.hasTextAlign();
     // User setting overrides CSS, unless "Book's Style" alignment setting is selected
     if (paragraphAlignment == CssTextAlign::None) {
-      blockStyle.alignment = blockStyle.textAlignDefined ? cssStyle.textAlign : CssTextAlign::Justify;
+      blockStyle.alignment = blockStyle.textAlignDefined ? cssStyle.textAlign : CssTextAlign::Left;
     } else {
       blockStyle.alignment = paragraphAlignment;
     }

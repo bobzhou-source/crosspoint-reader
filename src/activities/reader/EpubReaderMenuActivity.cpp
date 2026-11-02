@@ -3,10 +3,14 @@
 #include <GfxRenderer.h>
 #include <HalFrontlight.h>
 #include <I18n.h>
+#include <Memory.h>
+
+#include <cstdio>
 
 #include "CrossPointSettings.h"
 #include "MappedInputManager.h"
 #include "ReaderUtils.h"
+#include "ReadingStatsActivity.h"
 #include "components/UITheme.h"
 
 namespace fui = freeink::ui;
@@ -41,6 +45,7 @@ void EpubReaderMenuActivity::buildMenuItems(std::vector<MenuItem>& items, bool h
   items.clear();
   items.reserve(MAX_MENU_ITEMS);
   items.push_back({MenuAction::SELECT_CHAPTER, StrId::STR_SELECT_CHAPTER});
+  items.push_back({MenuAction::READING_STATS, StrId::STR_READING_STATS});
   if (hasFootnotes) {
     items.push_back({MenuAction::FOOTNOTES, StrId::STR_FOOTNOTES});
   }
@@ -87,6 +92,13 @@ void EpubReaderMenuActivity::activateIndex(const int index) {
   nav.selected = index;
 
   const auto selectedAction = menuItems[index].action;
+  if (selectedAction == MenuAction::READING_STATS) {
+    if (auto activity = makeUniqueNoThrow<ReadingStatsActivity>(renderer, mappedInput, true)) {
+      startActivityForResult(std::move(activity), nullptr);
+    } else
+      LOG_ERR("STATS", "OOM: reading statistics");
+    return;
+  }
   if (selectedAction == MenuAction::ROTATE_SCREEN) {
     optionPopup.show(StrId::STR_ORIENTATION, orientationLabels.data(), static_cast<int>(orientationLabels.size()),
                      pendingOrientation, [this](int idx) {
@@ -159,16 +171,19 @@ void EpubReaderMenuActivity::buildScreen(UiScreen& screen) {
       static_cast<int16_t>(renderer.getScreenWidth() - (safe.x + safe.width)),
       static_cast<int16_t>(renderer.getScreenHeight() - (safe.y + safe.height)), static_cast<int16_t>(safe.x)});
 
-  // Progress summary where the old sub-header band sat.
-  std::string progressLine;
+  // Progress is secondary metadata, kept allocation-free on repaint.
+  char progressLine[160];
   if (totalPages > 0) {
-    progressLine = std::string(tr(STR_CHAPTER_PREFIX)) + std::to_string(currentPage) + "/" +
-                   std::to_string(totalPages) + std::string(tr(STR_PAGES_SEPARATOR));
+    snprintf(progressLine, sizeof(progressLine), "%s%d/%d%s%s%d%%", tr(STR_CHAPTER_PREFIX),
+             currentPage, totalPages, tr(STR_PAGES_SEPARATOR), tr(STR_BOOK_PREFIX), bookProgressPercent);
+  } else {
+    snprintf(progressLine, sizeof(progressLine), "%s%d%%", tr(STR_BOOK_PREFIX), bookProgressPercent);
   }
-  progressLine += std::string(tr(STR_BOOK_PREFIX)) + std::to_string(bookProgressPercent) + "%";
   const fui::Rect band = screen.takeTop(static_cast<int16_t>(metrics.tabBarHeight));
   const int16_t pad = screen.theme().headerSidePadding;
-  screen.target().text(band.inset(fui::Insets{0, pad, 0, pad}), progressLine.c_str(), screen.theme().smallText);
+  fui::TextStyle progressStyle = screen.theme().smallText;
+  progressStyle.align = UITheme::isRtl() ? fui::TextAlign::Right : fui::TextAlign::Left;
+  screen.target().text(band.inset(fui::Insets{0, pad, 0, pad}), progressLine, progressStyle);
   screen.spacer(static_cast<int16_t>(metrics.verticalSpacing));
 
   // menuRowItems's labels/actionValue were set once in the constructor (see
@@ -192,10 +207,9 @@ void EpubReaderMenuActivity::buildScreen(UiScreen& screen) {
   props.action = ACTION_ROW;
   props.inputMask = fui::InputTouch;  // physical buttons stay in loop()
   props.valueInset = 8;               // air between the value and the row edge
-  // Label at the value's font size: both sides of the row read as one unit.
-  // maxLines=2 also marks the style caller-owned (see textStyleUnset).
-  props.labelText = screen.theme().smallText;
+  props.labelText = screen.theme().bodyText;
   props.labelText.maxLines = 2;
+  props.valueText = screen.theme().smallText;
   syncListViewport(screen, props);
   screen.list(props);
 }

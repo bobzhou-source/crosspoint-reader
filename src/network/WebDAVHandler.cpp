@@ -6,6 +6,7 @@
 
 #include "util/BookCacheUtils.h"
 #include "util/TaskWatchdog.h"
+#include "ReaderSyncProtocol.h"
 
 namespace {
 constexpr const char* HIDDEN_ITEMS[] = {"System Volume Information", "XTCache"};
@@ -117,6 +118,10 @@ void WebDAVHandler::raw(WebServer& server, const String& uri, HTTPRaw& raw) {
 
 bool WebDAVHandler::handle(WebServer& server, HTTPMethod method, const String& uri) {
   (void)uri;
+  if (isProtectedPath(getRequestPath(server))) {
+    server.send(403, "text/plain", "Private system path");
+    return true;
+  }
   switch (method) {
     case HTTP_OPTIONS:
       handleOptions(server);
@@ -228,7 +233,7 @@ void WebDAVHandler::handlePropfind(WebServer& s) {
       String fileName(name);
 
       // Skip hidden/protected items
-      bool shouldHide = fileName.startsWith(".");
+      bool shouldHide = isProtectedPath(fileName);
       if (!shouldHide) {
         for (const auto* item : HIDDEN_ITEMS) {
           if (fileName.equals(item)) {
@@ -759,6 +764,7 @@ void WebDAVHandler::urlEncodePath(const String& path, String& out) const {
 }
 
 bool WebDAVHandler::isProtectedPath(const String& path) const {
+  if (reader_sync::privateWebPath(path.c_str())) return true;
   // Check every segment of the path, not just the last one.
   // This prevents access to e.g. /.hidden/somefile or /System Volume Information/foo
   int start = 0;

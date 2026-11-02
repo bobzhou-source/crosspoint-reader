@@ -509,3 +509,30 @@ The final field is the WebSocket upload port.
 
 Calibre Wireless starts the same web server in STA mode and displays setup
 instructions plus WebSocket upload progress on the device screen.
+
+## Private Reader sync state
+
+The device's outbound Reader sync service is not configured through this web API.
+`/.crosspoint/reader-sync.json` contains a scoped credential and the entire
+`/.crosspoint/reader-sync/` tree is private. Generic file listings, downloads,
+uploads (HTTP and WebSocket), folder creation, rename, move, delete and WebDAV
+operations reject private/system paths, including case-insensitive FAT short-name
+aliases and dot/encoded path components. `showHiddenFiles` does not reveal them.
+Settings/status APIs expose no Reader sync credential. Provisioning is through
+the local SD companion; a person with physical SD access can still read the file.
+
+Implementation verification is pending the release integrator's final firmware
+build and protocol/UI smoke. `test/reader_sync/run_protocol.py` checks the shared
+private-path policy and real outbound protocol against a temporary TLS endpoint;
+the physical web server endpoints still require device/runtime verification.
+
+`test/reader_sync/run_fat_privacy.py` is the authoritative alias regression: it
+compiles the pinned SdFat from `.pio/libdeps` against an isolated in-memory FAT
+image, creates `/.crosspoint` and public control files, reads the real 8.3 names
+from the directory entries, and shows both that an alias-open handle reports the
+short name (which previously let `/CROSSP~1/...` bypass the guard) and that the
+production guard now rejects root and nested aliases while public names and
+their aliases, including ordinary `~` and `%` names, remain readable. Run it as
+`python3 test/reader_sync/run_fat_privacy.py`. It needs
+`pio pkg install -e x4pro-gh_release`, a C++20 host compiler, and no device or
+credentials.

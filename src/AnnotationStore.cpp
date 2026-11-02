@@ -13,6 +13,8 @@
 #include <cstdio>
 #include <cstring>
 
+#include "network/ReaderSync.h"
+
 namespace {
 constexpr char ROOT[] = "/.crosspoint/annotations";
 constexpr size_t MAX_FILE_BYTES = 8192;
@@ -296,6 +298,7 @@ AnnotationStore::Result AnnotationStore::save(AnnotationEntry& entry) {
   }
   if (!writeEntry(path, entry, id)) return Result::IoError;
   entry.id = id;
+  reader_sync::annotationSaved();
   return Result::Success;
 }
 

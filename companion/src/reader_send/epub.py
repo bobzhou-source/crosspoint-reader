@@ -22,6 +22,24 @@ MAX_PIXELS = 20_000_000
 MAX_EDGE = 1200
 MAX_PACKED_IMAGE = 512 * 1024
 
+CONTAINER_XML = ('<?xml version="1.0"?><container version="1.0" xmlns="urn:oasis:names:tc:opendocument:xmlns:container">'
+                 '<rootfiles><rootfile full-path="OEBPS/content.opf" media-type="application/oebps-package+xml"/>'
+                 '</rootfiles></container>')
+
+
+def pack_epub(entries: dict[str, bytes | str]) -> bytes:
+    """Zip EPUB entries reproducibly: mimetype first and stored, fixed timestamps, private modes."""
+    if next(iter(entries), None) != "mimetype":
+        raise ReaderError("EPUB entries must start with the mimetype file")
+    output = io.BytesIO()
+    with zipfile.ZipFile(output, "w") as archive:
+        for name, data in entries.items():
+            info = zipfile.ZipInfo(name, date_time=(1980, 1, 1, 0, 0, 0))
+            info.compress_type = zipfile.ZIP_STORED if name == "mimetype" else zipfile.ZIP_DEFLATED
+            info.external_attr = 0o600 << 16
+            archive.writestr(info, data.encode("utf-8") if isinstance(data, str) else data)
+    return output.getvalue()
+
 
 def resize_image(data: bytes) -> bytes:
     try:
@@ -130,16 +148,9 @@ def build_epub(article: Article, identity: str, client: PublicHTTP, *, local: Lo
 <content src="article.xhtml"/></navPoint></navMap></ncx>'''
     entries: dict[str, bytes | str] = {
         "mimetype": "application/epub+zip",
-        "META-INF/container.xml": '<?xml version="1.0"?><container version="1.0" xmlns="urn:oasis:names:tc:opendocument:xmlns:container"><rootfiles><rootfile full-path="OEBPS/content.opf" media-type="application/oebps-package+xml"/></rootfiles></container>',
+        "META-INF/container.xml": CONTAINER_XML,
         "OEBPS/content.opf": opf, "OEBPS/toc.ncx": ncx, "OEBPS/article.xhtml": xhtml,
         "OEBPS/style.css": "body { line-height: 1.4; } img { max-width: 100%; height: auto; } pre { white-space: pre-wrap; } blockquote { margin: 1em; } .image-alt { font-style: italic; }",
     }
     entries.update({f"OEBPS/images/{i}.jpg": data for i, data in packed.items()})
-    output = io.BytesIO()
-    with zipfile.ZipFile(output, "w") as archive:
-        for name, data in entries.items():
-            info = zipfile.ZipInfo(name, date_time=(1980, 1, 1, 0, 0, 0))
-            info.compress_type = zipfile.ZIP_STORED if name == "mimetype" else zipfile.ZIP_DEFLATED
-            info.external_attr = 0o600 << 16
-            archive.writestr(info, data.encode("utf-8") if isinstance(data, str) else data)
-    return output.getvalue()
+    return pack_epub(entries)

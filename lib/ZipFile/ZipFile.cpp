@@ -301,7 +301,7 @@ bool ZipFile::getInflatedFileSize(const char* filename, size_t* size) {
   return true;
 }
 
-int ZipFile::fillUncompressedSizes(std::deque<SizeTarget>& targets, std::deque<uint32_t>& sizes) {
+int ZipFile::fillUncompressedSizes(CheckedTable<SizeTarget>& targets, CheckedTable<uint32_t>& sizes) {
   if (targets.empty()) {
     return 0;
   }

@@ -1,10 +1,12 @@
 #include "ActivityManager.h"
 
+#include <Benchmark.h>
 #include <BoardConfig.h>
 #include <FontCacheManager.h>
 #include <FsHelpers.h>
 #include <HalDisplay.h>
 #include <HalPowerManager.h>
+#include <HalStorage.h>
 #include <Memory.h>
 #include <VectorFontSupport.h>
 
@@ -12,6 +14,7 @@
 
 #include "CrossPointSettings.h"
 #include "OpdsServerStore.h"
+#include "network/ReaderSync.h"
 #include "boot_sleep/BootActivity.h"
 #include "boot_sleep/SleepActivity.h"
 #include "browser/OpdsBookBrowserActivity.h"
@@ -21,13 +24,16 @@
 #include "home/HomeActivity.h"
 #include "library/LibraryListActivity.h"
 #include "network/CrossPointWebServerActivity.h"
+#include "network/OtaBootSwitch.h"
 #include "network/UsbDriveActivity.h"
 #include "reader/ReaderActivity.h"
+#include "reader/ReaderUtils.h"
 #include "settings/OpdsServerListActivity.h"
 #include "settings/SettingsActivity.h"
 #include "util/BmpViewerActivity.h"
 #include "util/FrontlightPanelActivity.h"
 #include "util/FullScreenMessageActivity.h"
+#include "util/NightMode.h"
 
 static portMUX_TYPE activityManagerSpinlock = portMUX_INITIALIZER_UNLOCKED;
 
@@ -70,10 +76,32 @@ void ActivityManager::renderTaskLoop() {
     RenderLock lock;
     if (currentActivity) {
       HalPowerManager::Lock powerLock;  // Ensure we don't go into low-power mode while rendering
-      // Night mode is a global output polarity applied to every activity.
-      // The sleep screen forces normal polarity itself (SleepActivity).
-      display.setInverted(SETTINGS.screenInverted != 0);
+      display.setInverted(night_mode::invertActivity(SETTINGS.screenInverted != 0,
+                                                   SETTINGS.darkMenusWithNightMode != 0,
+                                                   currentActivity->isReaderActivity()));
+      if (benchmark::enabled()) {
+        benchmark::settings(SETTINGS.fontFamily, SETTINGS.fontPointSize, SETTINGS.lineSpacing, SETTINGS.orientation,
+                            SETTINGS.textAntiAliasing, SETTINGS.screenInverted, SETTINGS.screenMargin,
+                            SETTINGS.sleepScreen, benchmark::id(SETTINGS.sdFontFamilyName));
+      }
+      const uint64_t renderStart = benchmark::start();
       currentActivity->render(std::move(lock));
+      if (renderStart) {
+        benchmark::span(benchmark::EventType::Render, renderStart, benchmark::id(currentActivity->name.c_str()),
+                        currentActivity->hasCompletedHealthyRender(), currentActivity->isReaderActivity());
+        benchmark::memory();
+      }
+      // The outer RenderLock is still held (render() only binds the rvalue
+      // reference), so currentActivity cannot be swapped out here. Returning
+      // from the blocking Home display call or from a reader that reported a
+      // completed normal frame (or end-of-book UI) proves a useful frame
+      // completed; error, placeholder and recovery screens report false.
+      const bool healthyNormalUi =
+          currentActivity->isHomeActivity() || currentActivity->hasCompletedHealthyRender();
+      if (healthyNormalUi && Storage.ready()) {
+        ota_boot::acceptPendingUpdate();
+        if (!isBenchmarkActivity()) reader_sync::healthyRender();
+      }
     }
     // Notify any task blocked in requestUpdateAndWait() that the render is done.
     TaskHandle_t waiter = nullptr;
@@ -101,7 +129,7 @@ void ActivityManager::loop() {
     return;
   }
 
-  if (currentActivity) {
+  if (currentActivity && pendingAction == PendingAction::None) {
     if (!currentActivity->isHomeActivity() && mappedInput.wasHomeGesture()) {
       if (currentActivity->handleHomeGesture()) {
         return;
@@ -123,7 +151,8 @@ void ActivityManager::loop() {
       // The header back button shares this band; its taps stay Back.
       statusBarTap = mappedInput.wasScreenTapped(tx, ty) && ty < 44 && !HeaderBackTapTarget::contains(tx, ty);
     }
-    if (currentActivity->name != "FrontlightPanel" && (statusBarTap || mappedInput.wasLightPanelGesture())) {
+    if (!isBenchmarkActivity() && currentActivity->name != "FrontlightPanel" &&
+        (statusBarTap || mappedInput.wasLightPanelGesture())) {
       pushActivity(std::make_unique<FrontlightPanelActivity>(renderer, mappedInput));
       return;
     }
@@ -133,6 +162,17 @@ void ActivityManager::loop() {
   }
 
   while (pendingAction != PendingAction::None) {
+    // Join before taking RenderLock: the worker may still be finishing SD I/O.
+    // Every activity transition revokes background radio/storage ownership.
+    reader_sync::cancelAndJoin();
+    if (pendingAction == PendingAction::Replace && currentActivity && currentActivity->isHomeActivity() &&
+        pendingActivity && pendingActivity->name == "Library" &&
+        static_cast<HomeActivity*>(currentActivity.get())->prepareLibraryTransition()) {
+      // Home has finished drawing but may still be in its blocking waveform.
+      // Keep that RenderLock/completed-frame boundary; prepare private SD data
+      // only after background ownership and outgoing recents writes are quiet.
+      pendingActivity->prepareEnter();
+    }
     if (pendingAction == PendingAction::Pop) {
       RenderLock lock;
 
@@ -152,6 +192,7 @@ void ActivityManager::loop() {
       if (stackActivities.empty()) {
         LOG_DBG("ACT", "No more activities on stack, going home");
         lock.unlock();  // goHome may acquire its own lock
+        reader_sync::finishActivityTransition();
         goHome();
         continue;  // Will launch goHome immediately
 
@@ -159,14 +200,14 @@ void ActivityManager::loop() {
         currentActivity = std::move(stackActivities.back());
         stackActivities.pop_back();
         LOG_DBG("ACT", "Popped from activity stack, new size = %zu", stackActivities.size());
+        // Move before unlocking: a result handler may install its own successor.
+        auto handler = std::move(currentActivity->resultHandler);
+        currentActivity->resultHandler = nullptr;
+        lock.unlock();  // Release deferred radio ownership before a result handler can start networking.
+        reader_sync::finishActivityTransition();
         // Handle result if necessary
-        if (currentActivity->resultHandler) {
+        if (handler) {
           LOG_DBG("ACT", "Handling result for popped activity");
-
-          // Move it here to avoid the case where handler calling another startActivityForResult()
-          auto handler = std::move(currentActivity->resultHandler);
-          currentActivity->resultHandler = nullptr;
-          lock.unlock();  // Handler may acquire its own lock
           handler(pendingResult);
         }
 
@@ -192,6 +233,7 @@ void ActivityManager::loop() {
           stackActivities.pop_back();
         }
       } else if (pendingAction == PendingAction::Push) {
+        if (currentActivity) currentActivity->onCovered();
         // Move current activity to stack
         stackActivities.push_back(std::move(currentActivity));
         // The parent's header back rect must not route taps on the pushed
@@ -199,16 +241,42 @@ void ActivityManager::loop() {
         HeaderBackTapTarget::clear();
         LOG_DBG("ACT", "Pushed to activity stack, new size = %zu", stackActivities.size());
       }
+      // "Rotate menus like reader": the three top-level tabs (and everything
+      // they open) take the reading orientation. Off leaves the renderer alone.
+      if (pendingAction == PendingAction::Replace && SETTINGS.rotateMenusWithReader &&
+          (pendingActivity->isHomeActivity() || pendingActivity->name == "Library" ||
+           pendingActivity->name == "Settings")) {
+        ReaderUtils::applyMenuOrientation(renderer);
+      }
       pendingAction = PendingAction::None;
       currentActivity = std::move(pendingActivity);
 
       lock.unlock();  // onEnter may acquire its own lock
+      reader_sync::finishActivityTransition();
       currentActivity->onEnter();
 
       // onEnter may request another pending action, we will handle it in the next loop iteration
       continue;
     }
   }
+
+  reader_sync::UiState syncUi;
+  {
+    RenderLock lock(RenderLock::Mode::Try);
+    if (lock.ownsLock() && currentActivity) {
+      // A benchmark workload inhibits Reader sync, except the one guarded `sync` step of a navigation run, which
+      // permits it on the Reader Sync screen only (see benchmark::nav::setSyncPermit).
+      const bool benchmarkInhibits =
+          isBenchmarkActivity() && !(benchmark::nav::syncPermit() && currentActivity->name == "ReaderSyncSettings");
+      syncUi.permitted = !benchmarkInhibits &&
+                         (currentActivity->isHomeActivity() || currentActivity->hasCompletedHealthyRender() ||
+                          currentActivity->name == "ReaderSyncSettings");
+      syncUi.homeShown = currentActivity->isHomeActivity();
+      // A reader that has not yet drawn its first page is still loading/indexing the book.
+      syncUi.bookOpening = currentActivity->isReaderActivity() && !currentActivity->hasCompletedHealthyRender();
+    }
+  }
+  reader_sync::tick(renderer, syncUi);
 
   if (requestedUpdate.exchange(false)) {
     // Using direct notification to signal the render task to update
@@ -360,7 +428,10 @@ void ActivityManager::popActivity() {
   pendingAction = PendingAction::Pop;
 }
 
-bool ActivityManager::preventAutoSleep() const { return currentActivity && currentActivity->preventAutoSleep(); }
+bool ActivityManager::preventAutoSleep() const {
+  // A navigation run owns the device: no inactivity sleep between its injected presses.
+  return benchmark::nav::runActive() || (currentActivity && currentActivity->preventAutoSleep());
+}
 
 bool ActivityManager::requiresExclusiveStorageLoop() const {
   return currentActivity && currentActivity->requiresExclusiveStorageLoop();
@@ -370,6 +441,18 @@ bool ActivityManager::isReaderActivity() const {
   return std::any_of(stackActivities.begin(), stackActivities.end(),
                      [](const auto& activity) { return activity->isReaderActivity(); }) ||
          (currentActivity && currentActivity->isReaderActivity());
+}
+
+bool ActivityManager::isBenchmarkActivity() const {
+  return benchmark::nav::runActive() || (currentActivity && currentActivity->isBenchmarkActivity());
+}
+
+uint32_t ActivityManager::currentActivityId() const {
+  return currentActivity ? benchmark::id(currentActivity->name.c_str()) : 0;
+}
+
+bool ActivityManager::hasPendingWork() const {
+  return requestedUpdate.load() || pendingAction != PendingAction::None || pendingActivity != nullptr;
 }
 
 bool ActivityManager::handleForcedRefresh() { return currentActivity && currentActivity->handleForcedRefresh(); }

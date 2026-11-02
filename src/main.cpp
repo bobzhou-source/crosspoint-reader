@@ -1,4 +1,6 @@
 #include <Arduino.h>
+#include <BatterySampling.h>
+#include <Benchmark.h>
 #include <BoardConfig.h>
 #include <Epub.h>
 #include <FontCacheManager.h>
@@ -32,11 +34,14 @@
 #include "SdCardFontSystem.h"
 #include "activities/Activity.h"
 #include "activities/ActivityManager.h"
+#include "activities/settings/BenchmarkSettingsActivityNavRun.h"
 #include "activities/settings/SdFirmwareUpdateActivity.h"
 #include "components/UITheme.h"
 #include "fontIds.h"
 #include "network/OtaBootSwitch.h"
+#include "network/ReaderSync.h"
 #include "platform/UsbSerialJtagHandoff.h"
+#include "util/BatterySample.h"
 #include "util/ButtonNavigator.h"
 #include "util/ScreenshotUtil.h"
 #include "util/Timezones.h"
@@ -216,6 +221,11 @@ void toggleFrontlight() {
 }
 
 bool handleX4ProFrontlightDoubleClick() {
+  if (activityManager.isBenchmarkActivity()) {
+    // A benchmark cancellation must not become a delayed Confirm in its menu.
+    lastX4ProPowerClickAt = 0;
+    return false;
+  }
   if (!BoardConfig::isX4Pro() || !SETTINGS.doubleClickPwrLight || !gpio.wasReleased(HalGPIO::BTN_POWER)) {
     return false;
   }
@@ -259,10 +269,22 @@ static bool loadSleepFrameBuffer() {
   return true;
 }
 
+// Session-log battery telemetry (battery_sample events). Main task only: gauge boards share the I2C bus.
+static void recordBatterySample(const benchmark::BatteryReason reason) {
+  if (!benchmark::enabled()) return;
+  const battery_sample::Sample sample = battery_sample::read();
+  // Slots: millivolts, percent, reason (BatteryReason), flags (bit0 charging, bit1 USB power present).
+  benchmark::point(benchmark::EventType::Battery, sample.millivolts, sample.percent, static_cast<uint32_t>(reason),
+                   (sample.charging ? 1U : 0U) | (gpio.isUsbConnected() ? 2U : 0U));
+}
+
 // Enter deep sleep mode
 void enterDeepSleep(bool fromTimeout = false) {
+  reader_sync::cancelAndJoin();
   HalPowerManager::Lock powerLock;  // Ensure we are at normal CPU frequency for sleep preparation
-  APP_STATE.lastSleepFromReader = activityManager.isReaderActivity();
+  benchmark::point(benchmark::EventType::Sleep, fromTimeout);
+  if (!activityManager.isBenchmarkActivity()) APP_STATE.lastSleepFromReader = activityManager.isReaderActivity();
+  const bool benchmarkRun = activityManager.isBenchmarkActivity();
 
   const bool isQuickResumeSleep =
       SETTINGS.sleepScreen == CrossPointSettings::SLEEP_SCREEN_MODE::QUICK_RESUME ||
@@ -285,6 +307,12 @@ void enterDeepSleep(bool fromTimeout = false) {
     // A stale Quick Resume frame must not replace the selected sleep screen during wake.
     Storage.remove(SLEEP_FRAME_FILE);
   }
+
+  // Event-driven sync, last chance before sleep: runs only when annotation uploads are pending,
+  // bounded by reader_sync::PRE_SLEEP_BUDGET_MS, and returns with the radio off. The sleep
+  // screen is already on the panel, so a wait here is invisible apart from the power draw.
+  if (!benchmarkRun) reader_sync::syncBeforeSleep(renderer);
+  recordBatterySample(benchmark::BatteryReason::SleepEntry);
 
   // Tear down WiFi so the modem power domain isn't held alive across deep sleep.
   // Wake from deep sleep is effectively a chip reset, so no state needs to survive.
@@ -315,6 +343,8 @@ void setupDisplayAndFonts(bool seamless = false) {
   }
 #endif
 
+  // BootActivity paints synchronously, before the activity render policy runs.
+  display.setInverted(SETTINGS.screenInverted != 0);
   display.begin(seamless);
   renderer.begin();
   activityManager.begin();
@@ -444,6 +474,10 @@ void setup() {
 
   HalSystem::checkPanic();
 
+  // A navigation run that died (crash, power loss, sleep) left a backup of the owner's recents, positions and
+  // statistics; put it back before anything reads them.
+  nav_run::recover();
+
   APP_STATE.loadFromFile();
   const bool isSleepWake = wakeupReason == HalGPIO::WakeupReason::PowerButton;
   const bool isPersistedSleepWake = isSleepWake && !APP_STATE.showBootScreen;
@@ -461,6 +495,13 @@ void setup() {
     SETTINGS.readerMenuStyle = CrossPointSettings::READER_MENU_TOOLBAR;
   }
   SETTINGS.loadFromFile();
+  benchmark::initialize(static_cast<uint32_t>(wakeupReason));
+  if (SETTINGS.benchmarkRecord) benchmark::begin(benchmark::SessionMode::Normal);
+  if (benchmark::enabled()) {
+    benchmark::settings(SETTINGS.fontFamily, SETTINGS.fontPointSize, SETTINGS.lineSpacing, SETTINGS.orientation,
+                        SETTINGS.textAntiAliasing, SETTINGS.screenInverted, SETTINGS.screenMargin, SETTINGS.sleepScreen,
+                        benchmark::id(SETTINGS.sdFontFamilyName));
+  }
   // Push the saved timezone's POSIX rule into the clock (migrating the legacy
   // UTC-offset setting on first boot after the update).
   timezones::applyToClock();
@@ -528,6 +569,7 @@ void setup() {
   bool needsWakeRefresh = false;
 
   setupDisplayAndFonts(resume != BootResume::Splash);
+  benchmark::hardware();
 
   switch (resume) {
     case BootResume::Silent:
@@ -557,8 +599,7 @@ void setup() {
       break;
   }
 
-  // Output polarity is resolved per render by ActivityManager (night mode
-  // inverts only the reading surfaces), so nothing to restore here.
+  // Subsequent activity renders resolve the reader/menu polarity independently.
 
   if (recoveryFirmwareMode) {
     // Skip normal home/reader routing: jump straight into the SD firmware picker.
@@ -601,7 +642,7 @@ void setup() {
     activityManager.requestUpdateAndWait();
     // Absorb any button held at this point into currentState as a non-edge:
     // two gpio.update() calls separated by > InputManager's 5ms debounce
-    // transition the held bit through lastDebounceTime into currentState
+    // transition the held bit through the debounce into currentState
     // without setting pressedEvents, so the first loop()'s own gpio.update()
     // sees state == currentState and emits nothing.
     gpio.update();
@@ -618,6 +659,7 @@ void loop() {
   static unsigned long lastMemPrint = 0;
 
   gpio.setSharedConfirmPowerShortPressEmitsPower(SETTINGS.shortPwrBtn == CrossPointSettings::SHORT_PWRBTN::SLEEP);
+  nav_run::tick();  // injects the next scripted press (if any) before this loop's input is sampled
   mappedInputManager.update();
 
   if (activityManager.requiresExclusiveStorageLoop()) {
@@ -634,6 +676,35 @@ void loop() {
       delay(50);
     }
     return;
+  }
+
+  if (benchmark::enabled() && activityManager.isReaderActivity() &&
+      (gpio.wasAnyPressed() || gpio.wasAnyReleased() || gpio.wasTouchActivity())) {
+    // Only reader activity flags: no key identities, coordinates, or text input.
+    benchmark::point(benchmark::EventType::Input, gpio.wasAnyPressed(), gpio.wasAnyReleased(), gpio.wasTouchActivity());
+  }
+  if (benchmark::nav::runActive() && benchmark::enabled() &&
+      (gpio.wasAnyPressed() || gpio.wasAnyReleased() || gpio.wasTouchActivity())) {
+    // Navigation run only: marks each input edge and whether the run injected it. No key identity.
+    benchmark::record(benchmark::nav::encodeInput(gpio.wasAnyPressed(), gpio.wasAnyReleased(), gpio.wasTouchActivity(),
+                                                  gpio.lastEdgeInjected(), activityManager.currentActivityId(),
+                                                  benchmark::nowUs()));
+  }
+  if (benchmark::flushDue()) {
+    RenderLock lock(RenderLock::Mode::Try);
+    if (lock.ownsLock()) benchmark::flush();
+  }
+
+  if (benchmark::enabled()) {
+    // One sample when a session starts, then one every BATTERY_SAMPLE_INTERVAL_MS while awake.
+    static char sampledSession[96] = "";
+    static uint32_t lastBatterySampleMs = 0;
+    const bool newSession = strncmp(benchmark::sessionPath(), sampledSession, sizeof(sampledSession) - 1) != 0;
+    if (newSession || benchmark::batterySampleDue(true, millis(), lastBatterySampleMs)) {
+      strlcpy(sampledSession, benchmark::sessionPath(), sizeof(sampledSession));
+      lastBatterySampleMs = millis();
+      recordBatterySample(newSession ? benchmark::BatteryReason::SessionStart : benchmark::BatteryReason::Periodic);
+    }
   }
 
   halTiltSensor.update(SETTINGS.tiltPageTurn, SETTINGS.orientation, activityManager.isReaderActivity());
@@ -722,7 +793,8 @@ void loop() {
   // A single X4 Pro power click becomes Confirm only after the frontlight
   // double-click window expires without a second click.
   mappedInputManager.setPowerConfirmClickFrame(false);
-  if (SETTINGS.shortPwrBtn == CrossPointSettings::SHORT_PWRBTN::PWR_CONFIRM && x4ProDoubleClickPwrLight) {
+  if (!activityManager.isBenchmarkActivity() &&
+      SETTINGS.shortPwrBtn == CrossPointSettings::SHORT_PWRBTN::PWR_CONFIRM && x4ProDoubleClickPwrLight) {
     if (lastX4ProPowerClickAt != 0 && millis() - lastX4ProPowerClickAt > X4PRO_POWER_DOUBLE_CLICK_MS) {
       lastX4ProPowerClickAt = 0;
       mappedInputManager.setPowerConfirmClickFrame(true);
@@ -795,12 +867,14 @@ void loop() {
 #endif
 
   // Refresh screen when power button is short-pressed with FORCE_REFRESH setting.
-  if (mappedInputManager.homeButtonAction() == HomeButtonAction::ToggleFrontlight) {
+  if (!activityManager.isBenchmarkActivity() &&
+      mappedInputManager.homeButtonAction() == HomeButtonAction::ToggleFrontlight) {
     toggleFrontlight();
   }
-  if (mappedInputManager.homeButtonAction() == HomeButtonAction::Refresh ||
-      (SETTINGS.shortPwrBtn == CrossPointSettings::SHORT_PWRBTN::FORCE_REFRESH &&
-       mappedInputManager.wasReleased(MappedInputManager::Button::Power))) {
+  if (!activityManager.isBenchmarkActivity() &&
+      (mappedInputManager.homeButtonAction() == HomeButtonAction::Refresh ||
+       (SETTINGS.shortPwrBtn == CrossPointSettings::SHORT_PWRBTN::FORCE_REFRESH &&
+        mappedInputManager.wasReleased(MappedInputManager::Button::Power)))) {
     LOG_DBG("MAIN", "Manual screen refresh triggered");
     if (!activityManager.handleForcedRefresh()) {
       RenderLock lock;
@@ -834,8 +908,9 @@ void loop() {
   {
     RenderLock lock(RenderLock::Mode::Try);
     if (!lock.ownsLock()) {
-      // Let rendering advance without treating lock contention as idle.
-      delay(10);
+      // Let rendering advance without treating lock contention as idle; an
+      // input edge ends the wait early so input during a render is not delayed.
+      gpio.waitForInput(10);
       return;
     }
     skipLoopDelay = activityManager.skipLoopDelay();
@@ -860,8 +935,10 @@ void loop() {
         if (gpio.rawInputActive()) break;
       }
     } else {
-      // Short delay to prevent tight loop while still being responsive
-      delay(10);
+      // Short wait to prevent a tight loop; an input edge (or a raw change
+      // reaching the end of its debounce window) ends it early. With no input
+      // this wakes exactly as often as the former fixed delay(10).
+      gpio.waitForInput(10);
     }
   }
 }

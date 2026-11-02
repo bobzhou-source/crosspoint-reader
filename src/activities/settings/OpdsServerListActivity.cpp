@@ -15,6 +15,7 @@
 #include "activities/browser/OpdsBookBrowserActivity.h"
 #include "activities/util/KeyboardEntryActivity.h"
 #include "components/UITheme.h"
+#include "fontIds.h"
 #include "util/OpdsFilename.h"
 
 namespace fui = freeink::ui;
@@ -211,7 +212,9 @@ void OpdsServerListActivity::buildScreen(UiScreen& screen) {
 
   const int itemCount = getItemCount();
   if (itemCount == 0) {
-    screen.centeredText(tr(STR_NO_SERVERS), screen.theme().bodyText);
+    const auto body = screen.body();
+    UITheme::drawCenteredWrappedText(renderer, Rect{body.x + 20, body.y, body.width - 40, body.height},
+                                     UI_12_FONT_ID, tr(STR_NO_SERVERS), 8);
     return;
   }
 

@@ -315,7 +315,7 @@ TEST_F(LibraryBuilderTest, ReadWriteCloseAndAllocationFailuresRetainPreviousInde
   EXPECT_FALSE(buildLibraryIndex("/", stats, true));
   EXPECT_EQ(fake::files[INDEX]->bytes, old);
 
-  fake::failAlloc = 3;
+  fake::failAlloc = 4;  // after the optional blob cache, fail the required prior table
   EXPECT_FALSE(buildLibraryIndex("/", stats, true));
   EXPECT_EQ(fake::files[INDEX]->bytes, old);
   fake::failAlloc = -1;
@@ -399,4 +399,180 @@ TEST_F(LibraryBuilderTest, SortAllocationFailureProducesValidDegradedIndex) {
   LibraryIndexFile index;
   ASSERT_TRUE(index.open(INDEX));
   EXPECT_EQ(index.bookCount(), 513);
+}
+
+TEST_F(LibraryBuilderTest, SeventeenHundredBooksPlusTwentyTwoOnlyParsesAdditions) {
+  fake::reset();
+  for (unsigned i = 0; i < 1700; i++) fake::add("/books/Inbox/" + numbered("article", i) + ".epub");
+  initial();
+  const auto old = fake::files[INDEX]->bytes;
+  for (unsigned i = 1700; i < 1722; i++) fake::add("/books/Inbox/" + numbered("article", i) + ".epub");
+  fake::parses = 0;
+  BuildControl control;
+  control.deferInstall = true;
+  ASSERT_TRUE(buildLibraryIndex("/", stats, true, &control));
+  EXPECT_EQ(stats.parsed, 22);
+  EXPECT_EQ(stats.metadataReused, 1700);
+  EXPECT_EQ(stats.books, 1722);
+  EXPECT_TRUE(stats.indexPrepared);
+  EXPECT_FALSE(stats.indexReplaced);
+  EXPECT_EQ(fake::files[INDEX]->bytes, old);
+  ASSERT_TRUE(installPreparedLibraryIndex());
+  LibraryIndexFile index;
+  ASSERT_TRUE(index.open(INDEX));
+  EXPECT_EQ(index.bookCount(), 1722);
+}
+
+TEST_F(LibraryBuilderTest, InterruptedColdBuildResumesOnlyValidatedUnchangedMetadata) {
+  fake::add("/c.epub");
+  fake::add("/d.epub");
+  BuildControl control;
+  control.service = [](void*, uint16_t scanned, uint16_t, uint16_t) { return scanned < 3; };
+  EXPECT_FALSE(buildLibraryIndex("/", stats, true, &control));
+  EXPECT_EQ(fake::parses, 3u);
+  EXPECT_FALSE(Storage.exists(INDEX));
+  ASSERT_TRUE(Storage.exists("/.crosspoint/library.resume"));
+  EXPECT_TRUE(isLibraryIndexDirty());
+  // A torn append cannot make the preceding complete entries unusable.
+  auto& journal = fake::files["/.crosspoint/library.resume"]->bytes;
+  journal.insert(journal.end(), 17, 0xCC);
+  fake::files["/b.epub"]->time++;
+  ASSERT_TRUE(Storage.remove("/c.epub"));
+  fake::parses = 0;
+  ASSERT_TRUE(buildLibraryIndex("/", stats, true));
+  EXPECT_EQ(stats.metadataResumed, 1);
+  EXPECT_EQ(stats.parsed, 2);
+  EXPECT_EQ(stats.books, 3);
+  EXPECT_FALSE(Storage.exists("/.crosspoint/library.resume"));
+  LibraryIndexFile index;
+  ASSERT_TRUE(index.open(INDEX));
+  for (uint16_t row = 0; row < index.bookCount(); row++) EXPECT_NE(pathAt(index, SortOrder::TitleAsc, row), "/c.epub");
+}
+
+TEST_F(LibraryBuilderTest, CorruptCheckpointIsReparsedInsteadOfTrusted) {
+  BuildControl control;
+  control.service = [](void*, uint16_t scanned, uint16_t, uint16_t) { return scanned < 1; };
+  EXPECT_FALSE(buildLibraryIndex("/", stats, true, &control));
+  fake::files["/.crosspoint/library.resume"]->bytes[30] ^= 1;
+  fake::parses = 0;
+  ASSERT_TRUE(buildLibraryIndex("/", stats, true));
+  EXPECT_EQ(stats.parsed, 2);
+  EXPECT_EQ(stats.metadataResumed, 0);
+}
+
+TEST_F(LibraryBuilderTest, OldFormatRebuildsCleanlyAndCurrentFormatRemainsReadable) {
+  initial();
+  fake::files[INDEX]->bytes[offsetof(ClixHeader, formatVersion)] = CLIX_FORMAT_VERSION - 1;
+  LibraryIndexFile index;
+  EXPECT_FALSE(index.open(INDEX));
+  EXPECT_EQ(index.validity(), ClixValidity::UnknownFormatVersion);
+  ASSERT_TRUE(buildLibraryIndex("/", stats, true));
+  ASSERT_TRUE(index.open(INDEX));
+  EXPECT_EQ(index.bookCount(), 2);
+  EXPECT_EQ(index.header().formatVersion, CLIX_FORMAT_VERSION);
+}
+
+TEST_F(LibraryBuilderTest, RemovingEveryBookPublishesEmptyShelfAndCountsRemovals) {
+  initial();
+  ASSERT_TRUE(Storage.remove("/a.epub"));
+  ASSERT_TRUE(Storage.remove("/b.epub"));
+  ASSERT_TRUE(buildLibraryIndex("/", stats, true));
+  EXPECT_EQ(stats.removed, 2);
+  EXPECT_EQ(stats.books, 0);
+  LibraryIndexFile index;
+  ASSERT_TRUE(index.open(INDEX));
+  EXPECT_EQ(index.bookCount(), 0);
+}
+
+TEST_F(LibraryBuilderTest, VisibleRowMetadataUsesOneBlobReadRegardlessOfLibrarySize) {
+  bookMetadata["/a.epub"].title = "A title";
+  bookMetadata["/a.epub"].author = "An Author";
+  initial();
+  LibraryIndexFile index;
+  ASSERT_TRUE(index.open(INDEX));
+  ClixRecord record{};
+  ASSERT_TRUE(index.readRecord(0, record));
+  fake::resetIoCounters();
+  std::string text;
+  ASSERT_TRUE(index.readAuthor(record, text));
+  ASSERT_TRUE(index.readTitle(record, text));
+  ASSERT_TRUE(index.readName(record, text));
+  EXPECT_EQ(fake::reads, 1u);
+  EXPECT_EQ(fake::seeks, 1u);
+}
+
+TEST_F(LibraryBuilderTest, TransferDuringBuildKeepsItsOwnDirtyGeneration) {
+  initial();
+  ASSERT_TRUE(markLibraryIndexDirty());
+  bool transferred = false;
+  BuildControl control;
+  control.context = &transferred;
+  control.service = [](void* context, uint16_t scanned, uint16_t, uint16_t) {
+    bool& sent = *static_cast<bool*>(context);
+    if (scanned == 1 && !sent) {
+      sent = true;
+      EXPECT_TRUE(markLibraryIndexDirty());
+    }
+    return true;
+  };
+  ASSERT_TRUE(buildLibraryIndex("/", stats, true, &control));
+  EXPECT_TRUE(transferred);
+  EXPECT_TRUE(isLibraryIndexDirty());
+  ASSERT_TRUE(buildLibraryIndex("/", stats, true));
+  EXPECT_FALSE(isLibraryIndexDirty());
+}
+
+TEST_F(LibraryBuilderTest, OversizedMetadataIsReparsedWithoutTruncatingAuthorIdentity) {
+  bookMetadata["/a.epub"].author = std::string(130, 'A') + " Lastname";
+  BuildControl control;
+  control.service = [](void*, uint16_t scanned, uint16_t, uint16_t) { return scanned < 1; };
+  EXPECT_FALSE(buildLibraryIndex("/", stats, true, &control));
+  fake::parses = 0;
+  ASSERT_TRUE(buildLibraryIndex("/", stats, true));
+  EXPECT_EQ(stats.parsed, 2);
+  EXPECT_EQ(stats.metadataResumed, 0);
+}
+
+TEST_F(LibraryBuilderTest, UnknownTimestampCannotReuseAnInterruptedCheckpoint) {
+  fake::files["/a.epub"]->time = 0;
+  BuildControl control;
+  control.service = [](void*, uint16_t scanned, uint16_t, uint16_t) { return scanned < 1; };
+  EXPECT_FALSE(buildLibraryIndex("/", stats, true, &control));
+  fake::parses = 0;
+  ASSERT_TRUE(buildLibraryIndex("/", stats, true));
+  EXPECT_EQ(stats.parsed, 2);
+  EXPECT_EQ(stats.metadataResumed, 0);
+}
+
+TEST_F(LibraryBuilderTest, RestartNeverRemovesTheOnlyPersistedRetryMarker) {
+  BuildControl control;
+  control.service = [](void*, uint16_t scanned, uint16_t, uint16_t) { return scanned < 1; };
+  ASSERT_FALSE(buildLibraryIndex("/", stats, true, &control));
+  const auto marker = fake::files["/.crosspoint/library.updating"];
+  ASSERT_NE(marker, nullptr);
+  control.service = [](void*, uint16_t, uint16_t, uint16_t) { return false; };
+  EXPECT_FALSE(buildLibraryIndex("/", stats, true, &control));
+  EXPECT_EQ(fake::files["/.crosspoint/library.updating"], marker);
+  EXPECT_TRUE(isLibraryIndexDirty());
+}
+
+TEST_F(LibraryBuilderTest, ShortBlobReadCannotPoisonThePreviousCachedRow) {
+  bookMetadata["/a.epub"].title = "Alpha";
+  bookMetadata["/b.epub"].title = "Bravo";
+  initial();
+  LibraryIndexFile index;
+  ASSERT_TRUE(index.open(INDEX));
+  ClixRecord first{};
+  ClixRecord second{};
+  ASSERT_TRUE(index.readRecord(0, first));
+  ASSERT_TRUE(index.readRecord(1, second));
+  std::string title;
+  ASSERT_TRUE(index.readTitle(first, title));
+  ASSERT_EQ(title, "Alpha");
+  const auto bytes = fake::files[INDEX]->bytes;
+  fake::files[INDEX]->bytes.pop_back();
+  EXPECT_FALSE(index.readTitle(second, title));
+  fake::files[INDEX]->bytes = bytes;
+  ASSERT_TRUE(index.readTitle(first, title));
+  EXPECT_EQ(title, "Alpha");
 }

@@ -37,13 +37,11 @@ void EndOfBookOptions::loadOnce(const std::string& currentBookPath) {
   folder = FsHelpers::extractFolderPath(currentBookPath);
   names = NextBookFinder::findNextBooks(currentBookPath, MAX_SUGGESTIONS);
   selector.store(0, std::memory_order_relaxed);
-  if (!names.empty()) {
-    // One-time app setup on the render task, before the first render/route.
-    resetUi();
-    app.on(ACTION_ROW, &EndOfBookOptions::onRowEvent, this);
-    app.setScreen(&EndOfBookOptions::listScreen, this);
-    buildRowItems();
-  }
+  // One-time app setup on the render task, including the Home-only case.
+  resetUi();
+  app.on(ACTION_ROW, &EndOfBookOptions::onRowEvent, this);
+  app.setScreen(&EndOfBookOptions::listScreen, this);
+  buildRowItems();
   // Release-publish so the main task, which gates all access on isLoaded, never
   // observes a partially built list (rowItems/rowLabels included)
   isLoaded.store(true, std::memory_order_release);
@@ -58,6 +56,9 @@ void EndOfBookOptions::buildRowItems() {
     rowLabels[rowCount] = displayName(name);
     fui::ListItem item;
     item.label = rowLabels[rowCount].c_str();
+    const auto extension = name.rfind('.');
+    item.value = extension == std::string::npos ? nullptr : name.c_str() + extension;
+    item.subtitle = folder.c_str();
     item.actionValue = static_cast<int16_t>(rowCount);
     rowItems[rowCount] = item;
     rowCount++;
@@ -72,7 +73,7 @@ void EndOfBookOptions::buildRowItems() {
   }
 }
 
-bool EndOfBookOptions::menuActive() const { return isLoaded.load(std::memory_order_acquire) && !names.empty(); }
+bool EndOfBookOptions::menuActive() const { return isLoaded.load(std::memory_order_acquire); }
 
 std::string EndOfBookOptions::fullPath(const size_t index) const {
   if (index >= names.size()) {
@@ -108,6 +109,22 @@ EndOfBookOptions::Action EndOfBookOptions::handleMenuInput(const MappedInputMana
     }
     return Action::GoHome;  // "Home" row tapped
   }
+
+  // Wrapped titles and folder lines can outgrow a landscape page. Vertical
+  // swipes page the viewport by the rows the last build drew (the selection
+  // stays put; buttons pull the view back to it), as on every list screen.
+  // Edge swipes keep their reader/home meanings, and a list that fit
+  // entirely gets no repaint.
+  if (!names.empty() && nav.inputPageRows() < static_cast<int>(rowCount) && !input.wasMenuGesture() &&
+      !input.wasHomeGesture() && !input.wasReaderMenuSwipeUp()) {
+    const auto swipe = input.wasSwipe();
+    if (swipe == MappedInputManager::SwipeDir::Up || swipe == MappedInputManager::SwipeDir::Down) {
+      const int rows = nav.inputPageRows();
+      nav.requestScroll(swipe == MappedInputManager::SwipeDir::Up ? rows : -rows);
+      return Action::Redraw;
+    }
+  }
+
   if (route.routed && app.invalidated()) {
     return Action::Redraw;
   }
@@ -141,10 +158,12 @@ EndOfBookOptions::Action EndOfBookOptions::handleMenuInput(const MappedInputMana
   };
   const int itemCount = static_cast<int>(names.size()) + 1;  // + "Home" entry
   if (triggered(MappedInputManager::Button::NavPrevious)) {
+    if (names.empty()) return Action::LastPage;
     selector.store(ButtonNavigator::previousIndex(selectedIndex, itemCount), std::memory_order_relaxed);
     return Action::Redraw;
   }
   if (triggered(MappedInputManager::Button::NavNext)) {
+    if (names.empty()) return Action::GoHome;
     selector.store(ButtonNavigator::nextIndex(selectedIndex, itemCount), std::memory_order_relaxed);
     return Action::Redraw;
   }
@@ -156,56 +175,55 @@ void EndOfBookOptions::listScreen(UiScreen& screen, void* user) {
 }
 
 void EndOfBookOptions::buildListScreen(UiScreen& screen) {
-  const auto& metrics = UITheme::getInstance().getMetrics();
-  // Same layout math as render(): the list band starts under the title/subtitle it
-  // draws, and stops above the button hints (the safe-area bottom edge).
-  const Rect safe = UITheme::getInstance().getScreenSafeArea(renderer, true, false);
-  const int titleY = safe.y + safe.height / 8;
-  const int subtitleY = titleY + renderer.getLineHeight(UI_12_FONT_ID) + metrics.verticalSpacing;
-  const int listTop = subtitleY + renderer.getLineHeight(UI_10_FONT_ID) + metrics.verticalSpacing * 2;
+  const Rect body = UITheme::getContentBounds(renderer);
   screen.setContentMarginFromScreen(fui::Insets{
-      static_cast<int16_t>(listTop), static_cast<int16_t>(renderer.getScreenWidth() - (safe.x + safe.width)),
-      static_cast<int16_t>(renderer.getScreenHeight() - (safe.y + safe.height) + metrics.verticalSpacing),
-      static_cast<int16_t>(safe.x)});
+      static_cast<int16_t>(body.y), static_cast<int16_t>(renderer.getScreenWidth() - (body.x + body.width)),
+      static_cast<int16_t>(renderer.getScreenHeight() - (body.y + body.height)), static_cast<int16_t>(body.x)});
+  if (!names.empty()) {
+    auto heading = screen.theme().smallText;
+    heading.align = UITheme::isRtl() ? fui::TextAlign::Right : fui::TextAlign::Left;
+    heading.maxLines = 2;
+    const int16_t height = fui::measureWrappedText(screen.target(), tr(STR_EOB_CONTINUE_WITH), heading,
+                                                  screen.body().width).height;
+    screen.target().text(screen.takeTop(height), tr(STR_EOB_CONTINUE_WITH), heading);
+    screen.spacer(screen.theme().spaceMd);
+  }
 
   // rowLabels/rowItems were built once in loadOnce() (see buildRowItems())
   // and reused here on every repaint.
   fui::ListProps props;
   props.items = rowItems;
   props.count = static_cast<uint16_t>(rowCount);
-  props.selectedIndex = static_cast<int16_t>(selector.load(std::memory_order_relaxed));
+  const int selected = selector.load(std::memory_order_relaxed);
+  if (nav.selected != selected) nav.followOnBuild = true;
+  nav.selected = selected;
   props.action = ACTION_ROW;
   props.inputMask = fui::InputTouch;  // physical buttons stay in handleMenuInput()
+  props.rowInset = 0;
+  props.labelText = screen.theme().bodyText;
+  props.labelText.maxLines = 2;
+  props.subtitleText = screen.theme().smallText;
+  props.valueText = screen.theme().smallText;
+  props.balanceWrappedLabelWithValue = false;
+  screen.syncListViewport(nav, props, static_cast<int>(rowCount));
   screen.list(props);
 }
 
 void EndOfBookOptions::render(GfxRenderer& renderer, const MappedInputManager& input) {
   const auto& metrics = UITheme::getInstance().getMetrics();
-
-  if (!menuActive()) {
-    // No suggestions: the historical plain end screen. 3/8 of the screen height matches
-    // the previous fixed position on the 480x800 panel and scales to other resolutions.
-    renderer.drawCenteredText(UI_12_FONT_ID, renderer.getScreenHeight() * 3 / 8, tr(STR_END_OF_BOOK), true,
-                              EpdFontFamily::BOLD);
-    return;
-  }
-
-  // Suggestion menu: title, list (+ Home entry) and button hints. The hints are drawn at
-  // the physical front buttons, which is a logical side/top edge in the rotated
-  // orientations — lay out inside the safe area so nothing hides behind them. Vertical
-  // positions derive from the safe-area height and font line heights so other panel
-  // resolutions scale (review request on #2532).
   const Rect safe = UITheme::getInstance().getScreenSafeArea(renderer, true, false);
-  const int titleY = safe.y + safe.height / 8;
-  const int subtitleY = titleY + renderer.getLineHeight(UI_12_FONT_ID) + metrics.verticalSpacing;
-
-  UITheme::drawCenteredText(renderer, safe, UI_12_FONT_ID, titleY, tr(STR_END_OF_BOOK), true, EpdFontFamily::BOLD);
-  UITheme::drawCenteredText(renderer, safe, UI_10_FONT_ID, subtitleY, tr(STR_EOB_CONTINUE_WITH));
+  const Rect header{safe.x, safe.y + metrics.topPadding, safe.width, metrics.headerHeight};
+  GUI.drawHeader(renderer, header, tr(STR_END_OF_BOOK));
 
   // The list renders through the FreeInkApp so its rows register touch hit
   // rects; renderUi re-derives the device context, picking up any rotation
   // since construction (reader menu rotate).
   renderUi();
+  for (int pass = 0; pass < static_cast<int>(MAX_ROWS) && nav.consumeRebuildNeeded(); ++pass) {
+    renderer.clearScreen();
+    GUI.drawHeader(renderer, header, tr(STR_END_OF_BOOK));
+    renderUi();
+  }
 
   const auto labels = input.mapLabels(tr(STR_BACK), tr(STR_OPEN), tr(STR_DIR_UP), tr(STR_DIR_DOWN));
   GUI.drawButtonHints(renderer, labels.btn1, labels.btn2, labels.btn3, labels.btn4);

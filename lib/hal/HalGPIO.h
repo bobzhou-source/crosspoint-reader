@@ -46,6 +46,19 @@ class HalGPIO {
   bool lastUsbConnected = false;
   bool usbStateChanged = false;
 
+  // Benchmark navigation overlay: one synthetic physical button press layered over the real inputs so the full
+  // MappedInputManager mapping and every activity's normal input path run unchanged. Idle unless a nav run uses it.
+  enum class InjectStage : uint8_t { Idle, Queued, Down };
+  InjectStage injectStage = InjectStage::Idle;
+  uint8_t injectIndex = 0;
+  uint16_t injectHoldMs = 0;
+  uint32_t injectDownAtMs = 0;
+  uint32_t injectHeldMs = 0;
+  bool injectPressEdge = false;
+  bool injectReleaseEdge = false;
+  bool injectionGuard = false;
+  bool realInputDuringInjection = false;
+
  public:
   enum class DeviceType : uint8_t { X4, X3 };
 
@@ -71,6 +84,11 @@ class HalGPIO {
 
   // Button input methods
   void update();
+  // Active-loop pause of at most maxMs before the next update(). X4 Pro ends it
+  // at the next button or touch INT edge, or as soon as a raw button change
+  // pending in the debounce can commit; with no input it lasts the full maxMs.
+  // Other boards: delay(maxMs).
+  void waitForInput(unsigned long maxMs);
   bool isPressed(uint8_t buttonIndex) const;
   bool wasPressed(uint8_t buttonIndex) const;
   bool wasAnyPressed() const;
@@ -78,9 +96,22 @@ class HalGPIO {
   bool wasAnyReleased() const;
   unsigned long getHeldTime() const;
   unsigned long getPowerButtonHeldTime() const;
+
+  // Benchmark navigation (lib/Benchmark/NavScript): press `buttonIndex` (BTN_BACK..BTN_DOWN, never power) for
+  // `holdMs`. The press becomes visible at the next update() as a normal press edge and ends with a release edge,
+  // bounded by holdMs. Refused (false) while another injected press is in flight or the index is invalid.
+  bool injectPress(uint8_t buttonIndex, uint16_t holdMs);
+  // True from injectPress() until the release edge has been delivered by update().
+  bool injectionInFlight() const { return injectStage != InjectStage::Idle || injectReleaseEdge; }
+  // While guarded, any real button/touch edge is latched in realInputSeen() so a run yields to the user at once.
+  void setInjectionGuard(bool enabled);
+  bool realInputSeen() const { return realInputDuringInjection; }
+  // True when the edge reported by the current update() came from injectPress(), not a finger.
+  bool lastEdgeInjected() const { return injectPressEdge || injectReleaseEdge; }
   // True when any button contact is closed right now, read straight from the
-  // hardware (ADC ladder off its idle rail, or the power GPIO asserted), without
-  // going through the debounced state. Cheap enough to call every few ms.
+  // hardware (direct-GPIO button pins, ADC ladder off its idle rail, or the power
+  // GPIO asserted), without going through the debounced state. Cheap enough to
+  // call every few ms.
   bool rawInputActive();
   bool hasTouch() const;
   // Capacitive Home key reported by the touch controller (X4 Pro). The tap

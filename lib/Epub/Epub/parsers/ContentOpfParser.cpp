@@ -257,7 +257,11 @@ void XMLCALL ContentOpfParser::startElement(void* userData, const XML_Char* name
       entry.idHash = fnvHash(itemId);
       entry.idLen = static_cast<uint16_t>(itemId.size());
       entry.fileOffset = static_cast<uint32_t>(self->tempItemStore.position());
-      self->itemIndex.push_back(entry);
+      if (!self->itemIndex.push_back(entry)) {
+        LOG_ERR("COF", "Out of memory building manifest index");
+        XML_StopParser(self->parser, XML_FALSE);
+        return;
+      }
     }
 
     if (self->tempItemStore) {

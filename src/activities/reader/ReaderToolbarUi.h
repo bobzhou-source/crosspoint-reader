@@ -12,10 +12,10 @@ class MappedInputManager;
 // FreeInkUI chrome for the toolbar reader menu (Settings -> Reader -> Reader
 // Menu Style -> Toolbar), painted over the page that is already on screen:
 //
-//  - Toolbar: a bottom sheet holding a chapter scrub row (< capsule >) and a
-//    Contents / Text / More tile row; the page above it stays untouched.
-//  - Panel: a taller bottom sheet with a title, a paged row list (name left,
-//    value right) and the same tile row as a switcher.
+//  - Toolbar: a bottom sheet holding chapter progress and a labeled
+//    Contents / Text / More row; the page above it stays untouched.
+//  - Panel: a taller bottom sheet with a title, a paged row list (label and
+//    value) and the same tool row as a switcher.
 //
 // EpubReaderActivity owns the state (which overlay, selection, row contents)
 // and the physical-button handling; this class owns the layout, the tap
@@ -38,6 +38,9 @@ class ReaderToolbarUi : public UiAppHost {
     int selectedIndex = -1;  // row the buttons' cursor sits on; -1 = none shown
     std::function<std::string(int)> rowText;
     std::function<std::string(int)> rowValue;
+    // Row of the chapter being read (Contents panel); tagged with a "Current"
+    // value unless rowValue supplies its own. -1 = none.
+    int currentRow = -1;
     // Tile row: the tool in focus (toolbar) / the open panel (panel). 0..2.
     int activeTool = 0;
     // Button boards keep the theme's denser list row height (as every other
@@ -79,8 +82,11 @@ class ReaderToolbarUi : public UiAppHost {
   static void onAction(const freeink::ui::ActionEvent& event, void* user);
   void buildToolbar(UiScreen& screen);
   void buildPanel(UiScreen& screen);
+  int16_t toolRowHeight(UiScreen& screen) const;
   void buildToolRow(UiScreen& screen, freeink::ui::LayoutAnchor anchor, int16_t sideInset);
+  std::string rowValue(int index) const;
 
+  const GfxRenderer& renderer_;
   Model model_;
   Routed pending_;
   freeink::ui::ListNav nav_;

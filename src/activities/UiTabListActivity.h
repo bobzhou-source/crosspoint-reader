@@ -10,8 +10,8 @@
 // Each tab owns its own ListNav (selection + viewport memory); activeNav()
 // redirects the whole UiListActivity protocol (touch routing, swipe scroll,
 // screen sync) to the active tab's state. Button navigation walks the ring on
-// release and steps the TAB on continuous hold. The tab-bar chrome (pill
-// styles, focused band wash) is shared verbatim via buildTabBar().
+// release and steps the TAB on continuous hold. Flat underline tabs and their
+// keyboard-focus outline share the same slots through buildTabBar().
 //
 // Subclasses own the button semantics wholesale (handleButtons is pure here:
 // the two existing tab screens differ on press-vs-release and what Back does)
@@ -33,7 +33,7 @@ class UiTabListActivity : public UiListActivity {
   virtual int activeTab() const = 0;
   virtual const char* tabLabel(int index) const = 0;
   virtual freeink::ui::TabIndicator tabIndicator(int) const { return freeink::ui::TabIndicator::None; }
-  // Touch tap on a tab pill (bounds already checked).
+  // Touch tap on a tab slot (bounds already checked).
   virtual void onTabAction(int index) = 0;
   // Advance the active tab by direction (continuous-hold navigation; also what
   // Confirm on the tab bar should do). Subclass owns wrap and any per-switch
@@ -56,8 +56,7 @@ class UiTabListActivity : public UiListActivity {
   void moveRingTo(int ringIndex);
 
   // --- screen helpers --------------------------------------------------------
-  // The shared tab band: theme-driven pill treatment (label-hugging Lyra vs
-  // full-slot RoundedRaff), Lyra focused band wash, always-on divider.
+  // Shared safe-area-relative tab band with active underline and focus outline.
   void buildTabBar(UiScreen& screen);
   // Ring-aware counterpart of syncListViewport: measures rows, applies the
   // one-shot follow to the remembered row, clamps, and writes
@@ -67,12 +66,6 @@ class UiTabListActivity : public UiListActivity {
   // Per-tab selection/viewport state, sized in onEnter. Protected so subclass
   // tab-switch code can seed the target tab's ring/viewport.
   std::vector<freeink::ui::ListNav> tabNavs;
-
-  // When > 0, each tab pill is capped at its label width plus this padding
-  // per side, centered in its unchanged equal-width slot. With few tabs the
-  // default full-slot pill stretches across a third of the screen; screens
-  // with more tabs (Settings) keep the default of 0 (fill the slot).
-  int16_t tabPillMaxPad = 0;
 
  private:
   static void tabActionTrampoline(const freeink::ui::ActionEvent& event, void* user);

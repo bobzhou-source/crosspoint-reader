@@ -16,6 +16,10 @@ class FontCacheManager {
 
   void setFontDecompressor(FontDecompressor* d);
 
+  // EXPLICIT invalidation: drops compressed-font page buffers, SD mini glyph
+  // caches AND every TTF (vector) face's cached glyphs/kerning (allocations
+  // kept). Render scopes do NOT call this; they only reset the transient
+  // per-render state, so TTF content survives scope begin/end.
   void clearCache();
   // Release every rebuildable font cache while keeping the fonts loaded:
   //   * SD (.cpfont): mini glyph/kern arenas, kern/lig class tables, overflow
@@ -54,6 +58,10 @@ class FontCacheManager {
   PrewarmScope createPrewarmScope();
 
  private:
+  // Scope-entry/exit reset: the per-render transient caches only (compressed
+  // page buffers, SD mini glyph caches). TTF faces are retained on purpose.
+  void resetScopeTransientCaches();
+
   const std::map<int, EpdFontFamily>& fontMap_;
   const std::map<int, SdCardFont*>& sdCardFonts_;
   // Read only when CROSSPOINT_VECTOR_FONTS is on (PSRAM boards).

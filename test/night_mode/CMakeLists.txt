@@ -1,0 +1,3 @@
+add_executable(NightModeTest NightModeTest.cpp)
+target_link_libraries(NightModeTest PRIVATE crosspoint_test_common GTest::gtest_main)
+gtest_discover_tests(NightModeTest)

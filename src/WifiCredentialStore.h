@@ -9,12 +9,19 @@
 struct WifiCredential {
   std::string ssid;
   std::string password;  // Plaintext in memory; obfuscated with hardware key on disk
+  bool enterprise = false;
+  std::string identity;
+  std::string anonymousIdentity;
+  std::string caPath;
+  std::string domain;
+  bool validateServer = true;
 };
 
 struct WifiCredentialSummary {
   std::string ssid;
   bool hasPassword = false;
   bool isLastConnected = false;
+  bool enterprise = false;
 };
 
 /**
@@ -34,6 +41,7 @@ class WifiCredentialStore : public PersistableStore<WifiCredentialStore> {
 
   static constexpr size_t MAX_NETWORKS = 8;
   static constexpr size_t MAX_PASSWORD_LENGTH = 64;
+  static constexpr size_t MAX_ENTERPRISE_PASSWORD_LENGTH = 127;
 
   // Private constructor for singleton
   WifiCredentialStore() = default;
@@ -47,6 +55,7 @@ class WifiCredentialStore : public PersistableStore<WifiCredentialStore> {
 
   // Credential management
   bool addCredential(const std::string& ssid, const std::string& password);
+  bool addCredential(const WifiCredential& credential);
   bool removeCredential(const std::string& ssid);
   std::optional<WifiCredential> findCredential(const std::string& ssid) const;
   std::optional<WifiCredential> getCredentialAt(size_t index) const;

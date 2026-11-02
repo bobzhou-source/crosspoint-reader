@@ -1,5 +1,6 @@
 #include "Epub.h"
 
+#include <Benchmark.h>
 #include <FsHelpers.h>
 #include <HalStorage.h>
 #include <JpegToBmpConverter.h>
@@ -568,6 +569,7 @@ bool Epub::load(const bool buildIfMissing, const bool skipLoadingCss) {
     return false;
   }
   LOG_DBG("EBP", "buildBookBin completed in %lu ms", millis() - buildStart);
+  benchmark::intervalMs(benchmark::EventType::Index, indexingStart, millis(), 0, 1);
   LOG_DBG("EBP", "Total indexing completed in %lu ms", millis() - indexingStart);
 
   if (!bookMetadataCache->cleanupTmpFiles()) {
@@ -596,17 +598,6 @@ bool Epub::load(const bool buildIfMissing, const bool skipLoadingCss) {
 bool Epub::loadMetadata(std::string& title, std::string& author) {
   title.clear();
   author.clear();
-
-  auto metadataCache = makeUniqueNoThrow<BookMetadataCache>(cachePath);
-  if (metadataCache && metadataCache->load()) {
-    title = metadataCache->coreMetadata.title;
-    author = metadataCache->coreMetadata.author;
-    return true;
-  }
-  if (!metadataCache) {
-    LOG_ERR("EBP", "Could not allocate metadata cache reader");
-  }
-  metadataCache.reset();
 
   ZipFile zip(filepath);
   if (!zip.open()) {

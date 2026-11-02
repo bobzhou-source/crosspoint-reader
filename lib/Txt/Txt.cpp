@@ -4,6 +4,30 @@
 #include <JpegToBmpConverter.h>
 #include <Logging.h>
 
+#include <algorithm>
+
+#include "TxtPageIndexFormat.h"
+
+namespace {
+
+// Bytes hashed from each end of the source into its signature.
+constexpr size_t SIGNATURE_SAMPLE_BYTES = 4096;
+
+// Hashes `count` bytes of `file` starting at `from` into `hash`. False on a read failure.
+bool hashRange(HalFile& file, const size_t from, size_t count, uint32_t& hash) {
+  if (!file.seek(from)) return false;
+  uint8_t chunk[128];
+  while (count > 0) {
+    const int got = file.read(chunk, std::min(count, sizeof(chunk)));
+    if (got <= 0) return false;
+    hash = TxtPageIndexFormat::fnv1a(hash, chunk, static_cast<size_t>(got));
+    count -= static_cast<size_t>(got);
+  }
+  return true;
+}
+
+}  // namespace
+
 Txt::Txt(std::string path, std::string cacheBasePath)
     : filepath(std::move(path)), cacheBasePath(std::move(cacheBasePath)) {
   // Generate cache path from file path hash
@@ -28,6 +52,16 @@ bool Txt::load() {
   }
 
   fileSize = file.size();
+  // Size alone misses an edited book of the same length: fold in the modification
+  // time and both ends of the text, which is cheap enough to do on every open.
+  uint32_t signature = TxtPageIndexFormat::fnv1aLe32(TxtPageIndexFormat::FNV_OFFSET, file.modificationTime());
+  const size_t head = std::min(fileSize, SIGNATURE_SAMPLE_BYTES);
+  const size_t tailStart = std::max(head, fileSize > SIGNATURE_SAMPLE_BYTES ? fileSize - SIGNATURE_SAMPLE_BYTES : 0);
+  if (!hashRange(file, 0, head, signature) || !hashRange(file, tailStart, fileSize - tailStart, signature)) {
+    LOG_ERR("TXT", "Failed to read file: %s", filepath.c_str());
+    return false;
+  }
+  sourceSignature = signature;
   file.close();
 
   loaded = true;
@@ -168,22 +202,4 @@ bool Txt::clearCache() const {
 
   LOG_DBG("TXT", "Cache cleared successfully");
   return true;
-}
-
-bool Txt::readContent(uint8_t* buffer, size_t offset, size_t length) const {
-  if (!loaded) {
-    return false;
-  }
-
-  HalFile file;
-  if (!Storage.openFileForRead("TXT", filepath, file)) {
-    return false;
-  }
-
-  if (!file.seek(offset)) {
-    return false;
-  }
-
-  size_t bytesRead = file.read(buffer, length);
-  return bytesRead > 0;
 }

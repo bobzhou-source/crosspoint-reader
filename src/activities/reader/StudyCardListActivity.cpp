@@ -61,11 +61,15 @@ void StudyCardListActivity::buildScreen(UiScreen& screen) {
   screen.setContentMarginFromScreen(
       fui::Insets{static_cast<int16_t>(safe.y + metrics.topPadding + metrics.headerHeight),
                   static_cast<int16_t>(renderer.getScreenWidth() - (safe.x + safe.width)),
-                  static_cast<int16_t>(renderer.getScreenHeight() - (safe.y + safe.height) + metrics.buttonHintsHeight),
+                  static_cast<int16_t>(renderer.getScreenHeight() - (safe.y + safe.height)),
                   static_cast<int16_t>(safe.x)});
   screen.spacer(static_cast<int16_t>(metrics.verticalSpacing));
   if (!loaded || count == 0) {
-    screen.centeredText(loaded ? tr(STR_STUDY_EMPTY) : tr(STR_STUDY_LOAD_FAILED), screen.theme().bodyText);
+    auto style = screen.theme().bodyText;
+    style.align = fui::TextAlign::Center;
+    style.maxLines = 4;
+    screen.target().text(screen.body().inset(fui::Insets{0, 20, 0, 20}),
+                         loaded ? tr(STR_STUDY_EMPTY) : tr(STR_STUDY_LOAD_FAILED), style);
     return;
   }
   fui::ListProps props;
@@ -74,6 +78,7 @@ void StudyCardListActivity::buildScreen(UiScreen& screen) {
   props.count = static_cast<uint16_t>(count);
   props.action = ACTION_ROW;
   props.inputMask = fui::InputTouch;
+  props.labelText = screen.theme().bodyText;
   props.labelText.maxLines = 3;
   syncListViewport(screen, props);
   screen.list(props);

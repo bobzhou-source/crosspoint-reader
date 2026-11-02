@@ -2,6 +2,7 @@
 #include <ArduinoJson.h>
 #include <PersistableStore.h>
 
+#include <cstdint>
 #include <string>
 #include <vector>
 
@@ -20,6 +21,7 @@ class RecentBooksStore : public PersistableStore<RecentBooksStore> {
 
  private:
   std::vector<RecentBook> recentBooks;
+  uint32_t revision = 0;
 
   RecentBooksStore() = default;
   ~RecentBooksStore() = default;
@@ -55,6 +57,12 @@ class RecentBooksStore : public PersistableStore<RecentBooksStore> {
   // Remove entries whose backing file is no longer on the SD card.
   // Returns true if any entry was removed. Does not persist — caller decides.
   bool pruneMissing();
+
+  // Read-only half of pruning, for navigation preparation while the outgoing
+  // screen still uses this store. Apply only against the same revision.
+  uint16_t missingMask() const;
+  bool pruneMissing(uint16_t mask);
+  uint32_t getRevision() const { return revision; }
 
   // Get the list of recent books (most recent first)
   const std::vector<RecentBook>& getBooks() const { return recentBooks; }

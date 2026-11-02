@@ -1,5 +1,6 @@
 #include "BmpViewerActivity.h"
 
+#include <Benchmark.h>
 #include <Bitmap.h>
 #include <Epub/converters/PngToFramebufferConverter.h>
 #include <FsHelpers.h>
@@ -12,6 +13,7 @@
 #include <algorithm>
 
 #include "CrossPointSettings.h"
+#include "components/HeaderBackTapTarget.h"
 #include "components/UITheme.h"
 #include "fontIds.h"
 
@@ -20,6 +22,24 @@ constexpr char CUSTOM_SLEEP_ROOT_BMP[] = "/sleep.bmp";
 constexpr char TRANSPARENT_SLEEP_ROOT_BMP[] = "/sleep-overlay.bmp";
 constexpr char TRANSPARENT_SLEEP_ROOT_PNG[] = "/sleep-overlay.png";
 constexpr size_t COPY_BUFFER_SIZE = 2048;
+
+void drawViewerExit(const GfxRenderer& renderer, const bool touch) {
+  if (!touch) return;
+  const Rect body = UITheme::getContentBounds(renderer, false);
+  const int width = std::min(body.width, 160);
+  const Rect button{UITheme::isRtl() ? body.x + body.width - width : body.x,
+                    body.y + body.height - 48, width, 48};
+  renderer.fillRect(button.x - 8, button.y - 8, button.width + 16, button.height + 16, false);
+  renderer.drawRoundedRect(button.x, button.y, button.width, button.height, 1, 6, true);
+  UITheme::drawCenteredWrappedText(renderer, button, UI_10_FONT_ID, tr(STR_BACK), 2);
+  HeaderBackTapTarget::set(button.x, button.y, button.width, button.height);
+}
+
+void drawViewerError(const GfxRenderer& renderer, const char* message) {
+  Rect body = UITheme::getContentBounds(renderer, false);
+  body.height = std::max(0, body.height - 64);
+  UITheme::drawCenteredWrappedText(renderer, body, UI_12_FONT_ID, message, 8);
+}
 }  // namespace
 
 BmpViewerActivity::BmpViewerActivity(GfxRenderer& renderer, MappedInputManager& mappedInput, std::string path)
@@ -65,6 +85,7 @@ void BmpViewerActivity::loadSiblingImages() {
 }
 
 bool BmpViewerActivity::canSetSleepCover() const {
+  if (isBenchmarkActivity()) return false;
   return FsHelpers::hasBmpExtension(filePath) ||
          (SETTINGS.sleepScreen == CrossPointSettings::SLEEP_SCREEN_MODE::TRANSPARENT_CUSTOM &&
           FsHelpers::hasPngExtension(filePath));
@@ -88,15 +109,17 @@ bool BmpViewerActivity::renderPng() {
 
 void BmpViewerActivity::onEnter() {
   Activity::onEnter();
+  RenderLock lock;
+  painted = false;
+  benchmark::RenderSpan measurement("BmpViewer");
 
-  if (siblingImages.empty() && !filePath.empty()) {
+  if (!isBenchmarkActivity() && siblingImages.empty() && !filePath.empty()) {
     loadSiblingImages();
   }
 
   const auto pageWidth = renderer.getScreenWidth();
   const auto pageHeight = renderer.getScreenHeight();
-  Rect popupRect = GUI.drawPopup(renderer, tr(STR_LOADING_POPUP));
-  GUI.fillPopupProgress(renderer, popupRect, 20);  // Initial 20% progress
+  GUI.drawPopup(renderer, tr(STR_LOADING_POPUP));
   if (FsHelpers::hasPngExtension(filePath)) {
     renderer.clearScreen();
     const bool hasPrevious = siblingImages.size() > 1 && currentImageIndex > 0;
@@ -106,10 +129,16 @@ void BmpViewerActivity::onEnter() {
                                               hasPrevious ? "<" : "", hasNext ? ">" : "");
     if (renderPng()) {
       GUI.drawButtonHints(renderer, labels.btn1, labels.btn2, labels.btn3, labels.btn4);
+      drawViewerExit(renderer, mappedInput.hasTouch());
       renderer.displayBuffer(HalDisplay::FAST_REFRESH);
+      measurement.complete();
+      painted = true;
+      benchmarkPaintedAt = millis();
+      if (benchmarkCompleted) *benchmarkCompleted = 1;
     } else {
-      renderer.drawCenteredText(UI_10_FONT_ID, pageHeight / 2, tr(STR_FILE_OPEN_FAILED));
+      drawViewerError(renderer, tr(STR_FILE_OPEN_FAILED));
       GUI.drawButtonHints(renderer, labels.btn1, "", "", "");
+      drawViewerExit(renderer, mappedInput.hasTouch());
       renderer.displayBuffer(HalDisplay::HALF_REFRESH);
     }
     return;
@@ -153,18 +182,18 @@ void BmpViewerActivity::onEnter() {
       const auto labels = mappedInput.mapLabels(tr(STR_BACK), canSetSleepCover() ? tr(STR_SET_SLEEP_COVER) : "",
                                                 (hasPrevious ? "<" : ""), (hasNext ? ">" : ""));
 
-      GUI.fillPopupProgress(renderer, popupRect, 50);
-
       renderer.clearScreen();
       if (!renderer.drawBitmap(bitmap, x, y, pageWidth, pageHeight, 0, 0)) {
         renderer.clearScreen();
-        renderer.drawCenteredText(UI_10_FONT_ID, pageHeight / 2, tr(STR_FILE_OPEN_FAILED));
+        drawViewerError(renderer, tr(STR_FILE_OPEN_FAILED));
+        drawViewerExit(renderer, mappedInput.hasTouch());
         renderer.displayBuffer(HalDisplay::HALF_REFRESH);
         return;
       }
 
       // Draw UI hints on the base layer
       GUI.drawButtonHints(renderer, labels.btn1, labels.btn2, labels.btn3, labels.btn4);
+      drawViewerExit(renderer, mappedInput.hasTouch());
       if (bitmap.hasGreyscale()) {
         const bool absolute = renderer.grayscaleCapabilities(HalDisplay::GrayscaleMode::Absolute).supported();
         if (absolute && !renderer.displayGrayscaleBase(HalDisplay::GrayscaleMode::Absolute)) return;
@@ -183,6 +212,7 @@ void BmpViewerActivity::onEnter() {
             break;
           }
           GUI.drawButtonHints(renderer, labels.btn1, labels.btn2, labels.btn3, labels.btn4);
+          drawViewerExit(renderer, mappedInput.hasTouch());
           if (mode == GfxRenderer::GRAYSCALE_LSB) {
             renderer.copyGrayscaleLsbBuffers();
           } else {
@@ -197,22 +227,34 @@ void BmpViewerActivity::onEnter() {
         if (bitmap.rewindToData() != BmpReaderError::Ok ||
             !renderer.drawBitmap(bitmap, x, y, pageWidth, pageHeight, 0, 0)) {
           LOG_ERR("BMP", "Failed to rewind bitmap to restore the BW framebuffer");
-          renderer.drawCenteredText(UI_10_FONT_ID, pageHeight / 2, tr(STR_FILE_OPEN_FAILED));
+          drawViewerError(renderer, tr(STR_FILE_OPEN_FAILED));
           planesReady = false;
         }
         GUI.drawButtonHints(renderer, labels.btn1, labels.btn2, labels.btn3, labels.btn4);
+        drawViewerExit(renderer, mappedInput.hasTouch());
         renderer.cleanupGrayscaleWithFrameBuffer();
         if (!planesReady) renderer.displayBuffer(HalDisplay::HALF_REFRESH);
+        if (planesReady) {
+          measurement.complete();
+          painted = true;
+          benchmarkPaintedAt = millis();
+          if (benchmarkCompleted) *benchmarkCompleted = 1;
+        }
       } else {
         renderer.displayBuffer(HalDisplay::FAST_REFRESH);
+        measurement.complete();
+        painted = true;
+        benchmarkPaintedAt = millis();
+        if (benchmarkCompleted) *benchmarkCompleted = 1;
       }
 
     } else {
       // Handle file parsing error
       renderer.clearScreen();
-      renderer.drawCenteredText(UI_10_FONT_ID, pageHeight / 2, tr(STR_INVALID_BMP_FILE));
+      drawViewerError(renderer, tr(STR_INVALID_BMP_FILE));
       const auto labels = mappedInput.mapLabels(tr(STR_BACK), "", "", "");
       GUI.drawButtonHints(renderer, labels.btn1, labels.btn2, labels.btn3, labels.btn4);
+      drawViewerExit(renderer, mappedInput.hasTouch());
       renderer.displayBuffer(HalDisplay::HALF_REFRESH);
     }
 
@@ -220,15 +262,18 @@ void BmpViewerActivity::onEnter() {
   } else {
     // Handle file open error
     renderer.clearScreen();
-    renderer.drawCenteredText(UI_10_FONT_ID, pageHeight / 2, tr(STR_FILE_OPEN_FAILED));
+    drawViewerError(renderer, tr(STR_FILE_OPEN_FAILED));
     const auto labels = mappedInput.mapLabels(tr(STR_BACK), "", "", "");
     GUI.drawButtonHints(renderer, labels.btn1, labels.btn2, labels.btn3, labels.btn4);
+    drawViewerExit(renderer, mappedInput.hasTouch());
     renderer.displayBuffer(HalDisplay::HALF_REFRESH);
   }
 }
 
 void BmpViewerActivity::onExit() {
   Activity::onExit();
+  HeaderBackTapTarget::clear();
+  if (isBenchmarkActivity()) return;
   renderer.clearScreen();
   renderer.displayBuffer(HalDisplay::HALF_REFRESH);
 }
@@ -280,6 +325,30 @@ void BmpViewerActivity::doSetSleepCover() {
 void BmpViewerActivity::loop() {
   // Keep CPU awake/polling so 1st click works
   Activity::loop();
+  if (isBenchmarkActivity()) {
+    if (mappedInput.isPressed(MappedInputManager::Button::Back) ||
+        mappedInput.isPressed(MappedInputManager::Button::Power)) return;
+    int tx = 0;
+    int ty = 0;
+    const bool tappedBack = mappedInput.wasScreenTapped(tx, ty) && HeaderBackTapTarget::contains(tx, ty);
+    BenchmarkOutcome outcome = BenchmarkOutcome::Complete;
+    if (mappedInput.wasReleased(MappedInputManager::Button::Back) ||
+        mappedInput.wasReleased(MappedInputManager::Button::Power) || mappedInput.wasBackGesture() ||
+        mappedInput.wasHomeGesture() || mappedInput.homeButtonAction() != HomeButtonAction::Ignore ||
+        mappedInput.wasLightPanelGesture() || tappedBack) {
+      outcome = BenchmarkOutcome::Cancelled;
+    } else if (!benchmark::enabled()) {
+      outcome = BenchmarkOutcome::RecorderFailed;
+    } else if (!painted) {
+      outcome = BenchmarkOutcome::RenderFailed;
+    } else if (millis() - benchmarkPaintedAt < 2000) {
+      return;
+    }
+    benchmark::point(benchmark::EventType::RunStep, 4, *benchmarkCompleted, 1, static_cast<uint32_t>(outcome));
+    setResult(BenchmarkResult{outcome});
+    finish();
+    return;
+  }
 
   auto openSibling = [this](const int delta) {
     if (currentImageIndex < 0) {

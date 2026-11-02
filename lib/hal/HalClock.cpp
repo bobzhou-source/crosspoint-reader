@@ -29,12 +29,14 @@ time_t epochFromUtc(const Rtc::DateTime& dt) {
 }  // namespace
 
 void HalClock::setTimezone(const char* posixTz) {
+  std::lock_guard<std::mutex> lock(clockMutex);
   setenv("TZ", posixTz && posixTz[0] != '\0' ? posixTz : "UTC0", 1);
   tzset();
   _lastPollMs = 0;  // re-derive local time under the new rule immediately
 }
 
 bool HalClock::localTime(struct tm& out) const {
+  std::lock_guard<std::mutex> lock(clockMutex);
   if (!_available) return false;
 
   const unsigned long now = millis();
@@ -76,8 +78,7 @@ bool HalClock::formatTime(char* buf, size_t bufSize, bool use12Hour) const {
   return true;
 }
 
-bool HalClock::syncFromNTP() {
-  if (!_available) return false;
+bool HalClock::syncFromNTP(bool (*cancelled)(void*), void* context) {
 
   if (WiFi.status() != WL_CONNECTED) {
     LOG_ERR("CLK", "WiFi not connected, cannot sync NTP");
@@ -85,18 +86,23 @@ bool HalClock::syncFromNTP() {
   }
 
   LOG_INF("CLK", "Starting NTP sync...");
-  // configTzTime overwrites the process TZ with UTC0 for the SNTP exchange;
-  // remember the display timezone so it can be restored below.
-  const char* tzBefore = getenv("TZ");
-  char savedTz[64] = {0};
-  if (tzBefore) snprintf(savedTz, sizeof(savedTz), "%s", tzBefore);
-  configTzTime("UTC0", "pool.ntp.org", "time.nist.gov");
+  // SNTP updates UTC system time without changing the reader's display timezone.
+  // The caller owns Wi-Fi exclusively; never hold the RTC mutex while waiting.
+  if (esp_sntp_enabled()) esp_sntp_stop();
+  esp_sntp_setoperatingmode(SNTP_OPMODE_POLL);
+  esp_sntp_setservername(0, const_cast<char*>("pool.ntp.org"));
+  esp_sntp_setservername(1, const_cast<char*>("time.nist.gov"));
+  sntp_set_sync_status(SNTP_SYNC_STATUS_RESET);
+  esp_sntp_init();
 
   // Wait for SNTP sync to complete (up to 5 seconds)
   constexpr int maxAttempts = 50;
   for (int i = 0; i < maxAttempts; i++) {
+    if (cancelled && cancelled(context)) { esp_sntp_stop(); return false; }
     if (sntp_get_sync_status() == SNTP_SYNC_STATUS_COMPLETED) {
       time_t now = time(nullptr);
+      if (now < 1704067200LL || now > 4102444800LL) { esp_sntp_stop(); return false; }
+      if (!_available) { esp_sntp_stop(); return true; }
       struct tm timeinfo;
       gmtime_r(&now, &timeinfo);
 
@@ -108,6 +114,7 @@ bool HalClock::syncFromNTP() {
       dt.minute = static_cast<uint8_t>(timeinfo.tm_min);
       dt.second = static_cast<uint8_t>(timeinfo.tm_sec);
       dt.weekday = static_cast<uint8_t>(timeinfo.tm_wday);
+      std::lock_guard<std::mutex> lock(clockMutex);
       const bool ok = _sdkRtc.set(dt);
       if (ok) {
         _cachedUtc = epochFromUtc(dt);
@@ -116,13 +123,13 @@ bool HalClock::syncFromNTP() {
         LOG_INF("CLK", "RTC set to %04u-%02u-%02u %02u:%02u:%02u UTC", dt.year, dt.month, dt.day, dt.hour, dt.minute,
                 dt.second);
       }
-      setTimezone(savedTz);
+      esp_sntp_stop();
       return ok;
     }
     delay(100);
   }
 
   LOG_ERR("CLK", "NTP sync timed out");
-  setTimezone(savedTz);
+  esp_sntp_stop();
   return false;
 }

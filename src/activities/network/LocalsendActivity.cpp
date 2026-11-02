@@ -5,6 +5,7 @@
 #include <Memory.h>
 #include <WiFi.h>
 
+#include <algorithm>
 #include <cstdio>
 #include <cstring>
 
@@ -55,13 +56,6 @@ void LocalsendActivity::startReceiver() {
     state = State::MemoryError;
     requestUpdate();
     return;
-  }
-  const auto& metrics = UITheme::getInstance().getMetrics();
-  const auto lines = renderer.wrappedText(SMALL_FONT_ID, tr(STR_LOCALSEND_HINT),
-                                          renderer.getScreenWidth() - metrics.contentSidePadding * 2, 2);
-  instructionCount = lines.size();
-  for (size_t i = 0; i < instructionCount; i++) {
-    snprintf(instructions[i], sizeof(instructions[i]), "%s", lines[i].c_str());
   }
   snprintf(connectedSSID, sizeof(connectedSSID), "%s", WiFi.SSID().c_str());
   snprintf(connectedIP, sizeof(connectedIP), "%s:%u", WiFi.localIP().toString().c_str(), LocalsendServer::PORT);
@@ -115,8 +109,6 @@ void LocalsendActivity::loop() {
 void LocalsendActivity::render(RenderLock&&) {
   const auto& metrics = UITheme::getInstance().getMetrics();
   const int width = renderer.getScreenWidth();
-  const int height = renderer.getScreenHeight();
-  const int margin = metrics.contentSidePadding;
   const int lineHeight = renderer.getLineHeight(SMALL_FONT_ID);
   renderer.clearScreen();
   GUI.drawHeader(renderer, Rect{0, metrics.topPadding, width, metrics.headerHeight}, tr(STR_LOCALSEND));
@@ -124,32 +116,42 @@ void LocalsendActivity::render(RenderLock&&) {
   GUI.drawButtonHints(renderer, labels.btn1, labels.btn2, labels.btn3, labels.btn4);
 
   if (state == State::Connecting || state == State::MemoryError) {
-    renderer.drawCenteredText(UI_12_FONT_ID, height / 2,
-                              state == State::Connecting ? tr(STR_CONNECTING) : tr(STR_MEMORY_ERROR));
+    UITheme::drawCenteredWrappedText(renderer, UITheme::getContentBounds(renderer), UI_12_FONT_ID,
+                                     state == State::Connecting ? tr(STR_CONNECTING) : tr(STR_MEMORY_ERROR), 6);
     renderer.displayBuffer();
     return;
   }
   if (state == State::Failed) {
     const char* message = displayStatus.error == LocalsendServer::Error::FileStorage ? tr(STR_LOCALSEND_STORAGE_FAILED)
                                                                                   : tr(STR_CONNECTION_FAILED);
-    renderer.drawCenteredText(UI_12_FONT_ID, height / 2, message);
+    UITheme::drawCenteredWrappedText(renderer, UITheme::getContentBounds(renderer), UI_12_FONT_ID, message, 6);
     renderer.displayBuffer();
     return;
   }
 
   GUI.drawSubHeader(renderer, Rect{0, metrics.topPadding + metrics.headerHeight, width, metrics.tabBarHeight},
                     connectedSSID, connectedIP);
-  int y = metrics.topPadding + metrics.headerHeight + metrics.tabBarHeight + metrics.verticalSpacing * 2;
-  // Instruction wrapping is cached at startup; rendering does not allocate.
-  // Clip filenames to the content bounds in every orientation.
-  const auto previousClip = renderer.getClipRect();
-  renderer.setClipRect(margin, y, width - margin * 2, height - y - metrics.buttonHintsHeight);
-  for (size_t i = 0; i < instructionCount; i++) {
-    renderer.drawText(SMALL_FONT_ID, margin, y, instructions[i]);
-    y += lineHeight + metrics.verticalSpacing;
+  Rect body = UITheme::getContentBounds(renderer);
+  body.y += metrics.tabBarHeight;
+  body.height = std::max(0, body.height - metrics.tabBarHeight);
+  Rect instructions = body;
+  Rect transfer = body;
+  if (body.width > body.height) {
+    instructions.width = (body.width - 24) / 2;
+    transfer.x += instructions.width + 24;
+    transfer.width = instructions.width;
+  } else {
+    instructions.height = (body.height - 24) / 2;
+    transfer.y += instructions.height + 24;
+    transfer.height = instructions.height;
   }
-  renderer.drawText(SMALL_FONT_ID, margin, y, tr(STR_LOCALSEND_DESTINATION));
-  y += lineHeight + metrics.verticalSpacing * 3;
+  const int destinationHeight = lineHeight * 3;
+  UITheme::drawCenteredWrappedText(renderer,
+      Rect{instructions.x, instructions.y, instructions.width, instructions.height - destinationHeight - 16},
+      SMALL_FONT_ID, tr(STR_LOCALSEND_HINT), 8);
+  UITheme::drawCenteredWrappedText(renderer,
+      Rect{instructions.x, instructions.y + instructions.height - destinationHeight, instructions.width, destinationHeight},
+      SMALL_FONT_ID, tr(STR_LOCALSEND_DESTINATION), 3);
 
   const char* message = tr(STR_LOCALSEND_WAITING);
   switch (displayStatus.error) {
@@ -170,18 +172,23 @@ void LocalsendActivity::render(RenderLock&&) {
       message = tr(STR_LOCALSEND_CANCELLED);
       break;
   }
-  renderer.drawText(UI_12_FONT_ID, margin, y, message);
-  y += renderer.getLineHeight(UI_12_FONT_ID) + metrics.verticalSpacing;
-  renderer.drawText(SMALL_FONT_ID, margin, y, displayStatus.fileName);
-  y += lineHeight + metrics.verticalSpacing;
+  const int progressHeight = displayStatus.receiving ? metrics.progressBarHeight + lineHeight + 16 : 0;
+  const int textHeight = std::max(0, transfer.height - progressHeight - 16);
+  UITheme::drawCenteredWrappedText(renderer,
+      Rect{transfer.x, transfer.y, transfer.width, textHeight / 2},
+      UI_12_FONT_ID, message, 4, true, EpdFontFamily::BOLD);
+  UITheme::drawCenteredWrappedText(renderer,
+      Rect{transfer.x, transfer.y + textHeight / 2 + 8, transfer.width, textHeight / 2},
+      SMALL_FONT_ID, displayStatus.fileName, 4);
   if (displayStatus.receiving) {
     // Pass bounded percentage counters to the shared progress-bar renderer.
     const int percent = displayStatus.total
                             ? static_cast<int>(static_cast<double>(displayStatus.received) * 100.0 /
                                                static_cast<double>(displayStatus.total))
                             : 0;
-    GUI.drawProgressBar(renderer, Rect{margin, y, width - margin * 2, metrics.progressBarHeight}, percent, 100);
+    GUI.drawProgressBar(renderer,
+        Rect{transfer.x, transfer.y + transfer.height - progressHeight, transfer.width, metrics.progressBarHeight},
+        percent, 100);
   }
-  renderer.setClipRect(previousClip[0], previousClip[1], previousClip[2], previousClip[3]);
   renderer.displayBuffer();
 }

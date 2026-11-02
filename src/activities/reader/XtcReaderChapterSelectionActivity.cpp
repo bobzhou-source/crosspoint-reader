@@ -105,7 +105,10 @@ void XtcReaderChapterSelectionActivity::buildScreen(UiScreen& screen) {
     return;
   }
   if (rowItems.empty()) {
-    screen.centeredText(tr(STR_NO_CHAPTERS), screen.theme().bodyText);
+    auto style = screen.theme().bodyText;
+    style.align = fui::TextAlign::Center;
+    style.maxLines = 4;
+    screen.target().text(screen.body().inset(fui::Insets{0, 20, 0, 20}), tr(STR_NO_CHAPTERS), style);
     return;
   }
 
@@ -116,6 +119,8 @@ void XtcReaderChapterSelectionActivity::buildScreen(UiScreen& screen) {
   props.count = static_cast<uint16_t>(rowItems.size());
   props.action = ACTION_ROW;
   props.inputMask = fui::InputTouch;  // physical buttons stay in loop()
+  props.labelText = screen.theme().bodyText;
+  props.labelText.maxLines = 2;
   syncListViewport(screen, props);
   screen.list(props);
 }
@@ -124,9 +129,6 @@ void XtcReaderChapterSelectionActivity::drawChrome() {
   const auto& metrics = UITheme::getInstance().getMetrics();
   const Rect safe = UITheme::getInstance().getScreenSafeArea(renderer, true, false);
 
-  // Centered title in the header band the content margin reserves.
-  const int titleWidth = renderer.getTextWidth(UI_12_FONT_ID, tr(STR_SELECT_CHAPTER), EpdFontFamily::BOLD);
-  const int titleX = safe.x + (safe.width - titleWidth) / 2;
-  const int titleY = safe.y + metrics.topPadding + (metrics.headerHeight - renderer.getLineHeight(UI_12_FONT_ID)) / 2;
-  renderer.drawText(UI_12_FONT_ID, titleX, titleY, tr(STR_SELECT_CHAPTER), true, EpdFontFamily::BOLD);
+  GUI.drawHeader(renderer, Rect{safe.x, safe.y + metrics.topPadding, safe.width, metrics.headerHeight},
+                 tr(STR_SELECT_CHAPTER));
 }

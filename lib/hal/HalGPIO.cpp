@@ -141,25 +141,94 @@ void HalGPIO::begin() {
 
 void HalGPIO::update() {
   inputMgr.update();
+  if (injectionGuard &&
+      (inputMgr.wasAnyPressed() || inputMgr.wasAnyReleased() || inputMgr.wasTouchActivity() || inputMgr.isPressed(0) ||
+       inputMgr.isPressed(1) || inputMgr.isPressed(2) || inputMgr.isPressed(3) || inputMgr.isPressed(4) ||
+       inputMgr.isPressed(5))) {
+    realInputDuringInjection = true;
+  }
+  // Edges last exactly one update(), like InputManager's own.
+  injectPressEdge = false;
+  injectReleaseEdge = false;
+  if (injectStage == InjectStage::Queued) {
+    injectStage = InjectStage::Down;
+    injectDownAtMs = millis();
+    injectPressEdge = true;
+  } else if (injectStage == InjectStage::Down && millis() - injectDownAtMs >= injectHoldMs) {
+    injectStage = InjectStage::Idle;
+    injectHeldMs = millis() - injectDownAtMs;
+    injectReleaseEdge = true;
+  }
   const bool connected = isUsbConnected();
   usbStateChanged = (connected != lastUsbConnected);
   lastUsbConnected = connected;
 }
 
+bool HalGPIO::injectPress(const uint8_t buttonIndex, const uint16_t holdMs) {
+  if (buttonIndex > BTN_DOWN || injectStage != InjectStage::Idle || injectReleaseEdge) return false;
+  injectIndex = buttonIndex;
+  injectHoldMs = holdMs;
+  injectStage = InjectStage::Queued;
+  return true;
+}
+
+void HalGPIO::setInjectionGuard(const bool enabled) {
+  injectionGuard = enabled;
+  realInputDuringInjection = false;
+  if (!enabled) {
+    injectStage = InjectStage::Idle;
+    injectPressEdge = false;
+    injectReleaseEdge = false;
+  }
+}
+
 bool HalGPIO::wasUsbStateChanged() const { return usbStateChanged; }
 
-bool HalGPIO::isPressed(uint8_t buttonIndex) const { return inputMgr.isPressed(buttonIndex); }
+void HalGPIO::waitForInput(const unsigned long maxMs) {
+  const SemaphoreHandle_t edge = inputMgr.inputEdgeSignal();
+  if (edge == nullptr) {
+    delay(maxMs);
+    return;
+  }
+  const unsigned long waitMs =
+      inputPollWaitMs(inputMgr.isDebouncePending(), inputMgr.msUntilDebounceSettled(millis()), maxMs);
+  xSemaphoreTake(edge, pdMS_TO_TICKS(waitMs));
+}
 
-bool HalGPIO::wasPressed(uint8_t buttonIndex) const { return inputMgr.wasPressed(buttonIndex); }
+bool HalGPIO::isPressed(uint8_t buttonIndex) const {
+  return inputMgr.isPressed(buttonIndex) || (injectStage == InjectStage::Down && buttonIndex == injectIndex);
+}
 
-bool HalGPIO::wasAnyPressed() const { return inputMgr.wasAnyPressed(); }
+bool HalGPIO::wasPressed(uint8_t buttonIndex) const {
+  return inputMgr.wasPressed(buttonIndex) || (injectPressEdge && buttonIndex == injectIndex);
+}
 
-bool HalGPIO::wasReleased(uint8_t buttonIndex) const { return inputMgr.wasReleased(buttonIndex); }
+bool HalGPIO::wasAnyPressed() const { return inputMgr.wasAnyPressed() || injectPressEdge; }
 
-bool HalGPIO::wasAnyReleased() const { return inputMgr.wasAnyReleased(); }
+bool HalGPIO::wasReleased(uint8_t buttonIndex) const {
+  return inputMgr.wasReleased(buttonIndex) || (injectReleaseEdge && buttonIndex == injectIndex);
+}
+
+bool HalGPIO::wasAnyReleased() const { return inputMgr.wasAnyReleased() || injectReleaseEdge; }
 
 bool HalGPIO::rawInputActive() {
+  const bool capturedButtons = inputMgr.captureDigitalButtons();
+  if (capturedButtons) return true;
   if (inputMgr.isPowerButtonPhysicallyPressed()) return true;
+  // X4 Pro's GT911 holds INT low until its pending frame is consumed by update().
+  // Observe it without reading/clearing the touch frame from the indexing/render task.
+  const auto& touch = BoardConfig::ACTIVE.touch;
+  if (BoardConfig::isX4Pro() && inputMgr.hasTouch() && touch.irq >= 0 && digitalRead(touch.irq) == LOW) {
+    return true;
+  }
+  if (BoardConfig::ACTIVE.inputStyle != BoardConfig::InputStyle::XteinkAdcLadder) {
+    // Direct-GPIO buttons (X4 Pro and other digital boards) are active-low, as in
+    // InputManager::getDigitalState(); the ADC ladder below reports nothing for them.
+    const auto& pins = BoardConfig::ACTIVE.input;
+    for (const int8_t pin : {pins.back, pins.confirm, pins.left, pins.right, pins.up, pins.down}) {
+      if (pin >= 0 && digitalRead(pin) == LOW) return true;
+    }
+  }
   InputManager::ButtonAdcSample g1{}, g2{};
   inputMgr.readButtonAdc(g1, g2);
   // The Xteink ladder idles at the ADC full-scale rail (~4095); every button band sits below 3900.
@@ -167,7 +236,11 @@ bool HalGPIO::rawInputActive() {
   return (g1.raw >= 0 && g1.raw < kIdleRailMin) || (g2.raw >= 0 && g2.raw < kIdleRailMin);
 }
 
-unsigned long HalGPIO::getHeldTime() const { return inputMgr.getHeldTime(); }
+unsigned long HalGPIO::getHeldTime() const {
+  if (injectStage == InjectStage::Down) return millis() - injectDownAtMs;
+  if (injectReleaseEdge) return injectHeldMs;
+  return inputMgr.getHeldTime();
+}
 
 unsigned long HalGPIO::getPowerButtonHeldTime() const { return inputMgr.getPowerButtonHeldTime(); }
 

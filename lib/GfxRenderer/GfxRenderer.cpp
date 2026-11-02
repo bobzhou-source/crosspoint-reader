@@ -124,9 +124,10 @@ void GfxRenderer::ensureSdCardFontReady(int fontId, const char* utf8Text, uint8_
     return;
   }
   // TTF (vector) fonts need nothing here: getGlyph faults glyphs in on demand
-  // (glyphMissHandler), and the page's set is batch-warmed by the render scan's
-  // prewarmCache(). Pre-faulting a whole chapter's text during layout would just
-  // thrash the page-bounded cache, so it is intentionally omitted.
+  // (glyphMissHandler), the render scan's prewarmCache() adds the page's
+  // missing glyphs, and the bounded cache retains them across pages.
+  // Pre-faulting a whole chapter's text during layout would just overrun the
+  // glyph cap and flush that working set, so it is intentionally omitted.
 }
 
 void GfxRenderer::ensureSdCardFontReady(const int fontId, const char* const* segments, const size_t* segmentLens,
@@ -2298,12 +2299,17 @@ size_t GfxRenderer::getBufferSize() const { return frameBufferSize; }
 
 void GfxRenderer::displayGrayscaleBase(HalDisplay::RefreshMode fallback) const {
   absoluteGrayPlanes = false;
-  display.displayGrayscaleBase(fallback, fadingFix);
+  display.displayGrayscaleBase(applyPromotedRefresh(fallback), fadingFix);
 }
 
 bool GfxRenderer::displayGrayscaleBase(HalDisplay::GrayscaleMode mode, HalDisplay::RefreshMode fallback) const {
   absoluteGrayPlanes = false;
-  if (!display.displayGrayscaleBase(mode, fallback, fadingFix)) return false;
+  // A refused base displays nothing, so a queued promotion stays for the
+  // caller's B/W fallback display.
+  if (!display.displayGrayscaleBase(mode, promotedRefreshPending_ ? promotedRefresh_ : fallback, fadingFix)) {
+    return false;
+  }
+  promotedRefreshPending_ = false;
   absoluteGrayPlanes = mode != HalDisplay::GrayscaleMode::Overlay;
   return true;
 }

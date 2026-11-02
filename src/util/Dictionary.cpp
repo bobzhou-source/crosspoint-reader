@@ -686,3 +686,41 @@ bool Dictionary::lookup(const char* word, std::string& definitionOut, std::strin
   }
   return false;
 }
+
+bool Dictionary::lookupCjk(const char* run, std::string& definitionOut, std::string& matchedHeadwordOut,
+                           uint8_t& matchMask, LookupResult* outResult) {
+  matchMask = 0;
+  if (outResult) *outResult = LookupResult::NotFound;
+  uint8_t ends[CjkDictionary::MAX_CHARACTERS];
+  const uint8_t count = CjkDictionary::prefixes(run, ends);
+  if (!count || !isOpen()) return false;
+  char candidate[CjkDictionary::RUN_BYTES];
+  DictLocation longest;
+  uint8_t longestBytes = 0;
+  {
+    LookupSession session;
+    if (!openSession(session)) {
+      if (outResult) *outResult = LookupResult::ReadError;
+      return false;
+    }
+    for (uint8_t i = 0; i < count; ++i) {
+      memcpy(candidate, run, ends[i]);
+      candidate[ends[i]] = '\0';
+      const DictLocation location = locate(session, candidate, nullptr);
+      if (location.readError) {
+        if (outResult) *outResult = LookupResult::ReadError;
+        return false;
+      }
+      if (location.found) {
+        matchMask |= static_cast<uint8_t>(1u << i);
+        longest = location;
+        longestBytes = ends[i];
+      }
+    }
+  }
+  if (!longest.found) return false;
+  if (!readDefinition(longest, definitionOut, outResult)) return false;
+  matchedHeadwordOut.assign(run, longestBytes);
+  if (outResult) *outResult = LookupResult::Found;
+  return true;
+}

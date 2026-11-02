@@ -12,6 +12,7 @@
 
 #include "CrossPointSettings.h"
 #include "DictionaryDefinitionActivity.h"
+#include "ReaderUtils.h"
 #include "components/UITheme.h"
 
 namespace {
@@ -72,6 +73,7 @@ void DictionaryWordSelectActivity::extractWords() {
   std::string pageText;
   pageText.reserve(2048);
   uint8_t styleMask = 0;
+  uint16_t run = 0;
 
   for (const auto& element : page->elements) {
     if (element->getTag() != TAG_PageLine) continue;
@@ -80,21 +82,49 @@ void DictionaryWordSelectActivity::extractWords() {
     if (!block || !block->valid()) continue;
 
     bool rowHasWords = false;
+    ++run;  // A rendered line is a bounded run; never cross paragraph/line gaps.
     const int ascender = renderer.getFontAscenderSize(fontId);
     const int rubyShift = block->getRubyShift(ascender);
     for (uint16_t i = 0; i < block->wordCount(); i++) {
       const char* text = block->wordText(i);
-      if (!isSelectableToken(text)) continue;
-
+      bool hasCjk = false;
+      for (const char* p = text; *p;) {
+        uint32_t cp;
+        const size_t n = CjkDictionary::characterBytes(p, cp);
+        hasCjk = hasCjk || CjkDictionary::isCjk(cp);
+        p += n;
+      }
       WordBox box;
       box.x = static_cast<int16_t>(line->xPos + block->wordXpos(i) + marginLeft);
       box.y = static_cast<int16_t>(line->yPos + marginTop + rubyShift);
       box.style = block->wordStyle(i);
-      box.width = 0;  // measured below, once the advance table is ready
+      box.width = 0;
       box.row = rowCount;
       box.text = text;
-      words.push_back(box);
-      rowHasWords = true;
+      if (hasCjk) {
+        // Punctuation can be glued to the same layout token as a Han character.
+        // Keep it out of the run without changing the displayed text.
+        for (const char* p = text; *p;) {
+          uint32_t cp;
+          const size_t n = CjkDictionary::characterBytes(p, cp);
+          if (CjkDictionary::isCjk(cp)) {
+            box.text = p;
+            box.cjkBytes = static_cast<uint8_t>(n);
+            box.run = run;
+            words.push_back(box);
+            rowHasWords = true;
+          } else {
+            ++run;
+          }
+          p += n;
+        }
+      } else {
+        ++run;
+        if (isSelectableToken(text)) {
+          words.push_back(box);
+          rowHasWords = true;
+        }
+      }
 
       pageText.append(text);
       pageText.push_back(' ');
@@ -105,8 +135,34 @@ void DictionaryWordSelectActivity::extractWords() {
 
   if (styleMask == 0) styleMask = 0x01;  // REGULAR
   renderer.ensureSdCardFontReady(fontId, pageText.c_str(), styleMask);
-  for (auto& word : words) {
-    word.width = static_cast<int16_t>(renderer.getTextAdvanceX(fontId, word.text, word.style));
+  size_t wordIndex = 0;
+  for (const auto& element : page->elements) {
+    if (element->getTag() != TAG_PageLine) continue;
+    const auto* block = static_cast<const PageLine*>(element.get())->getBlock();
+    if (!block || !block->valid()) continue;
+    for (uint16_t i = 0; i < block->wordCount(); ++i) {
+      const char* text = block->wordText(i);
+      if (wordIndex < words.size() && words[wordIndex].text == text && !words[wordIndex].cjkBytes) {
+        auto& word = words[wordIndex++];
+        word.width = static_cast<int16_t>(renderer.getTextAdvanceX(fontId, text, word.style));
+        continue;
+      }
+      int advance = 0;
+      for (const char* p = text; *p;) {
+        uint32_t cp;
+        const size_t n = CjkDictionary::characterBytes(p, cp);
+        char character[5] = {};
+        memcpy(character, p, n);
+        const int width = renderer.getTextAdvanceX(fontId, character, block->wordStyle(i));
+        if (wordIndex < words.size() && words[wordIndex].text == p) {
+          auto& word = words[wordIndex++];
+          word.x += advance;
+          word.width = static_cast<int16_t>(width);
+        }
+        advance += width;
+        p += n;
+      }
+    }
   }
 }
 
@@ -175,14 +231,28 @@ void DictionaryWordSelectActivity::performLookup() {
   std::string definition;
   std::string headword;
   Dictionary::LookupResult result = Dictionary::LookupResult::NotFound;
-  const bool found = ok && dict.lookup(words[selected].text, definition, headword, &result);
+  char run[CjkDictionary::RUN_BYTES] = {};
+  uint8_t matchMask = 0;
+  if (words[selected].cjkBytes) {
+    size_t bytes = 0;
+    size_t characters = 0;
+    for (size_t i = selected; i < words.size() && characters < CjkDictionary::MAX_CHARACTERS; ++i) {
+      const auto& word = words[i];
+      if (!word.cjkBytes || word.run != words[selected].run) break;
+      memcpy(run + bytes, word.text, word.cjkBytes);
+      bytes += word.cjkBytes;
+      ++characters;
+    }
+  }
+  const bool found = ok && (run[0] ? dict.lookupCjk(run, definition, headword, matchMask, &result)
+                                   : dict.lookup(words[selected].text, definition, headword, &result));
 
   if (found) {
     popup = Popup::None;
-    startActivityForResult(
-        std::make_unique<DictionaryDefinitionActivity>(renderer, mappedInput, std::move(headword),
-                                                       std::move(definition), dict.definitionsAreHtml()),
-        [this](const ActivityResult&) { requestUpdate(); });
+    startActivityForResult(std::make_unique<DictionaryDefinitionActivity>(
+                               renderer, mappedInput, std::move(headword), std::move(definition),
+                               dict.definitionsAreHtml(), run[0] ? &dict : nullptr, run, matchMask),
+                           [this](const ActivityResult&) { requestUpdate(); });
     return;
   }
   // Name the failure: a genuine miss is "Not found"; a word that WAS found but
@@ -367,6 +437,11 @@ void DictionaryWordSelectActivity::render(RenderLock&&) {
   }
 
   renderer.clearScreen();
+  if (words.empty()) {
+    ReaderUtils::drawState(renderer, mappedInput, tr(STR_DICTIONARY), tr(STR_DICT_NO_WORDS));
+    renderer.displayBuffer();
+    return;
+  }
 
   // Same prewarm-scan-then-render pass the reader uses, so SD-card fonts hit
   // the in-RAM glyph cache during the real draw.
