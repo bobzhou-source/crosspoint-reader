@@ -27,6 +27,7 @@
 
 #include "CrossPointSettings.h"
 #include "CrossPointState.h"
+#include "RefreshPolicyStore.h"
 #include "KOReaderCredentialStore.h"
 #include "MappedInputManager.h"
 #include "OpdsServerStore.h"
@@ -490,6 +491,7 @@ void setup() {
     SETTINGS.readerMenuStyle = CrossPointSettings::READER_MENU_TOOLBAR;
   }
   SETTINGS.loadFromFile();
+  refresh_policy_store::load();
   benchmark::initialize(static_cast<uint32_t>(wakeupReason));
   if (SETTINGS.benchmarkRecord) benchmark::begin(benchmark::SessionMode::Normal);
   if (benchmark::enabled()) {

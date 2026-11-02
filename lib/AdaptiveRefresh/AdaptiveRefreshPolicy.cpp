@@ -46,11 +46,12 @@ uint32_t AdaptiveRefreshPolicy::chargeFor(const Inputs& in) const {
   const auto& f = in.frame;
   uint64_t changed = f.historyValid ? f.changedPixels : estimateChangedPixels(f);
   if (changed > f.pixelCount) changed = f.pixelCount;
-  uint32_t weight = kWeightUnit;
-  if (in.visibleGrayscale) weight += kWeightGrayscale;
-  if (in.hasImage) weight += kWeightImage;
-  if (in.visibleGrayscale && in.hasImage) weight += kWeightGrayscaleImageExtra;
-  return saturate(changed * weight / kWeightUnit);
+  uint64_t weight = kWeightUnitPermille;
+  if (in.visibleGrayscale) weight += config_.weightGrayscalePermille;
+  if (in.hasImage) weight += config_.weightImagePermille;
+  if (in.visibleGrayscale && in.hasImage) weight += config_.weightGrayscaleImageExtraPermille;
+  const uint64_t flat = static_cast<uint64_t>(f.pixelCount) * config_.frameChargePermille / 1000;
+  return saturate(changed * weight / kWeightUnitPermille + flat);
 }
 
 AdaptiveRefreshPolicy::Decision AdaptiveRefreshPolicy::decide(const Inputs& in) {
@@ -72,9 +73,10 @@ AdaptiveRefreshPolicy::Decision AdaptiveRefreshPolicy::decide(const Inputs& in) 
   } else if (f.polarityChangePending) {
     reason = Reason::PolarityChange;
   } else if (static_cast<uint64_t>(debt_) + pendingCharge_ >=
-             static_cast<uint64_t>(f.pixelCount) * kClearThresholdPermille / 1000) {
+             static_cast<uint64_t>(f.pixelCount) *
+                 (in.invertedOutput ? config_.nightClearThresholdPermille : config_.clearThresholdPermille) / 1000) {
     reason = Reason::Debt;
-  } else if (fastSinceClear_ >= kSafetyCap) {
+  } else if (fastSinceClear_ >= config_.safetyCap) {
     reason = Reason::SafetyCap;
   }
   return {reason == Reason::None ? Refresh::Fast : Refresh::Clear, reason};

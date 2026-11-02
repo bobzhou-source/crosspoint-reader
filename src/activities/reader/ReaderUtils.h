@@ -3,6 +3,7 @@
 #include <AdaptiveRefreshPolicy.h>
 #include <CrossPointSettings.h>
 #include <GfxRenderer.h>
+#include <HalDisplay.h>
 #include <HalGPIO.h>
 #include <HalTiltSensor.h>
 #include <Logging.h>
@@ -218,6 +219,7 @@ inline AdaptiveRefreshPolicy::Refresh decideRefresh(const GfxRenderer& renderer,
   inputs.hasImage = hasImage;
   inputs.visibleGrayscale = visibleGrayscale;
   inputs.externalClearPending = renderer.hasPendingClearingRefresh();
+  inputs.invertedOutput = display.isInverted();
   const auto decision = policy.decide(inputs);
   LOG_DBG("READER", "Refresh %s: reason=%u debt=%lu fast=%u changed=%lu exact=%d",
           decision.refresh == AdaptiveRefreshPolicy::Refresh::Clear ? "clear" : "fast",

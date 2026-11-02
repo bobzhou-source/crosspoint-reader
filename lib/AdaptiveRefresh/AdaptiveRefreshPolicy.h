@@ -11,8 +11,9 @@
 // accumulates as "ghost debt" that only a clearing refresh (HALF/FULL) erases.
 // A page that changes little therefore lets many more fast refreshes through
 // than a dense page or an image, but a conservative safety ceiling bounds the
-// worst case. All constants are engineering estimates, NOT a calibration
-// against physical ghosting, and there is no ghosting sensor behind them.
+// worst case. The compiled constants are engineering estimates, NOT a
+// calibration against physical ghosting; a Config loaded from the SD card
+// (see RefreshPolicyConfig.h) can replace them with calibrated values.
 //
 // Protocol (single owner, one frame at a time, no allocation, no I/O):
 //   1. decide(inputs)   once per frame, before choosing the refresh mode. Pure
@@ -53,6 +54,8 @@ class AdaptiveRefreshPolicy {
     // A clearing refresh is already queued by the renderer (manual refresh,
     // popup close promotion); the frame is going to be a clear regardless.
     bool externalClearPending = false;
+    // The panel output is inverted (night mode): the night threshold applies.
+    bool invertedOutput = false;
   };
 
   struct Decision {
@@ -62,11 +65,11 @@ class AdaptiveRefreshPolicy {
 
   // --- Identity: bump BOTH whenever a threshold, weight or rule below changes, so
   // benchmark/settings metadata can never describe a different policy than the one
-  // that ran.
-  static constexpr uint8_t kVersion = 1;
-  static constexpr char kName[] = "adaptive-content-v1";
+  // that ran. A loaded Config is reported separately (RefreshPolicyConfig).
+  static constexpr uint8_t kVersion = 2;
+  static constexpr char kName[] = "adaptive-content-v2";
 
-  // --- Tunables (public so docs and tests can cite them) -------------------
+  // --- Compiled defaults (public so docs and tests can cite them) ----------
   // Clear when accumulated weighted change reaches this many thousandths of a
   // full screen of changed pixels (1500 = 1.5 screens).
   static constexpr uint32_t kClearThresholdPermille = 1500;
@@ -74,19 +77,42 @@ class AdaptiveRefreshPolicy {
   // reaches (sparse pages need ~tens of turns); it only stops pathological
   // streams of tiny changes from never clearing.
   static constexpr uint16_t kSafetyCap = 60;
-  // Charge multiplier in quarters (4 = 1.0x): a visible grayscale pass adds
-  // 0.25x (AA text alone is not heavy), a page image adds 1.0x, and a grayscale
-  // image adds a further 0.5x on top of both.
-  static constexpr uint32_t kWeightUnit = 4;
-  static constexpr uint32_t kWeightGrayscale = 1;
-  static constexpr uint32_t kWeightImage = 4;
-  static constexpr uint32_t kWeightGrayscaleImageExtra = 2;
+  // Charge multiplier in thousandths (1000 = 1.0x): a visible grayscale pass
+  // adds 0.25x (AA text alone is not heavy), a page image adds 1.0x, and a
+  // grayscale image adds a further 0.5x on top of both.
+  static constexpr uint32_t kWeightUnitPermille = 1000;
+  static constexpr uint32_t kWeightGrayscalePermille = 250;
+  static constexpr uint32_t kWeightImagePermille = 1000;
+  static constexpr uint32_t kWeightGrayscaleImageExtraPermille = 500;
+  // Flat charge per fast frame, in thousandths of a screen, independent of
+  // how much changed. 0: debt follows changed pixels only.
+  static constexpr uint32_t kFrameChargePermille = 0;
+
+  // Every tunable of the rule. The defaults are the compiled constants above;
+  // a policy built with Config{} behaves exactly like the compiled policy.
+  struct Config {
+    uint32_t clearThresholdPermille = kClearThresholdPermille;
+    // Threshold used while invertedOutput is set (night mode).
+    uint32_t nightClearThresholdPermille = kClearThresholdPermille;
+    uint16_t safetyCap = kSafetyCap;
+    uint32_t weightGrayscalePermille = kWeightGrayscalePermille;
+    uint32_t weightImagePermille = kWeightImagePermille;
+    uint32_t weightGrayscaleImageExtraPermille = kWeightGrayscaleImageExtraPermille;
+    uint32_t frameChargePermille = kFrameChargePermille;
+
+    bool operator==(const Config&) const = default;
+  };
 
   // initialClearRequired=false is the quick-resume case where the panel is
   // already known to show the restored page (allowFastInitialRefresh).
-  explicit AdaptiveRefreshPolicy(bool initialClearRequired = true) { reset(initialClearRequired); }
+  explicit AdaptiveRefreshPolicy(bool initialClearRequired = true, const Config& config = Config{})
+      : config_(config) {
+    reset(initialClearRequired);
+  }
 
   void reset(bool initialClearRequired = true);
+
+  const Config& config() const { return config_; }
 
   // Sticky until a Clear is committed. Not charged as debt.
   void requestClear() { clearRequested_ = true; }
@@ -102,6 +128,8 @@ class AdaptiveRefreshPolicy {
   bool clearPending() const { return initialClear_ || clearRequested_; }
   uint32_t debtPixels() const { return debt_; }
   uint16_t fastSinceClear() const { return fastSinceClear_; }
+  // Charge decide() computed for the frame awaiting commit().
+  uint32_t pendingCharge() const { return pendingCharge_; }
 
   // Changed-pixel estimate used when the display has no exact last-displayed
   // baseline (single framebuffer without a valid async shadow, borrowed or
@@ -118,6 +146,7 @@ class AdaptiveRefreshPolicy {
  private:
   uint32_t chargeFor(const Inputs& in) const;
 
+  Config config_;
   uint32_t debt_ = 0;            // weighted changed pixels since the last clear (saturating)
   uint32_t pendingCharge_ = 0;   // this frame's charge, set by decide()
   uint32_t pendingInk_ = 0;      // this frame's logical-ink pixels

@@ -5,6 +5,7 @@
 #include <FsHelpers.h>
 #include <HalStorage.h>
 #include <Memory.h>
+#include <RefreshPolicyConfig.h>
 
 #include <algorithm>
 
@@ -26,7 +27,7 @@ ReaderActivity::ReaderActivity(const char* name, GfxRenderer& renderer, MappedIn
                                std::string bookPath, const bool allowFastInitialRefresh)
     : Activity(name, renderer, mappedInput),
       bookPath(std::move(bookPath)),
-      refreshPolicy(/*initialClearRequired=*/!allowFastInitialRefresh) {}
+      refreshPolicy(/*initialClearRequired=*/!allowFastInitialRefresh, refresh_policy_config::active().config) {}
 
 std::unique_ptr<ReaderActivity> ReaderActivity::create(GfxRenderer& renderer, MappedInputManager& mappedInput,
                                                        std::string path, const bool allowFastInitialRefresh) {

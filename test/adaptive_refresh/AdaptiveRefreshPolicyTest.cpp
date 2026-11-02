@@ -303,3 +303,88 @@ TEST(AdaptiveRefreshPolicy, FastRunCounterSaturatesSoTheSafetyCapCannotReopen) {
   EXPECT_EQ(p.fastSinceClear(), 0xFFFFu);
   EXPECT_EQ(p.decide(exact(0)).reason, Reason::SafetyCap);
 }
+
+TEST(AdaptiveRefreshPolicyConfig, ThresholdFromConfigSetsTheClearCadence) {
+  Policy::Config config;
+  config.clearThresholdPermille = 3000;  // twice the compiled budget
+  Policy relaxed(false, config);
+  EXPECT_EQ(fastFramesBeforeClear(relaxed, exact(200)), 14u);  // 14*200=2800, the 15th reaches 3000
+
+  config.clearThresholdPermille = 400;
+  Policy strict(false, config);
+  EXPECT_EQ(fastFramesBeforeClear(strict, exact(200)), 1u);
+}
+
+TEST(AdaptiveRefreshPolicyConfig, NightThresholdAppliesOnlyToInvertedOutput) {
+  Policy::Config config;
+  config.clearThresholdPermille = 1000;
+  config.nightClearThresholdPermille = 2000;
+  auto night = exact(200);
+  night.invertedOutput = true;
+
+  Policy day(false, config);
+  EXPECT_EQ(fastFramesBeforeClear(day, exact(200)), 4u);
+  Policy dark(false, config);
+  EXPECT_EQ(fastFramesBeforeClear(dark, night), 9u);
+
+  // Compiled defaults: both polarities share one budget.
+  Policy compiledDay(false);
+  Policy compiledNight(false);
+  EXPECT_EQ(fastFramesBeforeClear(compiledDay, exact(200)), fastFramesBeforeClear(compiledNight, night));
+}
+
+TEST(AdaptiveRefreshPolicyConfig, ContentWeightsComeFromConfig) {
+  Policy::Config config;
+  config.weightImagePermille = 2000;  // image = 3.0x
+  config.weightGrayscalePermille = 0;
+  config.weightGrayscaleImageExtraPermille = 0;
+  auto image = exact(100);
+  image.hasImage = true;
+  Policy p(false, config);
+  (void)p.decide(image);
+  EXPECT_EQ(p.pendingCharge(), 300u);
+
+  auto grayText = exact(100);
+  grayText.visibleGrayscale = true;
+  (void)p.decide(grayText);
+  EXPECT_EQ(p.pendingCharge(), 100u);  // grayscale weight 0: AA text costs like BW text
+}
+
+TEST(AdaptiveRefreshPolicyConfig, FrameChargeBillsEveryFastFrameRegardlessOfChange) {
+  Policy::Config config;
+  config.frameChargePermille = 100;  // 0.1 screen per frame
+  Policy p(false, config);
+  EXPECT_EQ(fastFramesBeforeClear(p, exact(0)), 14u);  // 15th frame reaches 1500
+  Policy mixed(false, config);
+  EXPECT_EQ(fastFramesBeforeClear(mixed, exact(200)), 4u);  // 300/frame
+}
+
+TEST(AdaptiveRefreshPolicyConfig, SafetyCapFromConfig) {
+  Policy::Config config;
+  config.safetyCap = 5;
+  Policy p(false, config);
+  for (unsigned i = 0; i < 5; ++i) ASSERT_EQ(step(p, exact(1)).refresh, Refresh::Fast);
+  EXPECT_EQ(p.decide(exact(1)).reason, Reason::SafetyCap);
+}
+
+TEST(AdaptiveRefreshPolicyConfig, DefaultConfigReproducesTheV1RuleExactly) {
+  // v1 charged changed * (4 + gray + 4*image + 2*grayImage) / 4. The permille
+  // weights must floor to the same integer for every content mix and count.
+  for (uint32_t changed = 0; changed <= 4000; changed += 7) {
+    for (int mask = 0; mask < 4; ++mask) {
+      const bool gray = mask & 1;
+      const bool image = mask & 2;
+      Policy::Inputs in;
+      in.frame.pixelCount = 1000000;
+      in.frame.frameValid = true;
+      in.frame.historyValid = true;
+      in.frame.changedPixels = changed;
+      in.visibleGrayscale = gray;
+      in.hasImage = image;
+      const uint64_t quarters = 4 + (gray ? 1 : 0) + (image ? 4 : 0) + (gray && image ? 2 : 0);
+      Policy p(false);
+      (void)p.decide(in);
+      ASSERT_EQ(p.pendingCharge(), changed * quarters / 4) << changed << " mask " << mask;
+    }
+  }
+}

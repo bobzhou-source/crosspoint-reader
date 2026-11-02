@@ -2,6 +2,7 @@
 
 #include <AdaptiveRefreshPolicy.h>
 #include <Arduino.h>
+#include <RefreshPolicyConfig.h>
 #include <BoardConfig.h>
 #include <HalMemory.h>
 #include <HalStorage.h>
@@ -256,18 +257,28 @@ bool begin(SessionMode mode) {
   }
   imageHash[64] = '\0';
   const char* modeName = mode == SessionMode::Automatic ? "automatic" : "normal";
+  const auto& policyState = refresh_policy_config::active();
+  const auto& policy = policyState.config;
   if (!jsonString(escaped, sizeof(escaped), CROSSPOINT_VERSION) ||
       !metadataLocked("{\"event\":\"session\",\"schema\":3,\"mode\":\"%s\",\"version\":%s,\"app_elf_sha256\":\"%s\","
                       "\"build_date\":\"%s\",\"build_time\":\"%s\",\"boot_us\":%llu,\"reset_reason\":%u,"
                       "\"wake_cause\":%u,\"hal_wake_reason\":%u,\"max_bytes\":%u,\"buffer_events\":%u,"
                       "\"phase_resolution_us\":1000,\"clock\":\"esp_timer_since_boot\","
                       "\"memory_unit\":\"bytes\",\"index_phase_clock_unit\":\"ms\",\"id_algorithm\":\"fnv1a32\","
-                      "\"refresh_policy\":\"%s\"}\n",
+                      "\"refresh_policy\":\"%s\",\"refresh_policy_version\":%u,"
+                      "\"refresh_policy_source\":\"%s\",\"refresh_policy_config\":[%lu,%lu,%u,%lu,%lu,%lu,%lu]}\n",
                       modeName, escaped, imageHash, app->date, app->time,
                       static_cast<unsigned long long>(nowUs()), static_cast<unsigned>(esp_reset_reason()),
                       static_cast<unsigned>(esp_sleep_get_wakeup_cause()), static_cast<unsigned>(bootWakeReason),
                       static_cast<unsigned>(Writer::MAX_BYTES), static_cast<unsigned>(Buffer::CAPACITY),
-                      AdaptiveRefreshPolicy::kName)) {
+                      AdaptiveRefreshPolicy::kName, static_cast<unsigned>(AdaptiveRefreshPolicy::kVersion),
+                      refresh_policy_config::sourceName(policyState.source),
+                      static_cast<unsigned long>(policy.clearThresholdPermille),
+                      static_cast<unsigned long>(policy.nightClearThresholdPermille),
+                      static_cast<unsigned>(policy.safetyCap), static_cast<unsigned long>(policy.weightGrayscalePermille),
+                      static_cast<unsigned long>(policy.weightImagePermille),
+                      static_cast<unsigned long>(policy.weightGrayscaleImageExtraPermille),
+                      static_cast<unsigned long>(policy.frameChargePermille))) {
     return false;  // metadataLocked disabled the session.
   }
   if (!file.sync()) {
