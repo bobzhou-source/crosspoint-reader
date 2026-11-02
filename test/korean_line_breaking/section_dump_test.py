@@ -59,14 +59,14 @@ class SectionDumpTest(unittest.TestCase):
         self.assertEqual(page["links"][0]["width"], 24)
 
     def test_supported_partial_and_final_versions(self):
-        for version in range(47, 51):
+        for version in range(47, 53):
             self.assertFalse(decode(section(version))["partial"])
             partial = decode(section(254 - (version - 28)))
             self.assertTrue(partial["partial"])
             self.assertEqual(partial["format_version"], version)
 
     def test_rejects_truncated_and_unknown_records(self):
-        for data in (b"", section()[:-1], section(1)):
+        for data in (b"", section()[:-1], section(1), section(53)):
             with self.assertRaises(ValueError):
                 decode(data)
         raw = bytearray(block())

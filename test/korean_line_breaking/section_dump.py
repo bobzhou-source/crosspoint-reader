@@ -107,7 +107,7 @@ def decode(data):
     reader = Reader(data)
     version = reader.scalar("B")
     format_version = version if version < 128 else 28 + 254 - version
-    if format_version not in (47, 48, 49, 50):
+    if format_version not in (47, 48, 49, 50, 51, 52):
         raise ValueError(f"unsupported section version {version} (format {format_version})")
     font_id, compression, paragraph_spacing, alignment, width, height = reader.unpack("ifBBHH")
     hyphenation, embedded, images, focus, tracking, word_spacing = reader.unpack("BBBBbB")
