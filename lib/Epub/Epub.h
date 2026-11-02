@@ -43,7 +43,7 @@ class Epub {
 
  public:
   explicit Epub(std::string filepath, const std::string& cacheDir, std::string originalSourcePath = {})
-      : filepath(std::move(filepath)), sourcePath(originalSourcePath.empty() ? filepath : std::move(originalSourcePath)) {
+      : filepath(std::move(filepath)), sourcePath(originalSourcePath.empty() ? this->filepath : std::move(originalSourcePath)) {
     // Cache converted and native documents by their stable user-facing identity.
     cachePath = cacheDir + "/epub_" + std::to_string(std::hash<std::string>{}(sourcePath));
   }

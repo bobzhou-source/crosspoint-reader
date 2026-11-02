@@ -4,6 +4,18 @@ These formats describe the SD-card cache files under `/.crosspoint/epub_<hash>/`
 All POD fields are written in the ESP32 little-endian representation used by
 `Serialization.h`; strings are length-prefixed UTF-8.
 
+The EPUB cache key is `std::hash<std::string>` of the original document path.
+Native EPUB callers use that same path whether they supply it explicitly or let
+the constructor default it; converted documents retain their original source
+path rather than the temporary EPUB path. Reader, Home, sleep-cover and per-book
+cache clearing must therefore resolve the same directory.
+
+Per-book clearing removes only the selected book's cache directory. Older
+firmware could incorrectly share the empty-path hash among two-argument EPUB
+callers. That directory is not migrated or deleted by this operation: its
+contents cannot be attributed reliably to a particular book. Any separate
+cleanup must first confirm that no retained cache references still use it.
+
 ## `book.bin`
 
 ### Version 10
