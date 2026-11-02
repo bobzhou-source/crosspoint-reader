@@ -53,9 +53,9 @@ class Cache:
         except (ValueError, OSError, ReaderError) as exc:
             raise ReaderError(f"Corrupt cache entry {article_id}: {exc}; fetch with --refresh or convert again") from exc
 
-    def store(self, article_id: str, article: Article, data: bytes) -> dict:
+    def store(self, article_id: str, article: Article, data: bytes, name: str | None = None) -> dict:
         directory = self.directory(article_id)
-        name = filename(article.title, article_id)
+        name = name or filename(article.title, article_id)
         record = {"id": article_id, **article.metadata(), "filename": name, "size": len(data),
                   "sha256": digest(data), "cached_at": datetime.now(timezone.utc).isoformat()}
         directory.mkdir(parents=True, exist_ok=True, mode=0o700)

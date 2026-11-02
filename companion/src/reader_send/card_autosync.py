@@ -30,7 +30,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Callable
 
-from . import card
+from . import card, inbox_card
 from .cache import Cache
 from .cloud import DEFAULT_ORIGIN, CloudClient
 from .cloud_sync import pull_ready
@@ -252,6 +252,7 @@ def _run(cache, config, volume, client_factory, key_provider, notify, log, batch
     if card_result is not None:
         result["annotations"] = card_result["annotations"]
         result["card"] = card_result["card"]
+    result["cleanup"] = _cleanup(cache, config, volume, log)
     for item in result["unverified"]:
         log(f"not acknowledged (card copy did not verify): {item['id']}")
     for item_id in result["acked"]:
@@ -340,3 +341,24 @@ def _message(result: dict, annotations: int) -> str:
     if result["unverified"]:
         text += f"; {len(result['unverified'])} held back (copy not verified)"
     return text
+
+
+def _cleanup(cache: Cache, config: dict, volume: card.CardVolume, log) -> dict:
+    """Plan the Inbox auto-delete pass every mount; apply it only with ``inbox_cleanup: true`` in card.json."""
+    apply = config.get("inbox_cleanup", False) is True
+    try:
+        ledger = card._load_ledger(cache, volume.volume_uuid)
+        delivered = {f"/{card.BOOK_INBOX.as_posix()}/{entry['filename']}" for entry in ledger.values()}
+        outcome = inbox_card.run_cleanup(volume.root, inbox_card.state_path(cache.root, volume.volume_uuid),
+                                         apply=apply, delivered=delivered)
+    except (ReaderError, OSError) as exc:
+        log(f"inbox cleanup skipped: {exc}")
+        return {"error": str(exc)}
+    counts = outcome["counts"]
+    mode = "applied" if apply else "dry run (set \"inbox_cleanup\": true in card.json to apply)"
+    log(f"inbox cleanup {mode}: {counts['trash']} to trash, {counts['hold']} held for unconfirmed annotations, "
+        f"{counts['purge']} trash entries past {inbox_card.TRASH_DAYS} days")
+    for entry in outcome["files"]:
+        if entry["action"] != "keep":
+            log(f"  {entry['action']}: {entry['file']} ({entry['reason']})")
+    return {"dry_run": outcome["dry_run"], "counts": counts, "applied": outcome["applied"]}

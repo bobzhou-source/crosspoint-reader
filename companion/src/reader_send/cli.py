@@ -10,7 +10,7 @@ from pathlib import Path
 
 from . import __version__
 from .cache import ID_PATTERN, Cache, default_cache
-from .common import ReaderError, atomic_write, bounded_read, filename, http_url
+from .common import ReaderError, atomic_write, bounded_read, digest, filename, http_url
 from .epub import build_epub
 from .extract import extract
 from .localsend import Device, discover, endpoint, send
@@ -19,7 +19,7 @@ from .sources import load_sources
 from . import subscriptions as publications
 from .x_adapter import api_thread, load_export, thread_item
 from .x_browser import DEFAULT_CDP_ENDPOINT, capture_x_url
-from . import assist, card, card_autosync, cloud_cli, novels, x_following, collect
+from . import assist, card, card_autosync, cloud_cli, feed_digest, inbox_card, novels, x_following, collect
 
 
 def seconds(value: str) -> float:
@@ -183,6 +183,20 @@ def parser() -> argparse.ArgumentParser:
     card_autosync_parser.add_argument("--log", type=Path, default=card_autosync.default_log_path(),
                                       help="append a short run log here (default ~/Library/Logs/reader-card-autosync.log)")
     card_autosync_parser.add_argument("--no-notify", action="store_true", help="do not post a macOS notification")
+    for name, description in (
+            ("repack", "Plan daily X digests from the single X-post EPUBs in /books/Inbox; --apply writes them and "
+                       "moves the singles to /books/Inbox/.singles-archive/ (never deletes)"),
+            ("cleanup", "Plan the Inbox auto-delete pass (finished/expired feed items to /books/Inbox/.trash/); "
+                        "--apply performs it")):
+        maintenance = card_actions.add_parser(name, help=description)
+        cache_option(maintenance)
+        config_option(maintenance)
+        maintenance.add_argument("--root", type=Path,
+                                 help="mounted card folder (default: resolve the configured card UUID)")
+        maintenance.add_argument("--apply", action="store_true", help="change the card; the default is a dry run")
+        if name == "repack":
+            maintenance.add_argument("--timezone", default=feed_digest.DEFAULT_TZ,
+                                     help=f"local day for grouping (default {feed_digest.DEFAULT_TZ})")
     card_update = card_actions.add_parser("update", help="Stage one reviewed firmware image on the card; never flashes")
     cache_option(card_update)
     config_option(card_update)
@@ -429,6 +443,27 @@ def subscription_command(args, cache: Cache) -> int:
         time.sleep(args.interval)
 
 
+def inbox_command(args, cache: Cache, config_path) -> int:
+    """card repack / card cleanup: dry runs by default, on --root or the configured card."""
+    if args.root is not None:
+        root = args.root.expanduser().resolve()
+        if not (root / inbox_card.INBOX).is_dir():
+            raise ReaderError(f"{root} has no books/Inbox folder")
+        state_key = "root-" + digest(str(root))[:16]
+    else:
+        volume = card.resolve_card(card.load_config(config_path)["volume_uuid"])
+        root, state_key = volume.root, volume.volume_uuid
+    if args.card_operation == "repack":
+        plan = inbox_card.plan_repack(root, args.timezone)
+        result = {"dry_run": not args.apply, **inbox_card.describe_repack(plan)}
+        if args.apply:
+            result["applied"] = inbox_card.apply_repack(root, plan)
+        emit(result)
+        return 0
+    emit(inbox_card.run_cleanup(root, inbox_card.state_path(cache.root, state_key), apply=args.apply))
+    return 0
+
+
 def card_command(args, cache: Cache) -> int:
     config_path = args.config or card.default_config_path()
     if args.card_operation == "setup":
@@ -436,6 +471,8 @@ def card_command(args, cache: Cache) -> int:
                         annotations_dir=args.annotations_dir, firmware_path=args.firmware,
                         firmware_sha256=args.sha256, launchers_dir=args.launchers_dir))
         return 0
+    if args.card_operation in ("repack", "cleanup"):
+        return inbox_command(args, cache, config_path)
     config = card.load_config(config_path)
     if args.card_operation == "status":
         result, mounted = card.card_status(config)

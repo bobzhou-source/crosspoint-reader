@@ -28,6 +28,7 @@ CONFIG_KEYS = {
     "firmware_sha256",
     "launchers_dir",
 }
+OPTIONAL_CONFIG_KEYS = {"inbox_cleanup"}
 FIRMWARE_NAME = "reader-workbench-rollback-reviewed.bin"
 FIRMWARE_CONFIG = Path(".crosspoint/reader-sync.json")
 FIRMWARE_CONFIG_VERSION = 1
@@ -170,8 +171,11 @@ def load_config(path: Path | None = None) -> dict:
         value = json.loads(bounded_read(path, 64 * 1024))
     except (OSError, ValueError, TypeError, UnicodeError) as exc:
         raise ReaderError(f"Card configuration is invalid: {path}: {exc}") from None
-    if not isinstance(value, dict) or set(value) != CONFIG_KEYS or value.get("version") != CONFIG_VERSION:
+    if (not isinstance(value, dict) or set(value) - OPTIONAL_CONFIG_KEYS != CONFIG_KEYS
+            or value.get("version") != CONFIG_VERSION):
         raise ReaderError(f"Card configuration has an unsupported schema: {path}")
+    if type(value.get("inbox_cleanup", False)) is not bool:
+        raise ReaderError(f"Card configuration inbox_cleanup must be true or false: {path}")
     return {
         "version": CONFIG_VERSION,
         "volume_uuid": _canonical_uuid(value["volume_uuid"]),
@@ -179,6 +183,8 @@ def load_config(path: Path | None = None) -> dict:
         "firmware_path": str(value["firmware_path"]),
         "firmware_sha256": _expected_sha(value["firmware_sha256"]),
         "launchers_dir": str(value["launchers_dir"]),
+        # Optional opt-in: card autosync applies the Inbox auto-delete plan only when true.
+        **({"inbox_cleanup": value["inbox_cleanup"]} if "inbox_cleanup" in value else {}),
     }
 
 
