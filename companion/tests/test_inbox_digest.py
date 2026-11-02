@@ -1,6 +1,7 @@
 import io
 import json
 import os
+import re
 import tempfile
 import unittest
 import zipfile
@@ -117,6 +118,9 @@ class DigestTests(unittest.TestCase):
                                                  "href", "title"})
         self.assertEqual(feed["items"][0]["id"], "00000000-0000-5000-8000-000000000002")
         self.assertEqual(feed["items"][0]["published"], "2026-11-02T13:00:00Z")
+        # All three posts share one posts file; each href points at the post's own anchor.
+        self.assertEqual([i["href"] for i in feed["items"]],
+                         ["posts/0001.xhtml#p-x:2", "posts/0001.xhtml#p-x:1", "posts/0001.xhtml#p-x:3"])
         with zipfile.ZipFile(io.BytesIO(data)) as archive:
             self.assertEqual(archive.namelist()[0], "mimetype")
             self.assertEqual(archive.getinfo("mimetype").compress_type, zipfile.ZIP_STORED)
@@ -124,20 +128,46 @@ class DigestTests(unittest.TestCase):
             ns = {"opf": "http://www.idpf.org/2007/opf"}
             hrefs = {i.get("id"): i.get("href") for i in opf.findall(".//opf:item", ns)}
             spine = [hrefs[r.get("idref")] for r in opf.findall(".//opf:itemref", ns)]
-            self.assertEqual(spine, ["contents.xhtml"] + [i["href"] for i in feed["items"]])
-            for item in feed["items"]:
-                document = archive.read("OEBPS/" + item["href"]).decode()
-                ElementTree.fromstring(document.encode())
-                self.assertIn(f"@{item['handle']}", document)
-                self.assertNotIn("t.co", document)
-            thread = archive.read("OEBPS/posts/0002.xhtml").decode()
-            self.assertIn('<p class="n">3/3</p>', thread)
-            zed = archive.read("OEBPS/posts/0003.xhtml").decode()
-            self.assertIn('src="../images/0003-0.jpg"', zed)
+            self.assertEqual(spine, ["contents.xhtml", "posts/0001.xhtml"])
+            document = archive.read("OEBPS/posts/0001.xhtml").decode()
+            body = ElementTree.fromstring(document.encode()).find("{http://www.w3.org/1999/xhtml}body")
+            # One block per post in manifest order with thin rules between: body/div[i] is the i-th post.
+            self.assertEqual([(child.tag.split("}")[1], child.get("id")) for child in body],
+                             [("div", "p-x:2"), ("hr", None), ("div", "p-x:1"), ("hr", None), ("div", "p-x:3")])
+            self.assertIn('<p class="meta"><b>@amy · <a href="https://x.com/amy/status/2">08:00</a></b></p>', document)
+            self.assertIn("<b>Zed @zed · ", document)
+            self.assertNotIn("t.co", document)
+            self.assertIn('<p class="n">3/3</p>', document)
+            self.assertIn('src="../images/0003-0.jpg"', document)
             self.assertEqual(archive.read("OEBPS/images/0003-0.jpg"), PNG)
+            self.assertNotIn("page-break", archive.read("OEBPS/style.css").decode())
             contents = archive.read("OEBPS/contents.xhtml").decode()
             self.assertLess(contents.index("amy"), contents.index("Zed"))
             self.assertIn("3 posts from 2 accounts", contents)
+            self.assertIn('<a href="posts/0001.xhtml#p-x:3">10:00 — hello</a>', contents)
+            # Navigation targets whole posts files: a TOC anchor would start a new page per post.
+            ncx = archive.read("OEBPS/toc.ncx").decode()
+            self.assertEqual(re.findall(r'<content src="([^"]+)"/>', ncx), ["contents.xhtml", "posts/0001.xhtml"])
+
+    def test_posts_files_pack_whole_author_groups(self):
+        many = [post("bob", str(100 + n), f"2026-11-02T14:{n:02d}:00Z", name="Bob") for n in range(30)]
+        posts = [post("amy", "1", "2026-11-02T13:00:00Z", name="Amy"), *many,
+                 post("cat", "2", "2026-11-02T15:00:00Z", name="Cat")]
+        feed = fd.read_manifest(fd.build_digest(fd.plan_volumes(posts)[0]))
+        files = [item["href"].split("#")[0] for item in feed["items"]]
+        # Amy fits alone; Bob's 30 posts do not fit beside her and split at 25; Cat joins Bob's remainder.
+        self.assertEqual([files.count(f"posts/{n:04d}.xhtml") for n in (1, 2, 3)], [1, 25, 6])
+        self.assertEqual(files[0], "posts/0001.xhtml")
+        self.assertEqual(feed["items"][-1]["handle"], "cat")
+        self.assertEqual(files[-1], "posts/0003.xhtml")
+
+    def test_handle_only_names_and_x_entities(self):
+        value = post("zed", "9", "2026-11-02T14:00:00Z", text="&amp;gt;quoted &amp;amp; more", name="@zed")
+        self.assertEqual((value.author, value.title), ("zed", ">quoted & more"))
+        with zipfile.ZipFile(io.BytesIO(fd.build_digest(fd.plan_volumes([value])[0]))) as archive:
+            document = archive.read("OEBPS/posts/0001.xhtml").decode()
+        self.assertIn("<b>@zed · ", document)
+        self.assertIn("<p>&gt;quoted &amp; more part 1</p>", document)
 
     def test_ordinary_book_has_no_manifest(self):
         self.assertIsNone(fd.read_manifest(article()))
