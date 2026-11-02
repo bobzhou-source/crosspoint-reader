@@ -75,6 +75,9 @@ enum class CssVerticalAlign : uint8_t { Baseline = 0, Super = 1, Sub = 2 };
 // list-style-type — only None and Disc (bullet) are relevant for rendering
 enum class CssListStyleType : uint8_t { Disc = 0, None = 1 };
 
+// float — only used to recognise out-of-flow inline content such as drop caps
+enum class CssFloat : uint8_t { None = 0, Left = 1, Right = 2 };
+
 // Bitmask for tracking which properties have been explicitly set
 struct CssPropertyFlags {
   uint16_t textAlign : 1;
@@ -96,6 +99,7 @@ struct CssPropertyFlags {
   uint16_t direction : 1;
   uint16_t verticalAlign : 1;
   uint16_t listStyleType : 1;
+  uint16_t cssFloat : 1;
 
   CssPropertyFlags()
       : textAlign(0),
@@ -116,26 +120,27 @@ struct CssPropertyFlags {
         display(0),
         direction(0),
         verticalAlign(0),
-        listStyleType(0) {}
+        listStyleType(0),
+        cssFloat(0) {}
 
   [[nodiscard]] bool anySet() const {
     return textAlign || fontStyle || fontWeight || textDecoration || textIndent || marginTop || marginBottom ||
            marginLeft || marginRight || paddingTop || paddingBottom || paddingLeft || paddingRight || imageHeight ||
-           imageWidth || display || direction || verticalAlign || listStyleType;
+           imageWidth || display || direction || verticalAlign || listStyleType || cssFloat;
   }
 
   void clearAll() {
     textAlign = fontStyle = fontWeight = textDecoration = textIndent = 0;
     marginTop = marginBottom = marginLeft = marginRight = 0;
     paddingTop = paddingBottom = paddingLeft = paddingRight = 0;
-    imageHeight = imageWidth = display = direction = verticalAlign = listStyleType = 0;
+    imageHeight = imageWidth = display = direction = verticalAlign = listStyleType = cssFloat = 0;
   }
 };
 
-// Cache serializes defined flags as uint32_t with bit indices 0..18.
+// Cache serializes defined flags as uint32_t with bit indices 0..19.
 static_assert(sizeof(CssPropertyFlags) <= sizeof(uint32_t),
               "CssPropertyFlags exceeds 32 bits; update cache read/write in CssParser.cpp");
-static_assert(sizeof(CssPropertyFlags) * 8 >= 19,
+static_assert(sizeof(CssPropertyFlags) * 8 >= 20,
               "CssPropertyFlags has fewer bits than properties; update bitfield widths");
 
 // Represents a collection of CSS style properties
@@ -162,6 +167,7 @@ struct CssStyle {
   CssDisplay display = CssDisplay::Block;                       // display property (Block or None)
   CssVerticalAlign verticalAlign = CssVerticalAlign::Baseline;  // vertical-align (super/sub positioning)
   CssListStyleType listStyleType = CssListStyleType::Disc;      // list-style-type (Disc or None)
+  CssFloat cssFloat = CssFloat::None;                           // float (drop-cap detection)
 
   CssPropertyFlags defined;  // Tracks which properties were explicitly set
 
@@ -244,6 +250,10 @@ struct CssStyle {
       listStyleType = base.listStyleType;
       defined.listStyleType = 1;
     }
+    if (base.hasFloat()) {
+      cssFloat = base.cssFloat;
+      defined.cssFloat = 1;
+    }
   }
 
   [[nodiscard]] bool hasTextAlign() const { return defined.textAlign; }
@@ -265,6 +275,8 @@ struct CssStyle {
   [[nodiscard]] bool hasDirection() const { return defined.direction; }
   [[nodiscard]] bool hasVerticalAlign() const { return defined.verticalAlign; }
   [[nodiscard]] bool hasListStyleType() const { return defined.listStyleType; }
+  [[nodiscard]] bool hasFloat() const { return defined.cssFloat; }
+  [[nodiscard]] bool isFloated() const { return defined.cssFloat && cssFloat != CssFloat::None; }
 
   void reset() {
     textAlign = CssTextAlign::Left;
@@ -279,6 +291,7 @@ struct CssStyle {
     display = CssDisplay::Block;
     verticalAlign = CssVerticalAlign::Baseline;
     listStyleType = CssListStyleType::Disc;
+    cssFloat = CssFloat::None;
     defined.clearAll();
   }
 };

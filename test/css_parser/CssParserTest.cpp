@@ -171,7 +171,10 @@ TEST_F(CssParserTest, CanonicalCacheRoundTripPreservesStyles) {
   ASSERT_EQ(loadCss(writer,
                     "p { text-align: justify; margin-top: 2em; }\n"
                     ".bold { font-weight: bolder; }\n"
-                    ".hidden { display: none; }\n"),
+                    ".hidden { display: none; }\n"
+                    ".dropcap { float: left; font-size: 3em; }\n"
+                    ".side { float: RIGHT !important; }\n"
+                    ".inflow { float: none; }\n"),
             CssParser::ParseResult::Complete);
   ASSERT_TRUE(writer.saveToCache(true));
   EXPECT_EQ(writer.inspectCache(), CssParser::CacheStatus::Complete);
@@ -181,6 +184,14 @@ TEST_F(CssParserTest, CanonicalCacheRoundTripPreservesStyles) {
   EXPECT_EQ(reader.ruleCount(), writer.ruleCount());
   EXPECT_EQ(reader.resolveStyle("span", "bold").fontWeight, CssFontWeight::Bold);
   EXPECT_EQ(reader.resolveStyle("div", "hidden").display, CssDisplay::None);
+  const CssStyle dropcap = reader.resolveStyle("span", "dropcap");
+  EXPECT_TRUE(dropcap.isFloated());
+  EXPECT_EQ(dropcap.cssFloat, CssFloat::Left);
+  EXPECT_EQ(reader.resolveStyle("span", "side").cssFloat, CssFloat::Right);
+  const CssStyle inflow = reader.resolveStyle("span", "inflow");
+  EXPECT_TRUE(inflow.hasFloat());
+  EXPECT_FALSE(inflow.isFloated());
+  EXPECT_FALSE(reader.resolveStyle("span", "bold").hasFloat());
   const CssStyle paragraph = reader.resolveStyle("p", "");
   EXPECT_EQ(paragraph.textAlign, CssTextAlign::Justify);
   EXPECT_FLOAT_EQ(paragraph.marginTop.value, 2.0f);
@@ -249,6 +260,8 @@ TEST_F(CssParserTest, CacheHydrationRejectsInvalidStyleEnumBytes) {
   }
   enumOffsets.push_back(kStyleEnumPrefixBytes + kStyleLengthFieldCount * kStyleLengthBytes);
   enumOffsets.push_back(kStyleEnumPrefixBytes + kStyleLengthFieldCount * kStyleLengthBytes + 1);
+  enumOffsets.push_back(kStyleEnumPrefixBytes + kStyleLengthFieldCount * kStyleLengthBytes + 2);
+  enumOffsets.push_back(kStyleEnumPrefixBytes + kStyleLengthFieldCount * kStyleLengthBytes + 3);
 
   for (const size_t enumOffset : enumOffsets) {
     SCOPED_TRACE(enumOffset);

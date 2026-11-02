@@ -459,3 +459,157 @@ TEST(KoreanLayout, HangulGluedAcrossInlineStyleIsUnbreakable) {
   const std::vector<std::vector<std::string>> expected{{"가나"}, {"한국", "어"}};
   EXPECT_EQ(lines, expected);
 }
+
+namespace {
+
+// One 4-character word per line: the stub font is 8 px per glyph, so "a000 a001" (68 px) never fits in 40 px.
+std::string paragraph(char prefix, int lineCount, const char* attributes = "") {
+  std::string markup = std::string("<p style=\"text-indent:0;margin:0\"") + attributes + ">";
+  for (int i = 0; i < lineCount; ++i) {
+    char word[8];
+    snprintf(word, sizeof(word), "%c%03d", prefix, i);
+    if (i > 0) markup += ' ';
+    markup += word;
+  }
+  return markup + "</p>";
+}
+
+// Each page as the first letter of every line, e.g. {"aaaa", "bbb"}.
+std::vector<std::string> pageSignatures(const std::vector<std::unique_ptr<Page>>& pages) {
+  std::vector<std::string> signatures;
+  for (const auto& page : pages) {
+    std::string signature;
+    for (const auto& element : page->elements) {
+      if (element->getTag() != TAG_PageLine) continue;
+      signature += static_cast<const PageLine*>(element.get())->getBlock()->wordText(0)[0];
+    }
+    signatures.push_back(signature);
+  }
+  return signatures;
+}
+
+}  // namespace
+
+TEST_F(ChapterHtmlSlimParserTest, OrphanFirstLineMovesWholeShortParagraphToNextPage) {
+  parser.viewportWidth = 40;
+  parser.viewportHeight = 80;  // five 16 px lines
+  const auto pages = parseMarkup(paragraph('a', 4) + paragraph('b', 3, " id=\"next\""));
+  const std::vector<std::string> expected{"aaaa", "bbb"};
+  EXPECT_EQ(pageSignatures(pages), expected);
+  ASSERT_EQ(parser.anchorData.size(), 1u);
+  EXPECT_EQ(parser.anchorData[0].first, "next");
+  EXPECT_EQ(parser.anchorData[0].second, 1u);
+}
+
+TEST_F(ChapterHtmlSlimParserTest, ShortParagraphIsNeverSplitIntoOrphanAndWidow) {
+  parser.viewportWidth = 40;
+  parser.viewportHeight = 80;
+  const auto pages = parseMarkup(paragraph('a', 3) + paragraph('b', 3));
+  const std::vector<std::string> expected{"aaa", "bbb"};
+  EXPECT_EQ(pageSignatures(pages), expected);
+}
+
+TEST_F(ChapterHtmlSlimParserTest, WidowLinePullsAnotherLineToNextPage) {
+  parser.viewportWidth = 40;
+  parser.viewportHeight = 80;
+  const auto pages = parseMarkup(paragraph('a', 2) + paragraph('b', 4));
+  const std::vector<std::string> expected{"aabb", "bb"};
+  EXPECT_EQ(pageSignatures(pages), expected);
+  const auto rendered = lines(pages);
+  ASSERT_EQ(rendered.size(), 6u);
+  EXPECT_STREQ(rendered[3]->getBlock()->wordText(0), "b001");
+  EXPECT_STREQ(rendered[4]->getBlock()->wordText(0), "b002");
+  EXPECT_EQ(rendered[4]->yPos, 0);
+}
+
+TEST_F(ChapterHtmlSlimParserTest, ParagraphThatFillsThePageExactlyIsUnchanged) {
+  parser.viewportWidth = 40;
+  parser.viewportHeight = 80;
+  const auto pages = parseMarkup(paragraph('a', 1) + paragraph('b', 4) + paragraph('c', 2));
+  const std::vector<std::string> expected{"abbbb", "cc"};
+  EXPECT_EQ(pageSignatures(pages), expected);
+}
+
+TEST_F(ChapterHtmlSlimParserTest, OrphanAndWidowControlHoldAcrossSoftFlushedParagraph) {
+  parser.viewportWidth = 40;
+  parser.viewportHeight = 80;
+  // 801 words exceeds the soft-flush threshold, so the paragraph is laid out in several batches.
+  const auto pages = parseMarkup(paragraph('a', 4) + paragraph('b', 801));
+  const auto signatures = pageSignatures(pages);
+  ASSERT_GE(signatures.size(), 3u);
+  EXPECT_EQ(signatures.front(), "aaaa");
+  EXPECT_EQ(signatures[signatures.size() - 2], "bbbb");
+  EXPECT_EQ(signatures.back(), "bb");
+  const auto rendered = lines(pages);
+  ASSERT_EQ(rendered.size(), 805u);
+  for (int i = 0; i < 801; ++i) {
+    char word[8];
+    snprintf(word, sizeof(word), "b%03d", i);
+    ASSERT_STREQ(rendered[4 + i]->getBlock()->wordText(0), word);
+  }
+}
+
+TEST_F(ChapterHtmlSlimParserTest, HeadingMovesToNextPageWithItsParagraph) {
+  parser.viewportWidth = 40;
+  parser.viewportHeight = 80;
+  const auto pages = parseMarkup(paragraph('a', 3) + "<h2 id=\"h\" style=\"text-indent:0;margin:0\">Head</h2>" +
+                                 paragraph('b', 3));
+  const std::vector<std::string> expected{"aaa", "Hbbb"};
+  EXPECT_EQ(pageSignatures(pages), expected);
+  ASSERT_EQ(pages.size(), 2u);
+  const auto rendered = lines(pages);
+  ASSERT_EQ(rendered.size(), 7u);
+  EXPECT_EQ(rendered[3]->yPos, 0);
+  EXPECT_EQ(rendered[4]->yPos, 16);
+  ASSERT_EQ(parser.anchorData.size(), 1u);
+  EXPECT_EQ(parser.anchorData[0].second, 1u);
+}
+
+TEST_F(ChapterHtmlSlimParserTest, OversizedParagraphStillMakesProgressOnEmptyPages) {
+  parser.viewportWidth = 40;
+  parser.viewportHeight = 16;  // one line per page: orphan/widow control cannot be satisfied
+  const auto pages = parseMarkup(paragraph('a', 3) + paragraph('b', 1));
+  const std::vector<std::string> expected{"a", "a", "a", "b"};
+  EXPECT_EQ(pageSignatures(pages), expected);
+}
+
+TEST_F(ChapterHtmlSlimParserTest, FloatedDropCapJoinsTheRestOfItsWord) {
+  const auto pages = parseMarkup("<div style=\"text-indent:0\"><span style=\"float:left;font-size:3em\">M</span>\n"
+                                 "ost people</div>");
+  const auto rendered = lines(pages);
+  ASSERT_EQ(rendered.size(), 1u);
+  const auto* block = rendered[0]->getBlock();
+  ASSERT_EQ(block->wordCount(), 2u);
+  EXPECT_STREQ(block->wordText(0), "Most");
+  EXPECT_STREQ(block->wordText(1), "people");
+}
+
+TEST_F(ChapterHtmlSlimParserTest, StyledFloatedDropCapStaysAttachedWithoutASpace) {
+  const auto pages = parseMarkup("<div style=\"text-indent:0\"><span style=\"float:left;font-weight:bold\">M</span>"
+                                 "\n  ost people</div>");
+  const auto rendered = lines(pages);
+  ASSERT_EQ(rendered.size(), 1u);
+  const auto* block = rendered[0]->getBlock();
+  ASSERT_EQ(block->wordCount(), 3u);
+  EXPECT_STREQ(block->wordText(0), "M");
+  EXPECT_STREQ(block->wordText(1), "ost");
+  EXPECT_EQ(block->wordStyle(0) & EpdFontFamily::BOLD, EpdFontFamily::BOLD);
+  EXPECT_EQ(block->wordXpos(1) - block->wordXpos(0), 8);
+  EXPECT_EQ(block->wordXpos(2) - block->wordXpos(1), 28);
+}
+
+TEST_F(ChapterHtmlSlimParserTest, InFlowInlineElementsKeepTheirSourceSpace) {
+  const auto pages = parseMarkup("<div style=\"text-indent:0\"><span>M</span>\nost</div>"
+                                 "<div style=\"text-indent:0\">A <span style=\"float:left\">x</span>\n y</div>");
+  const auto rendered = lines(pages);
+  ASSERT_EQ(rendered.size(), 2u);
+  const auto* first = rendered[0]->getBlock();
+  ASSERT_EQ(first->wordCount(), 2u);
+  EXPECT_STREQ(first->wordText(0), "M");
+  EXPECT_STREQ(first->wordText(1), "ost");
+  EXPECT_EQ(first->wordXpos(1) - first->wordXpos(0), 12);
+  const auto* second = rendered[1]->getBlock();
+  ASSERT_EQ(second->wordCount(), 3u);
+  EXPECT_STREQ(second->wordText(1), "x");
+  EXPECT_STREQ(second->wordText(2), "y");
+}
