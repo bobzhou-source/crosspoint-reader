@@ -3,7 +3,8 @@
 #include <AdaptiveRefreshPolicy.h>
 #include <RefreshCalibrationLadder.h>
 
-#include <atomic>
+#include <I18n.h>
+
 
 #include "activities/Activity.h"
 
@@ -42,10 +43,15 @@ class RefreshCalibrationActivity final : public Activity {
   void drawTextPage(TextKind kind, uint32_t offset, int top, int bottom, int maxWidth, int maxLines, bool record);
   void drawImage(int top, int bottom, uint8_t pass);
   void drawMenuPage(uint16_t selection);
+  // 0/1/2 from a side key, a front button, or a tap on the bottom labels.
+  // A tap above that band is a body tap (starts the run). -1 if nothing arrived.
+  int readRating() const;
   void displayContentFrame(bool clear);
   void account(const AdaptiveRefreshPolicy::Inputs& inputs, bool clear);
   void commitPageAdvance();
-  refresh_calibration::RungMeasurement measurement;
+  refresh_calibration::Ladder ladder;
+  refresh_calibration::Rung rung;
+  unsigned long rungStartedMs = 0;
   AdaptiveRefreshPolicy driver;    // runs the hardware: fast unless a clear is requested
   AdaptiveRefreshPolicy observer;  // the active config, only watched
   AdaptiveRefreshPolicy meter;     // zero weights: unweighted change sum

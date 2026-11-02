@@ -137,7 +137,8 @@ void RefreshCalibrationActivity::inspectSession() {
   damagedLog = false;
   char id[sizeof(sessionId)]{};
   const size_t n = Storage.readFileToBuffer(kCurrent, id, sizeof(id));
-  if (n == 0) return;
+  if (n == 0 || n >= sizeof(id)) return;
+  id[n] = '\0';
   snprintf(logPath, sizeof(logPath), "%s/%s.jsonl", kDir, id);
   HalFile file;
   if (!Storage.openFileForRead("RCAL", logPath, file)) return;
@@ -227,33 +228,56 @@ void RefreshCalibrationActivity::rate(const uint8_t rating) {
     if (done) appendRow(row, done);
     Storage.remove(kCurrent);
     stage = Stage::Done;
+    message = StrId::STR_REFRESH_DONE;
   } else {
     startRung();
   }
   requestUpdate();
 }
 
+int RefreshCalibrationActivity::readRating() const {
+  using Button = MappedInputManager::Button;
+  if (mappedInput.wasReleased(Button::Left) || mappedInput.wasReleased(Button::Up)) return 0;
+  if (mappedInput.wasReleased(Button::Confirm)) return 1;
+  if (mappedInput.wasReleased(Button::Right) || mappedInput.wasReleased(Button::Down)) return 2;
+  int x = 0;
+  int y = 0;
+  if (!mappedInput.wasScreenTapped(x, y)) return -1;
+  if (y < kBodyBottom) return 3;
+  const int third = std::max(1, renderer.getScreenWidth() / 3);
+  if (x < third) return 0;
+  if (x < 2 * third) return 1;
+  return 2;
+}
+
 void RefreshCalibrationActivity::loop() {
+  using Button = MappedInputManager::Button;
   if (stage == Stage::Intro || stage == Stage::Done || stage == Stage::Error) {
-    if (mappedInput.wasReleased(MappedInputManager::Button::Back)) {
+    if (mappedInput.wasReleased(Button::Back)) {
       Activity::finish();
       return;
     }
-    if (stage == Stage::Intro && mappedInput.wasReleased(MappedInputManager::Button::Confirm)) {
+    if (stage == Stage::Intro && resumable &&
+        (mappedInput.wasReleased(Button::Left) || mappedInput.wasReleased(Button::Up))) {
+      resumable = false;
+      ladder = rc::Ladder(skipMask);
+      requestUpdate();
+      return;
+    }
+    int tapX = 0;
+    int tapY = 0;
+    const bool bodyTap = mappedInput.wasScreenTapped(tapX, tapY);
+    if (stage == Stage::Intro && (mappedInput.wasReleased(Button::Confirm) || bodyTap)) {
       if (!resumable && !startSession()) {
         fail(StrId::STR_REFRESH_LOG_FAILED);
         return;
       }
       startRung();
-    } else if (stage == Stage::Intro && resumable && mappedInput.wasReleased(MappedInputManager::Button::Left)) {
-      resumable = false;
-      ladder = rc::Ladder(skipMask);
-      requestUpdate();
     }
     return;
   }
   if (stage == Stage::Running && frameDone.exchange(false)) {
-    if (mappedInput.wasReleased(MappedInputManager::Button::Back)) {
+    if (mappedInput.wasReleased(Button::Back)) {
       stage = Stage::Intro;
       resumable = ladder.rated() > 0;
       resumeRated = ladder.rated();
@@ -266,12 +290,10 @@ void RefreshCalibrationActivity::loop() {
     return;
   }
   if (stage == Stage::Rating) {
-    uint8_t rating = 3;
-    if (mappedInput.wasReleased(MappedInputManager::Button::Left)) rating = 0;
-    else if (mappedInput.wasReleased(MappedInputManager::Button::Confirm)) rating = 1;
-    else if (mappedInput.wasReleased(MappedInputManager::Button::Right)) rating = 2;
-    if (rating <= 2) rate(rating);
-    else if (mappedInput.wasReleased(MappedInputManager::Button::Back)) {
+    const int rating = readRating();
+    if (rating >= 0 && rating <= 2) {
+      rate(static_cast<uint8_t>(rating));
+    } else if (rating == 3 || mappedInput.wasReleased(Button::Back)) {
       stage = Stage::Intro;
       resumable = true;
       resumeRated = ladder.rated();
@@ -294,14 +316,14 @@ void RefreshCalibrationActivity::render(RenderLock&&) {
 void RefreshCalibrationActivity::renderMenu() {
   renderer.clearScreen();
   const auto& theme = GUI;
+  const auto& metrics = UITheme::getInstance().getMetrics();
   const int width = renderer.getScreenWidth();
   const int height = renderer.getScreenHeight();
-  theme.drawHeader(renderer, {0, 0, width, theme.metrics.headerHeight}, tr(STR_REFRESH_CALIBRATION));
+  theme.drawHeader(renderer, Rect{0, 0, width, metrics.headerHeight}, tr(STR_REFRESH_CALIBRATION));
   const int lineHeight = renderer.getLineHeight(UI_12_FONT_ID);
-  const int statusTop = height - theme.metrics.buttonHintsHeight - 3 * lineHeight;
-  UITheme::drawCenteredWrappedText(renderer,
-                                   {12, theme.metrics.headerHeight + 8, width - 24, statusTop - theme.metrics.headerHeight - 16},
-                                   UI_12_FONT_ID, tr(message), 14, true, EpdFontFamily::REGULAR,
+  const int statusTop = height - metrics.buttonHintsHeight - 3 * lineHeight;
+  UITheme::drawCenteredWrappedText(renderer, Rect{12, metrics.headerHeight + 8, width - 24, statusTop - metrics.headerHeight - 16},
+                                   UI_12_FONT_ID, I18N.get(message), 14, true, EpdFontFamily::REGULAR,
                                    UITheme::TextVerticalAlignment::TOP);
   const auto& config = refresh_policy_config::active();
   snprintf(line, sizeof(line), "policy %s: day %lu / night %lu", refresh_policy_config::sourceName(config.source),
@@ -536,8 +558,13 @@ void RefreshCalibrationActivity::drawProbe() {
     for (int x = kMargin; x < renderer.getScreenWidth() - kMargin; x += 2) renderer.drawPixel(x + (y & 2 ? 1 : 0), y, black);
   }
   renderer.fillRect(kMargin, kBodyTop + 2 * bandHeight, renderer.getScreenWidth() - 2 * kMargin, bandHeight, black);
-  const auto labels = mappedInput.mapLabels(tr(STR_REFRESH_PAUSE), tr(ratingLabel(1)), tr(ratingLabel(0)),
-                                            tr(ratingLabel(2)));
+  const auto labels = mappedInput.mapLabels(tr(STR_REFRESH_PAUSE), I18N.get(ratingLabel(1)), I18N.get(ratingLabel(0)),
+                                            I18N.get(ratingLabel(2)));
   GUI.drawButtonHints(renderer, labels.btn1, labels.btn2, labels.btn3, labels.btn4);
+  const int labelY = kBodyBottom + 8;
+  const int rightX = renderer.getScreenWidth() - kMargin - kFiducial - 70;
+  renderer.drawText(UI_10_FONT_ID, kMargin + kFiducial + 4, labelY, tr(STR_REFRESH_RATING_NONE), black);
+  renderer.drawCenteredText(UI_10_FONT_ID, labelY, tr(STR_REFRESH_RATING_FINE), black);
+  renderer.drawText(UI_10_FONT_ID, rightX, labelY, tr(STR_REFRESH_RATING_BAD), black);
   renderer.displayBuffer(HalDisplay::FAST_REFRESH);
 }
