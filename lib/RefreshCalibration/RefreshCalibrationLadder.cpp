@@ -10,8 +10,9 @@
 namespace refresh_calibration {
 namespace {
 
-constexpr const char* kClassNames[kClassCount] = {"dense-latin", "dense-cjk", "sparse", "gray-image", "menu"};
-constexpr const char* kClassCodes[kClassCount] = {"LAT", "CJK", "SPR", "IMG", "MNU"};
+constexpr const char* kClassNames[kClassCount] = {"dense-latin", "dense-cjk", "sparse",       "gray-image",
+                                                  "menu",        "image-cleared", "image-residue"};
+constexpr const char* kClassCodes[kClassCount] = {"LAT", "CJK", "SPR", "IMG", "MNU", "ICL", "IRS"};
 
 // Bounded JSON line builder: any overflow poisons the whole line.
 struct Line {
@@ -101,7 +102,32 @@ void Rung::formatId(char* out, const size_t capacity) const {
   }
 }
 
-Ladder::Ladder(const uint8_t skipMask) : skipMask_(skipMask) { skipFinishedPhases(); }
+uint8_t Rung::frameCount() const {
+  if (kind == RungKind::Reference) return 1;
+  return static_cast<uint8_t>(1 + (cls == ContentClass::ImageCleared ? 1 : 0) + fastCount());
+}
+
+FramePlan Rung::frame(const uint8_t index) const {
+  FramePlan plan;
+  plan.clear = index == 0;
+  if (kind == RungKind::Reference) return plan;
+  switch (cls) {
+    case ContentClass::GrayImage: plan.content = FrameContent::Picture; break;
+    case ContentClass::Menu: plan.content = FrameContent::Menu; break;
+    case ContentClass::ImageCleared:
+      plan.content = index == 0 ? FrameContent::Picture : FrameContent::Text;
+      plan.clear = index <= 1;  // the clear the reader runs on the page after a picture
+      break;
+    case ContentClass::ImageResidue: plan.content = index == 0 ? FrameContent::Picture : FrameContent::Text; break;
+    default: plan.content = FrameContent::Text; break;
+  }
+  return plan;
+}
+
+Ladder::Ladder(const uint8_t skipMask) : skipMask_(skipMask) {
+  for (auto& polarity : series_) polarity[static_cast<uint8_t>(ContentClass::ImageCleared)].maxRungs = 1;
+  skipFinishedPhases();
+}
 
 Series& Ladder::seriesAt(const Polarity polarity, const ContentClass cls) {
   return series_[static_cast<uint8_t>(polarity)][static_cast<uint8_t>(cls)];
@@ -112,6 +138,13 @@ const Series& Ladder::series(const Polarity polarity, const ContentClass cls) co
 }
 
 int8_t Ladder::startLevelFor(const Polarity polarity, const ContentClass cls) const {
+  // The picture classes show dense Latin after the picture, so the dense text
+  // boundary is where a picture's residue would first add to text ghosting.
+  // Night image-residue still follows its daylight series below.
+  if (cls == ContentClass::ImageCleared || (cls == ContentClass::ImageResidue && polarity == Polarity::Light)) {
+    const Series& text = series(polarity, ContentClass::DenseLatin);
+    return text.rungs ? text.boundary() : kFirstStartLevel;
+  }
   // Same content in daylight is the closest predictor of a night series.
   if (polarity == Polarity::Night && !(skipMask_ & classBit(cls))) {
     const Series& day = series(Polarity::Light, cls);
@@ -195,7 +228,8 @@ uint8_t Ladder::estimatedTotal() const {
     }
     const ContentClass cls = phaseClass(phase);
     if (skipMask_ & classBit(cls)) continue;
-    total += series(phasePolarity(phase), cls).rungs ? 1 : 3;
+    const Series& s = series(phasePolarity(phase), cls);
+    total += s.rungs || s.maxRungs == 1 ? 1 : 3;
   }
   return static_cast<uint8_t>(total > 255 ? 255 : total);
 }
@@ -254,12 +288,13 @@ size_t formatRungRow(char* out, const size_t capacity, const Rung& rung, const R
       m.pixelCount ? static_cast<unsigned long long>(m.weightedDebt) * 1000ull / m.pixelCount : 0ull;
   line.add(",\"level\":%d,\"fast_count\":%u,\"rating\":%u,\"frames\":%u,\"panel_pixels\":%lu,\"changed_px\":%llu,"
            "\"weighted_debt\":%lu,\"debt_permille\":%llu,\"policy_clear_at\":%u,\"ink_px_mean\":%lu,"
-           "\"grayscale\":%u,\"image\":%u,\"elapsed_ms\":%lu}",
+           "\"grayscale\":%u,\"image\":%u,\"picture_charge\":%lu,\"picture_changed\":%lu,\"elapsed_ms\":%lu}",
            static_cast<int>(rung.level), static_cast<unsigned>(rung.fastCount()), static_cast<unsigned>(rating),
            static_cast<unsigned>(m.frames), static_cast<unsigned long>(m.pixelCount),
            static_cast<unsigned long long>(m.changedPixels), static_cast<unsigned long>(m.weightedDebt), debtPermille,
            static_cast<unsigned>(m.policyClearAt), static_cast<unsigned long>(m.meanInkPixels),
-           m.grayscale ? 1u : 0u, m.image ? 1u : 0u, static_cast<unsigned long>(elapsedMs));
+           m.grayscale ? 1u : 0u, m.image ? 1u : 0u, static_cast<unsigned long>(m.pictureCharge),
+           static_cast<unsigned long>(m.pictureChanged), static_cast<unsigned long>(elapsedMs));
   return line.finish();
 }
 

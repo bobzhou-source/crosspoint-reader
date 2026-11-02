@@ -18,14 +18,23 @@
 // boundary: the first series starts at 12 fast frames, later ones at the
 // boundary of the most similar finished series; the search widens by 1, 2, 4
 // levels until a "2" and a "<=1" bracket it, then bisects. A series typically
-// needs 2-3 rungs, so the whole run is about 25 rungs.
+// needs 2-3 rungs, so the whole run is about 30 rungs.
+//
+// Two classes measure what an inline picture leaves on the text pages after
+// it, the question behind refresh-policy.json's clear_after_image:
+//   image-cleared  picture page, the clear the reader runs after it, then N
+//                  fast text pages. One rung per polarity, N = the dense
+//                  text boundary: does the clear remove the picture?
+//   image-residue  picture page, then N fast text pages with no clear in
+//                  between: how many pages until the picture's residue
+//                  bothers. A staircase from the dense text boundary.
 namespace refresh_calibration {
 
 enum class Polarity : uint8_t { Light = 0, Night = 1 };
-enum class ContentClass : uint8_t { DenseLatin = 0, DenseCjk, Sparse, GrayImage, Menu };
+enum class ContentClass : uint8_t { DenseLatin = 0, DenseCjk, Sparse, GrayImage, Menu, ImageCleared, ImageResidue };
 enum class RungKind : uint8_t { Reference = 0, Probe };
 
-static constexpr uint8_t kClassCount = 5;
+static constexpr uint8_t kClassCount = 7;
 static constexpr uint8_t kFastCounts[] = {2, 4, 8, 12, 16, 24, 32, 48};
 static constexpr int8_t kLevels = sizeof(kFastCounts);
 static constexpr int8_t kFirstStartLevel = 3;  // 12 fast frames
@@ -34,7 +43,8 @@ static constexpr uint8_t kMaxRungsPerSeries = 6;
 static constexpr uint8_t kRatingInvisible = 0;
 static constexpr uint8_t kRatingFine = 1;
 static constexpr uint8_t kRatingBothers = 2;
-static constexpr int kLogSchema = 1;
+// 2: the picture-residue classes and their picture_* rung fields.
+static constexpr int kLogSchema = 2;
 
 const char* polarityName(Polarity polarity);
 const char* className(ContentClass cls);
@@ -43,6 +53,18 @@ const char* classCode(ContentClass cls);
 bool parsePolarity(const char* name, Polarity& out);
 bool parseClass(const char* name, ContentClass& out);
 constexpr uint8_t classBit(ContentClass cls) { return static_cast<uint8_t>(1u << static_cast<uint8_t>(cls)); }
+// The classes that open with a picture page and then show text.
+constexpr bool isPictureResidue(ContentClass cls) {
+  return cls == ContentClass::ImageCleared || cls == ContentClass::ImageResidue;
+}
+
+// What one frame before the probe shows, and whether it is a clearing refresh.
+enum class FrameContent : uint8_t { Blank, Text, Picture, Menu };
+struct FramePlan {
+  FrameContent content = FrameContent::Blank;
+  bool clear = false;
+  bool operator==(const FramePlan&) const = default;
+};
 
 struct Rung {
   RungKind kind = RungKind::Reference;
@@ -52,6 +74,10 @@ struct Rung {
   uint8_t seq = 0;                              // 0-based position in the run (= ratings logged before it)
 
   uint8_t fastCount() const { return level < 0 ? 0 : kFastCounts[level]; }
+  // Frames shown before the probe. Frame 0 is always a clear; then the
+  // fastCount() fast frames, preceded by one more clear for image-cleared.
+  uint8_t frameCount() const;
+  FramePlan frame(uint8_t index) const;
   // Human-readable ID shown large on the probe: "07 L-LAT-12", "00 L-REF".
   void formatId(char* out, size_t capacity) const;
   bool operator==(const Rung&) const = default;
@@ -63,8 +89,9 @@ struct Series {
   int8_t start = kFirstStartLevel;
   uint8_t rungs = 0;
   uint8_t widen = 0;   // widening steps taken while only one side is known
+  uint8_t maxRungs = kMaxRungsPerSeries;  // 1 for image-cleared: one paired rung, no search
 
-  bool done() const { return hi - lo <= 1 || rungs >= kMaxRungsPerSeries; }
+  bool done() const { return hi - lo <= 1 || rungs >= maxRungs; }
   // Highest level the series accepted, clamped to the ladder (0 when none).
   int8_t boundary() const { return lo < 0 ? 0 : lo; }
 };
@@ -83,7 +110,8 @@ class Ladder {
   bool rate(const Rung& rung, uint8_t rating);
 
   uint8_t rated() const { return rated_; }
-  // Rated rungs plus a 2-per-unfinished-series estimate of what is left.
+  // Rated rungs plus an estimate of what is left (3 per unstarted staircase,
+  // 1 per started one or image-cleared rung).
   uint8_t estimatedTotal() const;
   const Series& series(Polarity polarity, ContentClass cls) const;
 
@@ -109,12 +137,17 @@ class Ladder {
 struct RungMeasurement {
   uint32_t pixelCount = 0;
   uint16_t frames = 0;          // fast content frames actually shown
-  uint64_t changedPixels = 0;   // policy's per-frame change estimate, unweighted, summed
-  uint32_t weightedDebt = 0;    // debt the active policy config accumulated
+  uint64_t changedPixels = 0;   // policy's per-frame change estimate, unweighted, summed over the fast frames
+  uint32_t weightedDebt = 0;    // debt the active policy config accumulated over the fast frames
   uint16_t policyClearAt = 0;   // 1-based fast frame the active config would have cleared at; 0 = none
   uint32_t meanInkPixels = 0;
   bool grayscale = false;       // visible grayscale pass on the content frames
   bool image = false;
+  // Picture-residue classes: the opening picture page's charge under the
+  // active weights and its unweighted change. Not in weightedDebt (that page
+  // is a clear); with clear_after_image false the policy carries the charge.
+  uint32_t pictureCharge = 0;
+  uint32_t pictureChanged = 0;
 };
 
 struct SessionInfo {
@@ -132,8 +165,8 @@ struct SessionInfo {
 
 // One JSON object per line, newline-terminated. Return the line length, or 0
 // when it does not fit (the caller must not write a truncated row). Every row
-// fits in kMaxRowBytes; the complete row (10 series) is the longest.
-static constexpr size_t kMaxRowBytes = 1024;
+// fits in kMaxRowBytes; the complete row (14 series) is the longest.
+static constexpr size_t kMaxRowBytes = 1536;
 size_t formatSessionRow(char* out, size_t capacity, const SessionInfo& info);
 size_t formatRungRow(char* out, size_t capacity, const Rung& rung, const RungMeasurement& m, uint8_t rating,
                      uint32_t elapsedMs);

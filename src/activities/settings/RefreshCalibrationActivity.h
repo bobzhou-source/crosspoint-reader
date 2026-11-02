@@ -2,16 +2,16 @@
 
 #include <AdaptiveRefreshPolicy.h>
 #include <RefreshCalibrationLadder.h>
-
+#include <HalDisplay.h>
 #include <I18n.h>
-
 
 #include "activities/Activity.h"
 
 // Settings -> System -> Refresh calibration. Walks the refresh_calibration
-// ladder: per rung a clearing refresh, N fast refreshes of a bundled fixture
-// page, then a probe screen (white / gray / black fields, rung ID, fiducials)
-// that Robert photographs and rates. Ratings append to
+// ladder: per rung the frames of Rung::frame() (a clearing refresh, then N
+// fast refreshes of a bundled fixture page; picture rungs open with a picture
+// page), then a probe screen (white / gray / black fields, rung ID,
+// fiducials) that Robert photographs and rates. Ratings append to
 // /.crosspoint/refresh-calibration/<session>.jsonl; an interrupted run resumes
 // from that log. Never touches the user's books or settings.
 class RefreshCalibrationActivity final : public Activity {
@@ -46,11 +46,14 @@ class RefreshCalibrationActivity final : public Activity {
   // 0/1/2 from a side key, a front button, or a tap on the bottom labels.
   // A tap above that band is a body tap (starts the run). -1 if nothing arrived.
   int readRating() const;
-  void displayContentFrame(bool clear);
-  void account(const AdaptiveRefreshPolicy::Inputs& inputs, bool clear);
+  void displayContentFrame();
+  // A picture page the way the reader shows one: B/W base, then the gray planes.
+  void displayPicture(HalDisplay::RefreshMode mode, bool absolute);
+  void account(const AdaptiveRefreshPolicy::Inputs& inputs);
   void commitPageAdvance();
   refresh_calibration::Ladder ladder;
   refresh_calibration::Rung rung;
+  refresh_calibration::FramePlan plan;  // what the current frame shows
   refresh_calibration::RungMeasurement measurement;
   unsigned long rungStartedMs = 0;
   AdaptiveRefreshPolicy driver;    // runs the hardware: fast unless a clear is requested

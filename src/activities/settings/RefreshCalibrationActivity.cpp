@@ -1,5 +1,6 @@
 #include "RefreshCalibrationActivity.h"
 
+#include <BitmapHelpers.h>
 #include <CrossPointSettings.h>
 #include <EpdFontFamily.h>
 #include <FontCacheManager.h>
@@ -286,7 +287,7 @@ void RefreshCalibrationActivity::loop() {
       return;
     }
     ++frame;
-    if (frame > rung.fastCount()) stage = Stage::Rating;
+    if (frame >= rung.frameCount()) stage = Stage::Rating;
     requestUpdate();
     return;
   }
@@ -346,6 +347,7 @@ void RefreshCalibrationActivity::renderMenu() {
 }
 
 void RefreshCalibrationActivity::renderFrame() {
+  plan = rung.frame(static_cast<uint8_t>(frame));
   layoutRecorded = false;
   renderer.clearScreen();
   // Same two passes as the readers: the scan pass records the page's codepoints so an SD-card
@@ -355,29 +357,30 @@ void RefreshCalibrationActivity::renderFrame() {
   drawContent(-1);
   scope.endScanAndPrewarm();
   drawContent(-1);
-  displayContentFrame(frame == 0);
+  displayContentFrame();
   commitPageAdvance();
 }
 
 void RefreshCalibrationActivity::commitPageAdvance() {
-  if (rung.kind != rc::RungKind::Probe || rung.cls == rc::ContentClass::Menu) return;
+  if (plan.content != rc::FrameContent::Text && plan.content != rc::FrameContent::Picture) return;
   textOffset[rung.cls == rc::ContentClass::DenseCjk ? 1 : 0] = pageEnd;
 }
 
-void RefreshCalibrationActivity::displayContentFrame(const bool clear) {
-  const bool textPage = rung.kind == rc::RungKind::Probe && rung.cls != rc::ContentClass::GrayImage &&
-                        rung.cls != rc::ContentClass::Menu;
-  const bool grayscale = textPage && ReaderUtils::textAntiAliasingVisible(renderer);
-  const bool image = rung.kind == rc::RungKind::Probe && rung.cls == rc::ContentClass::GrayImage &&
-                     renderer.grayscaleCapabilities().supported();
+void RefreshCalibrationActivity::displayContentFrame() {
+  const bool picture = plan.content == rc::FrameContent::Picture;
+  const bool grayscale = plan.content == rc::FrameContent::Text && ReaderUtils::textAntiAliasingVisible(renderer);
+  // The reader's choice for picture pages: the absolute quality waveform on
+  // the X4 Pro unless refresh-policy.json asks for image_waveform "fast".
+  const bool absolute = picture && ReaderUtils::absoluteImageGrayscale(renderer, observer.config());
+  const bool image = picture && (absolute || renderer.grayscaleCapabilities().supported());
   AdaptiveRefreshPolicy::Inputs inputs;
   inputs.frame = renderer.measureFrameChange();
-  inputs.hasImage = rung.kind == rc::RungKind::Probe && rung.cls == rc::ContentClass::GrayImage;
+  inputs.hasImage = picture;
   inputs.visibleGrayscale = grayscale || image;
   inputs.externalClearPending = renderer.hasPendingClearingRefresh();
   inputs.invertedOutput = display.isInverted();
-  account(inputs, clear);
-  const auto mode = clear ? HalDisplay::HALF_REFRESH : HalDisplay::FAST_REFRESH;
+  account(inputs);
+  const auto mode = plan.clear ? HalDisplay::HALF_REFRESH : HalDisplay::FAST_REFRESH;
   if (grayscale) {
     if (renderer.grayscaleCapabilities().base == HalDisplay::GrayscaleBase::Combined) {
       renderer.displayGrayscaleBase(mode);
@@ -386,81 +389,104 @@ void RefreshCalibrationActivity::displayContentFrame(const bool clear) {
     }
     ReaderUtils::renderAntiAliased(renderer, [this]() { drawContent(-1); });
   } else if (image) {
-    if (renderer.grayscaleCapabilities().base == HalDisplay::GrayscaleBase::Combined) {
-      renderer.displayGrayscaleBase(mode);
-    } else if (clear) {
-      renderer.displayBuffer(HalDisplay::HALF_REFRESH);
-      renderer.preconditionGrayscale();
-    } else {
-      renderer.displayGrayscaleBase(HalDisplay::FAST_REFRESH);
-    }
-    for (const auto pass : {GfxRenderer::GRAYSCALE_LSB, GfxRenderer::GRAYSCALE_MSB}) {
-      renderer.clearScreen(0x00);
-      renderer.setRenderMode(pass);
-      drawContent(pass == GfxRenderer::GRAYSCALE_LSB ? 0 : 1);
-      if (pass == GfxRenderer::GRAYSCALE_LSB) renderer.copyGrayscaleLsbBuffers();
-      else renderer.copyGrayscaleMsbBuffers();
-    }
-    renderer.displayGrayBuffer();
-    renderer.setRenderMode(GfxRenderer::BW);
-    renderer.clearScreen();
-    drawContent(-1);
-    renderer.cleanupGrayscaleWithFrameBuffer();
+    displayPicture(mode, absolute);
   } else {
     renderer.displayBuffer(mode);
   }
-  const auto booked = clear ? AdaptiveRefreshPolicy::Refresh::Clear : AdaptiveRefreshPolicy::Refresh::Fast;
+  const auto booked = plan.clear ? AdaptiveRefreshPolicy::Refresh::Clear : AdaptiveRefreshPolicy::Refresh::Fast;
   driver.commit(booked);
   observer.commit(booked);
   meter.commit(booked);
-  if (frame > 0) {
+  if (!plan.clear) {
     ++measurement.frames;
     inkSum += inputs.frame.inkPixels;
     measurement.meanInkPixels = static_cast<uint32_t>(inkSum / measurement.frames);
   }
-  if (frame == rung.fastCount()) {
+  if (frame + 1 == rung.frameCount()) {
     measurement.pixelCount = inputs.frame.pixelCount;
     measurement.changedPixels = meter.debtPixels();
     measurement.weightedDebt = observer.debtPixels();
     measurement.grayscale = grayscale;
-    measurement.image = inputs.hasImage;
+    measurement.image = picture;
   }
 }
 
-void RefreshCalibrationActivity::account(const AdaptiveRefreshPolicy::Inputs& inputs, const bool clear) {
-  if (clear) driver.requestClear();
+void RefreshCalibrationActivity::displayPicture(const HalDisplay::RefreshMode mode, const bool absolute) {
+  // Mirrors EpubReaderActivity's untiled image page: the clear or fast base
+  // first, then both gray planes and one gray waveform.
+  if (absolute) {
+    if (!renderer.displayGrayscaleBase(HalDisplay::GrayscaleMode::Absolute, mode)) {
+      LOG_ERR("RCAL", "Could not start absolute picture page; displaying B/W");
+      renderer.displayBuffer(mode);
+      return;
+    }
+  } else {
+    renderer.displayBuffer(mode);
+  }
+  if (!renderer.storeBwBuffer()) {
+    LOG_ERR("RCAL", "Could not store B/W buffer; picture page without grays");
+    if (absolute) renderer.setRenderMode(GfxRenderer::BW);
+    return;
+  }
+  for (const auto pass : {GfxRenderer::GRAYSCALE_LSB, GfxRenderer::GRAYSCALE_MSB}) {
+    renderer.clearScreen(absolute ? 0xFF : 0x00);
+    renderer.setRenderMode(pass);
+    drawContent(pass == GfxRenderer::GRAYSCALE_LSB ? 0 : 1);
+    if (pass == GfxRenderer::GRAYSCALE_LSB) {
+      renderer.copyGrayscaleLsbBuffers();
+    } else {
+      renderer.copyGrayscaleMsbBuffers();
+    }
+  }
+  renderer.displayGrayBuffer();
+  renderer.setRenderMode(GfxRenderer::BW);
+  renderer.restoreBwBuffer();
+}
+
+void RefreshCalibrationActivity::account(const AdaptiveRefreshPolicy::Inputs& inputs) {
+  if (plan.clear) driver.requestClear();
   (void)driver.decide(inputs);
   const auto watched = observer.decide(inputs);
-  if (frame > 0 && measurement.policyClearAt == 0 && watched.refresh == AdaptiveRefreshPolicy::Refresh::Clear) {
-    measurement.policyClearAt = frame;
+  if (!plan.clear && measurement.policyClearAt == 0 && watched.refresh == AdaptiveRefreshPolicy::Refresh::Clear) {
+    measurement.policyClearAt = static_cast<uint16_t>(measurement.frames + 1);
   }
   (void)meter.decide(inputs);
+  if (frame == 0 && rc::isPictureResidue(rung.cls)) {
+    measurement.pictureCharge = observer.pendingCharge();
+    measurement.pictureChanged = meter.pendingCharge();
+  }
 }
 
 void RefreshCalibrationActivity::drawContent(const int plane) {
   const int width = renderer.getScreenWidth() - 2 * kMargin;
   const int height = kBodyBottom - kBodyTop;
-  if (rung.kind == rc::RungKind::Reference) {
-    renderer.fillRect(kMargin, kBodyTop, width, height, false);
-    return;
-  }
-  if (rung.cls == rc::ContentClass::Menu) {
-    if (plane < 0) drawMenuPage(frame);
-    return;
-  }
-  if (rung.cls == rc::ContentClass::GrayImage) {
-    const int imageBottom = kBodyTop + height * 2 / 3;
-    if (plane < 0 && !layoutRecorded) {
-      imageSeed = static_cast<uint32_t>(frame) * 17 + 3;
-      pageOffset = textOffset[0];
-      layoutRecorded = true;
+  switch (plan.content) {
+    case rc::FrameContent::Blank:
+      renderer.fillRect(kMargin, kBodyTop, width, height, false);
+      return;
+    case rc::FrameContent::Menu:
+      if (plane < 0) drawMenuPage(frame);
+      return;
+    case rc::FrameContent::Picture: {
+      const int imageBottom = kBodyTop + height * 2 / 3;
+      if (plane < 0 && !layoutRecorded) {
+        imageSeed = static_cast<uint32_t>(frame) * 17 + 3;
+        pageOffset = textOffset[0];
+        layoutRecorded = true;
+      }
+      const bool gray = renderer.grayscaleCapabilities().supported() || renderer.grayPlanesAreAbsolute();
+      const uint8_t pass = !gray ? 3 : plane < 0 ? 0 : plane == 0 ? 1 : 2;
+      if (!renderer.isFontCacheScanning()) drawImage(kBodyTop, imageBottom, pass);
+      // Absolute planes hold the whole page, text included.
+      if (plane < 0 || renderer.grayPlanesAreAbsolute()) {
+        drawTextPage(TextKind::Latin, pageOffset, imageBottom + 8, kBodyBottom, width, 6, true);
+      }
+      return;
     }
-    const bool gray = renderer.grayscaleCapabilities().supported();
-    const uint8_t pass = !gray ? 3 : plane < 0 ? 0 : plane == 0 ? 1 : 2;
-    if (!renderer.isFontCacheScanning()) drawImage(kBodyTop, imageBottom, pass);
-    if (plane < 0) drawTextPage(TextKind::Latin, pageOffset, imageBottom + 8, kBodyBottom, width, 6, true);
-    return;
+    case rc::FrameContent::Text:
+      break;
   }
+  // The picture-residue classes follow the picture with dense Latin.
   const auto kind = rung.cls == rc::ContentClass::DenseCjk ? TextKind::Cjk : TextKind::Latin;
   const int lines = rung.cls == rc::ContentClass::Sparse ? 4 : 200;
   if (!layoutRecorded) {
@@ -488,21 +514,21 @@ void RefreshCalibrationActivity::drawTextPage(const TextKind kind, uint32_t offs
 }
 
 void RefreshCalibrationActivity::drawImage(const int top, const int bottom, const uint8_t pass) {
+  // pass 0: B/W base, 1: LSB plane, 2: MSB plane, 3: dithered B/W (no grayscale).
   const int width = renderer.getScreenWidth() - 2 * kMargin;
+  const bool absolute = renderer.grayPlanesAreAbsolute();
   for (int y = top; y < bottom; ++y) {
     for (int x = kMargin; x < kMargin + width; ++x) {
-      const uint8_t level = imageLevel(x - kMargin, y - top, imageSeed);
-      bool black = false;
+      const uint8_t darkness = imageLevel(x - kMargin, y - top, imageSeed);
       if (pass == 3) {
-        black = level * 4 > kBayer[(y - top) & 3][(x - kMargin) & 3];
+        if (darkness * 4 > kBayer[(y - top) & 3][(x - kMargin) & 3]) renderer.drawPixel(x, y, true);
       } else if (pass == 0) {
-        black = level >= 1;
-      } else if (pass == 1) {
-        black = level == 1;
+        if (darkness > 0) renderer.drawPixel(x, y, true);
       } else {
-        black = level == 1 || level == 2;
+        // The bitmap renderer's plane rule; its levels run 0 = black .. 3 = white.
+        const auto pixel = grayPlanePixel(static_cast<uint8_t>(3 - darkness), pass == 2, absolute);
+        if (pixel.write) renderer.drawPixel(x, y, pixel.black);
       }
-      if (black) renderer.drawPixel(x, y, true);
     }
   }
 }

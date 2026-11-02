@@ -75,11 +75,14 @@ TEST(RefreshCalibrationLadder, EachPolarityOpensWithAReferenceThenWalksTheClasse
     const int cls = r.kind == RungKind::Reference ? -1 : static_cast<int>(r.cls);
     if (order.empty() || order.back() != std::make_pair(r.polarity, cls)) order.emplace_back(r.polarity, cls);
   }
-  const std::vector<std::pair<Polarity, int>> expected = {
-      {Polarity::Light, -1}, {Polarity::Light, 0}, {Polarity::Light, 1}, {Polarity::Light, 2},
-      {Polarity::Light, 3},  {Polarity::Light, 4}, {Polarity::Night, -1}, {Polarity::Night, 0},
-      {Polarity::Night, 1},  {Polarity::Night, 2}, {Polarity::Night, 3},  {Polarity::Night, 4}};
+  std::vector<std::pair<Polarity, int>> expected;
+  for (const Polarity p : {Polarity::Light, Polarity::Night}) {
+    expected.emplace_back(p, -1);
+    for (int c = 0; c < rc::kClassCount; ++c) expected.emplace_back(p, c);
+  }
   EXPECT_EQ(order, expected);
+  EXPECT_EQ(static_cast<int>(ContentClass::ImageCleared) + 1, static_cast<int>(ContentClass::ImageResidue))
+      << "the cleared rung is shown right before the residue series it pairs with";
   for (size_t i = 0; i < shown.size(); ++i) EXPECT_EQ(shown[i].seq, i) << "seq is the run position";
 }
 
@@ -91,7 +94,15 @@ TEST(RefreshCalibrationLadder, StaircaseFindsEveryPossibleBoundaryForEverySeries
     ASSERT_TRUE(ladder.done());
     for (uint8_t p = 0; p < 2; ++p) {
       for (uint8_t c = 0; c < rc::kClassCount; ++c) {
-        const auto& s = ladder.series(static_cast<Polarity>(p), static_cast<ContentClass>(c));
+        const auto cls = static_cast<ContentClass>(c);
+        const auto& s = ladder.series(static_cast<Polarity>(p), cls);
+        if (cls == ContentClass::ImageCleared) {
+          // One rung at the dense text boundary (level 0 when even 2 bother).
+          EXPECT_EQ(s.rungs, 1u);
+          EXPECT_EQ(s.lo, tolerated < 0 ? -1 : tolerated);
+          EXPECT_EQ(s.hi, tolerated < 0 ? 0 : rc::kLevels);
+          continue;
+        }
         EXPECT_EQ(s.lo, tolerated) << "tolerated " << int(tolerated) << " p" << int(p) << " c" << int(c);
         EXPECT_EQ(s.hi, tolerated + 1);
         EXPECT_LE(s.rungs, 4u) << "8 levels need at most 4 rungs";
@@ -104,8 +115,9 @@ TEST(RefreshCalibrationLadder, WarmStartsKeepAConsistentViewerNearTwoRungsPerSer
   Ladder ladder;
   const Viewer viewer = uniformViewer(4);  // 16 fast frames fine, 24 bothers
   const auto shown = run(ladder, viewer);
-  // 2 references + the first series (12 ok, 16 ok, 32 bad, 24 bad = 4) + 9 warm series of 2.
-  EXPECT_EQ(shown.size(), 2u + 4u + 9u * 2u);
+  // 2 references + the first series (12 ok, 16 ok, 32 bad, 24 bad = 4) + 11 warm
+  // staircases of 2 + one image-cleared rung per polarity.
+  EXPECT_EQ(shown.size(), 2u + 4u + 11u * 2u + 2u);
   EXPECT_EQ(ladder.series(Polarity::Light, ContentClass::DenseLatin).start, rc::kFirstStartLevel);
   EXPECT_EQ(ladder.series(Polarity::Light, ContentClass::DenseCjk).start, 4);
   EXPECT_EQ(ladder.series(Polarity::Night, ContentClass::DenseLatin).start, 4);
@@ -130,7 +142,7 @@ TEST(RefreshCalibrationLadder, WorstCaseRunStaysBounded) {
   Ladder ladder;
   const auto shown = run(ladder, viewer);
   EXPECT_TRUE(ladder.done());
-  EXPECT_LE(shown.size(), 2u + 10u * 4u);
+  EXPECT_LE(shown.size(), 2u + 12u * 4u + 2u);
 }
 
 TEST(RefreshCalibrationLadder, NonMonotoneRatingsStillTerminate) {
@@ -179,7 +191,7 @@ TEST(RefreshCalibrationLadder, OnlyTheExpectedRungAndValidRatingsAreBooked) {
 TEST(RefreshCalibrationLadder, EstimatedTotalShrinksToTheExactCountAtTheEnd) {
   Ladder ladder;
   const uint8_t initial = ladder.estimatedTotal();
-  EXPECT_EQ(initial, 2u + 10u * 3u);
+  EXPECT_EQ(initial, 2u + 12u * 3u + 2u);
   const auto shown = run(ladder, uniformViewer(4));
   EXPECT_EQ(ladder.estimatedTotal(), shown.size());
 }
@@ -226,7 +238,26 @@ TEST(RefreshCalibrationLog, RungRowCarriesEverythingTheAnalysisJoinsOn) {
   EXPECT_EQ(doc["policy_clear_at"].as<int>(), 8);
   EXPECT_EQ(doc["grayscale"].as<int>(), 1);
   EXPECT_EQ(doc["image"].as<int>(), 0);
+  EXPECT_EQ(doc["picture_charge"].as<long>(), 0);
+  EXPECT_EQ(doc["picture_changed"].as<long>(), 0);
   EXPECT_EQ(doc["elapsed_ms"].as<long>(), 4321);
+
+  // Picture-residue rows carry the opening picture page apart from the text debt.
+  Rung residue;
+  residue.kind = RungKind::Probe;
+  residue.cls = ContentClass::ImageResidue;
+  residue.level = 1;
+  residue.seq = 30;
+  rc::RungMeasurement picture = sampleMeasurement();
+  picture.pictureCharge = 352000;
+  picture.pictureChanged = 128000;
+  const size_t pn = rc::formatRungRow(line, sizeof(line), residue, picture, 2, 0);
+  const auto pdoc = parseLine(line, pn);
+  EXPECT_STREQ(pdoc["class"].as<const char*>(), "image-residue");
+  EXPECT_STREQ(pdoc["rung"].as<const char*>(), "30 L-IRS-4");
+  EXPECT_EQ(pdoc["picture_charge"].as<long>(), 352000);
+  EXPECT_EQ(pdoc["picture_changed"].as<long>(), 128000);
+  EXPECT_EQ(pdoc["weighted_debt"].as<long>(), 1140431);
 
   // Reference rows have no class.
   Ladder fresh;
@@ -266,6 +297,14 @@ TEST(RefreshCalibrationLog, SessionRowEscapesUntrustedNamesAndListsSkips) {
   EXPECT_STREQ(doc["policy"].as<const char*>(), "adaptive-content-v2");
   EXPECT_STREQ(doc["policy_source"].as<const char*>(), "file");
   EXPECT_EQ(doc["policy_config"]["clear_threshold_permille"].as<int>(), 2400);
+  EXPECT_TRUE(doc["policy_config"]["clear_after_image"].as<bool>());
+  EXPECT_STREQ(doc["policy_config"]["image_waveform"].as<const char*>(), "quality");
+  info.config.clearAfterImage = false;
+  info.config.imageWaveform = AdaptiveRefreshPolicy::ImageWaveform::Fast;
+  const auto tuned = parseLine(line, rc::formatSessionRow(line, sizeof(line), info));
+  EXPECT_FALSE(tuned["policy_config"]["clear_after_image"].as<bool>());
+  EXPECT_TRUE(tuned["policy_config"]["clear_after_image"].is<bool>());
+  EXPECT_STREQ(tuned["policy_config"]["image_waveform"].as<const char*>(), "fast");
   ASSERT_EQ(doc["skip"].size(), 1u);
   EXPECT_STREQ(doc["skip"][0].as<const char*>(), "dense-cjk");
   ASSERT_EQ(doc["fast_counts"].size(), 8u);
@@ -308,7 +347,7 @@ TEST(RefreshCalibrationResume, ReplayingTheLogRestoresTheExactNextRung) {
     }
   const size_t n = rc::formatCompleteRow(line, sizeof(line), live);
   ASSERT_GT(n, 0u);
-  EXPECT_EQ(parseLine(line, n)["series"].size(), 10u);
+  EXPECT_EQ(parseLine(line, n)["series"].size(), 14u);
 }
 
 TEST(RefreshCalibrationLog, TheCompleteRowFitsTheActivityBuffer) {
@@ -322,7 +361,7 @@ TEST(RefreshCalibrationLog, TheCompleteRowFitsTheActivityBuffer) {
     ASSERT_GT(n, 0u) << "tolerated " << static_cast<int>(tolerated);
     const auto doc = parseLine(line, n);
     EXPECT_STREQ(doc["event"].as<const char*>(), "complete");
-    EXPECT_EQ(doc["series"].size(), 10u);
+    EXPECT_EQ(doc["series"].size(), 14u);
   }
 }
 
@@ -332,7 +371,7 @@ TEST(RefreshCalibrationResume, DamagedOrForeignLogsAreRejected) {
   EXPECT_EQ(noHeader.feed(rung.data(), rung.size()), rc::Replay::Status::NeedSession);
 
   rc::Replay replay;
-  const std::string header = R"({"event":"session","schema":1,"skip":[]})";
+  const std::string header = R"({"event":"session","schema":2,"skip":[]})";
   ASSERT_EQ(replay.feed(header.data(), header.size()), rc::Replay::Status::Ok);
   const std::string truncated = R"({"event":"rung","seq":0,"kind":"refer)";
   EXPECT_EQ(replay.feed(truncated.data(), truncated.size()), rc::Replay::Status::BadRow);
@@ -344,8 +383,80 @@ TEST(RefreshCalibrationResume, DamagedOrForeignLogsAreRejected) {
   EXPECT_EQ(replay.feed(blank.data(), blank.size()), rc::Replay::Status::Ok);
 
   rc::Replay future;
-  const std::string v2 = R"({"event":"session","schema":2,"skip":[]})";
-  EXPECT_EQ(future.feed(v2.data(), v2.size()), rc::Replay::Status::BadSession);
-  const std::string badSkip = R"({"event":"session","schema":1,"skip":["comics"]})";
+  const std::string v3 = R"({"event":"session","schema":3,"skip":[]})";
+  EXPECT_EQ(future.feed(v3.data(), v3.size()), rc::Replay::Status::BadSession);
+  // An rc9.2 log (schema 1, no picture classes) cannot resume into this ladder.
+  rc::Replay older;
+  const std::string v1 = R"({"event":"session","schema":1,"skip":[]})";
+  EXPECT_EQ(older.feed(v1.data(), v1.size()), rc::Replay::Status::BadSession);
+  const std::string badSkip = R"({"event":"session","schema":2,"skip":["comics"]})";
   EXPECT_EQ(future.feed(badSkip.data(), badSkip.size()), rc::Replay::Status::BadSession);
+}
+
+TEST(RefreshCalibrationLadder, EveryRungStartsCleanAndPictureRungsOpenWithThePicture) {
+  using rc::FrameContent;
+  using rc::FramePlan;
+  auto probe = [](ContentClass cls, int8_t level) {
+    Rung r;
+    r.kind = RungKind::Probe;
+    r.cls = cls;
+    r.level = level;
+    return r;
+  };
+  const Rung reference;
+  EXPECT_EQ(reference.frameCount(), 1u);
+  EXPECT_EQ(reference.frame(0), (FramePlan{FrameContent::Blank, true}));
+
+  const Rung text = probe(ContentClass::DenseLatin, 1);  // 4 fast frames
+  ASSERT_EQ(text.frameCount(), 5u);
+  EXPECT_EQ(text.frame(0), (FramePlan{FrameContent::Text, true}));
+  for (uint8_t i = 1; i < 5; ++i) EXPECT_EQ(text.frame(i), (FramePlan{FrameContent::Text, false}));
+  EXPECT_EQ(probe(ContentClass::GrayImage, 0).frame(1), (FramePlan{FrameContent::Picture, false}));
+  EXPECT_EQ(probe(ContentClass::Menu, 0).frame(0), (FramePlan{FrameContent::Menu, true}));
+
+  // Picture, the post-picture clear, then the fast text pages.
+  const Rung cleared = probe(ContentClass::ImageCleared, 1);
+  ASSERT_EQ(cleared.frameCount(), 6u);
+  EXPECT_EQ(cleared.frame(0), (FramePlan{FrameContent::Picture, true}));
+  EXPECT_EQ(cleared.frame(1), (FramePlan{FrameContent::Text, true}));
+  for (uint8_t i = 2; i < 6; ++i) EXPECT_EQ(cleared.frame(i), (FramePlan{FrameContent::Text, false}));
+
+  // Picture, then straight into fast text pages.
+  const Rung residue = probe(ContentClass::ImageResidue, 1);
+  ASSERT_EQ(residue.frameCount(), 5u);
+  EXPECT_EQ(residue.frame(0), (FramePlan{FrameContent::Picture, true}));
+  for (uint8_t i = 1; i < 5; ++i) EXPECT_EQ(residue.frame(i), (FramePlan{FrameContent::Text, false}));
+
+  for (const auto cls : {ContentClass::DenseLatin, ContentClass::GrayImage, ContentClass::ImageCleared,
+                         ContentClass::ImageResidue}) {
+    const Rung r = probe(cls, 2);
+    unsigned fast = 0;
+    for (uint8_t i = 0; i < r.frameCount(); ++i) fast += r.frame(i).clear ? 0 : 1;
+    EXPECT_EQ(fast, r.fastCount()) << "fast_count is the fast frames before the probe";
+  }
+}
+
+TEST(RefreshCalibrationLadder, PictureRungsStartAtTheDenseTextBoundary) {
+  Viewer viewer = uniformViewer(4);
+  viewer.tolerated[0][static_cast<int>(ContentClass::ImageResidue)] = 1;  // picture residue: only 4 pages
+  viewer.tolerated[1][static_cast<int>(ContentClass::ImageResidue)] = 1;
+  Ladder ladder;
+  const auto shown = run(ladder, viewer);
+  ASSERT_TRUE(ladder.done());
+  const auto& lightCleared = ladder.series(Polarity::Light, ContentClass::ImageCleared);
+  EXPECT_EQ(lightCleared.rungs, 1u);
+  EXPECT_EQ(lightCleared.lo, 4) << "paired with the dense text boundary, rated fine";
+  const auto& lightResidue = ladder.series(Polarity::Light, ContentClass::ImageResidue);
+  EXPECT_EQ(lightResidue.start, 4);
+  EXPECT_EQ(lightResidue.lo, 1);
+  EXPECT_EQ(lightResidue.hi, 2);
+  EXPECT_EQ(ladder.series(Polarity::Night, ContentClass::ImageResidue).start, 1) << "night follows daylight";
+  EXPECT_EQ(ladder.series(Polarity::Night, ContentClass::ImageCleared).rungs, 1u);
+  // The cleared rung and the residue staircase's first rung show the same number of text pages.
+  for (size_t i = 0; i + 1 < shown.size(); ++i) {
+    if (shown[i].kind == RungKind::Probe && shown[i].cls == ContentClass::ImageCleared) {
+      EXPECT_EQ(shown[i + 1].cls, ContentClass::ImageResidue);
+      if (shown[i].polarity == Polarity::Light) EXPECT_EQ(shown[i + 1].level, shown[i].level);
+    }
+  }
 }
