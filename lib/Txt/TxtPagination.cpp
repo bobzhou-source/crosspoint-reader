@@ -206,6 +206,126 @@ class Breaker {
   const TextMeasure& measure;
 };
 
+// ---- CJK paragraph style: cleaned view of a physical line ----
+
+bool isClutter(const uint32_t cp) { return TxtLineBreak::isSpaceLike(cp) || TxtLineBreak::isInvisible(cp); }
+
+// Whether cleanLine would change text[begin, end). A false positive only costs a copy.
+bool needsClean(const char* text, const size_t begin, const size_t end, const bool complete) {
+  size_t p = begin;
+  bool prevSpace = false;
+  bool first = true;
+  while (p < end) {
+    uint32_t cp = 0;
+    const size_t n = decodeAt(text, p, end, cp);
+    if (TxtLineBreak::isInvisible(cp)) return true;
+    const bool space = TxtLineBreak::isSpaceLike(cp);
+    if (space) {
+      if (first) return true;
+      if (cp != ' ' && cp != 0x00A0 && cp != 0x3000) return true;
+      if (prevSpace) return true;
+    }
+    first = false;
+    prevSpace = space;
+    p += n;
+  }
+  return prevSpace && complete;
+}
+
+// `end` of text[begin, end) without its trailing whitespace and invisible characters.
+size_t trimTrailing(const char* text, const size_t begin, size_t end) {
+  while (end > begin) {
+    size_t q = end - 1;
+    while (q > begin && (static_cast<uint8_t>(text[q]) & 0xC0) == 0x80) q--;
+    uint32_t cp = 0;
+    if (decodeAt(text, q, end, cp) != end - q || !isClutter(cp)) break;
+    end = q;
+  }
+  return end;
+}
+
+// Display copy of one CJK line. A cleaned line is never longer than its source (a run becomes one character no
+// longer than the run, an invisible character vanishes), so one allocation of the line's length serves it, and the
+// scratch is only ever allocated for a line that needs cleaning: at most PAGE_INPUT_BYTES + 1 text bytes and
+// 2 * (PAGE_INPUT_BYTES + 1) offset bytes (24 KiB) per page, nothing for clean text. When the allocation fails
+// the line is simply shown as it is.
+static_assert(PAGE_INPUT_BYTES < 0x10000, "source offsets are 16-bit");
+struct CleanScratch {
+  std::unique_ptr<char[]> text;
+  std::unique_ptr<uint16_t[]> source;  // source[i]: offset from the line start of the code point behind text[i]
+  size_t capacity = 0;
+  size_t size = 0;
+
+  bool reserve(const size_t length) {
+    if (capacity > length) return true;
+    auto newText = makeUniqueNoThrow<char[]>(length + 1);
+    auto newSource = makeUniqueNoThrow<uint16_t[]>(length + 1);
+    if (!newText || !newSource) return false;
+    text = std::move(newText);
+    source = std::move(newSource);
+    capacity = length + 1;
+    return true;
+  }
+};
+
+// The line text[begin, end) as it is displayed, in `s` (NUL-terminated, source[size] = the line length). Rules:
+//  - invisible characters (BOM, zero-width space) are dropped;
+//  - a run of whitespace becomes one character: a plain space, or the run's first NBSP/ideographic space when
+//    it holds nothing else;
+//  - whitespace leading the line and whitespace ending a complete line is dropped.
+void cleanLine(const char* text, const size_t begin, const size_t end, const bool complete, CleanScratch& s) {
+  s.size = 0;
+  const auto put = [&](const char* bytes, const size_t count, const size_t at) {
+    for (size_t i = 0; i < count; i++) {
+      s.text[s.size] = bytes[i];
+      s.source[s.size++] = static_cast<uint16_t>(at - begin);
+    }
+  };
+  size_t p = begin;
+  bool leading = true;
+  while (p < end) {
+    uint32_t cp = 0;
+    const size_t n = decodeAt(text, p, end, cp);
+    if (!isClutter(cp)) {
+      put(text + p, n, p);
+      leading = false;
+      p += n;
+      continue;
+    }
+    size_t q = p;
+    bool plain = false;
+    size_t keepAt = 0;
+    size_t keepLength = 0;
+    while (q < end) {
+      uint32_t c = 0;
+      const size_t m = decodeAt(text, q, end, c);
+      if (!isClutter(c)) break;
+      if (TxtLineBreak::isAsciiSpace(c)) {
+        plain = true;
+      } else if (TxtLineBreak::isSpaceLike(c) && keepLength == 0) {
+        keepAt = q;
+        keepLength = m;
+      }
+      q += m;
+    }
+    if (plain || keepLength > 0) {
+      const bool atEnd = q >= end;
+      bool drop = leading || (atEnd && complete);
+      if (!drop) {
+        if (plain) {
+          put(" ", 1, p);
+        } else {
+          put(text + keepAt, keepLength, keepAt);
+        }
+      }
+      leading = false;
+    }
+    p = q;
+  }
+  s.source[s.size] = static_cast<uint16_t>(end - begin);
+  s.text[s.size] = '\0';
+}
+
 }  // namespace
 
 int layoutPage(char* text, const size_t length, const size_t pageOffset, const size_t fileSize, const bool startsLine,
@@ -213,7 +333,7 @@ int layoutPage(char* text, const size_t length, const size_t pageOffset, const s
   const bool atEof = pageOffset + length >= fileSize;
   // Bytes of a code point the window cut in half belong to the next page.
   const size_t decodable = atEof ? length : TxtLineBreak::completePrefix(text, length);
-  const Breaker breaker(text, length, layout.measure);
+  CleanScratch scratch;
 
   int lineCount = 0;
   size_t pos = 0;
@@ -223,8 +343,8 @@ int layoutPage(char* text, const size_t length, const size_t pageOffset, const s
     return -1;
   };
 
-  const auto emit = [&](const size_t start, const size_t spanLength, const int indent) {
-    if (sink) sink->line(sink->ctx, text + start, spanLength, indent);
+  const auto emit = [&](const char* buffer, const size_t start, const size_t spanLength, const int indent) {
+    if (sink) sink->line(sink->ctx, buffer + start, spanLength, indent);
     lineCount++;
   };
 
@@ -249,31 +369,50 @@ int layoutPage(char* text, const size_t length, const size_t pageOffset, const s
       paragraphs->paragraph(paragraphs->ctx, pageOffset + pos, text + pos, contentEnd - pos);
     }
 
-    size_t cur = pos;  // start of the unconsumed remainder of this physical line
-    if (layout.cjkParagraphs && paragraphStart) {
-      while (cur < contentEnd) {
+    // The line laid out below: the source bytes, or (CJK paragraph style) a
+    // cleaned copy of them whose indices sourceAt maps back to source offsets.
+    char* buf = text;
+    size_t bufLength = length;
+    size_t begin = pos;  // the line as displayed starts here: CJK style drops leading whitespace
+    size_t end = contentEnd;
+    if (layout.cjkParagraphs) {
+      while (begin < end) {
         uint32_t cp = 0;
-        const size_t n = decodeAt(text, cur, contentEnd, cp);
-        if (!TxtLineBreak::isParagraphIndentSpace(cp)) break;
-        cur += n;
+        const size_t n = decodeAt(text, begin, end, cp);
+        if (!isClutter(cp)) break;
+        begin += n;
       }
-      if (cur == contentEnd) {
-        // A blank line separates nothing the indent does not already mark: it takes no display line.
-        if (!complete) {
-          pos = cur;
-          break;
-        }
-        pos = lineEnd + 1;
-        continue;
+      if (complete) end = trimTrailing(text, begin, end);
+    }
+    size_t cur = begin;  // start of the unconsumed remainder of this physical line
+    size_t limit = end;
+    const bool cleaned = layout.cjkParagraphs && needsClean(text, begin, end, complete) && scratch.reserve(end - begin);
+    if (cleaned) {
+      cleanLine(text, begin, end, complete, scratch);
+      buf = scratch.text.get();
+      bufLength = scratch.size;
+      cur = 0;
+      limit = bufLength;
+    }
+    const auto sourceAt = [&](const size_t index) { return cleaned ? begin + scratch.source[index] : index; };
+    const Breaker breaker(buf, bufLength, layout.measure);
+
+    if (layout.cjkParagraphs && paragraphStart && cur == limit) {
+      // A blank line separates nothing the indent does not already mark: it takes no display line.
+      if (!complete) {
+        pos = sourceAt(cur);
+        break;
       }
+      pos = lineEnd + 1;
+      continue;
     }
 
-    if (cur == contentEnd) {
+    if (cur == limit) {
       // An empty physical line is one blank display line; the empty rest of a
       // line the previous page ended at its window edge is nothing.
-      if (paragraphStart) emit(cur, 0, 0);
+      if (paragraphStart) emit(buf, cur, 0, 0);
       if (!complete) {
-        pos = cur;
+        pos = sourceAt(cur);
         break;
       }
       pos = lineEnd + 1;
@@ -283,10 +422,10 @@ int layoutPage(char* text, const size_t length, const size_t pageOffset, const s
 
     bool firstLine = paragraphStart;
     bool deferred = false;
-    while (cur < contentEnd && lineCount < layout.linesPerPage) {
+    while (cur < limit && lineCount < layout.linesPerPage) {
       if (yieldRequested(layout.measure)) return interrupted();
       const int indent = layout.cjkParagraphs && firstLine ? layout.firstLineIndent : 0;
-      LineBreak line = breaker.breakLine(cur, contentEnd, complete, layout.viewportWidth - indent);
+      LineBreak line = breaker.breakLine(cur, limit, complete, layout.viewportWidth - indent);
       if (line.interrupted || yieldRequested(layout.measure)) return interrupted();
       if (!line.determined) {
         // The window ends before this line does: the next page lays it out
@@ -295,18 +434,26 @@ int layoutPage(char* text, const size_t length, const size_t pageOffset, const s
           deferred = true;
           break;
         }
-        line = {contentEnd, contentEnd, true};
+        line = {limit, limit, true};
       }
-      emit(cur, line.end - cur, indent);
+      emit(buf, cur, line.end - cur, indent);
       firstLine = false;
       cur = line.next;
+      // A continued line never starts with whitespace: the break that fell before a run of NBSP/ideographic
+      // spaces (the only whitespace a cleaned line keeps) leaves it at the start of the next line, so drop it here.
+      while (layout.cjkParagraphs && cur < limit) {
+        uint32_t cp = 0;
+        const size_t n = decodeAt(buf, cur, limit, cp);
+        if (!TxtLineBreak::isSpaceLike(cp)) break;
+        cur += n;
+      }
     }
 
-    if (!deferred && cur >= contentEnd && complete) {
+    if (!deferred && cur >= limit && complete) {
       pos = lineEnd + 1;
       paragraphStart = true;
     } else {
-      pos = cur;
+      pos = sourceAt(cur);
       break;
     }
   }

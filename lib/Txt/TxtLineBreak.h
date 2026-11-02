@@ -261,6 +261,23 @@ inline bool isParagraphIndentSpace(const uint32_t cp) {
   return cp == ' ' || cp == '\t' || cp == 0x00A0 || cp == 0x3000 || cp == 0xFEFF;
 }
 
+// CJK paragraph style whitespace (PageLayout::cjkParagraphs). Characters a font
+// draws as a replacement glyph or as a stray gap are normalised in layout only:
+//  - isInvisible: byte-order mark, zero-width space, word joiner: dropped.
+//  - isAsciiSpace: ASCII space, C0 controls other than '\n' (tab, a stray '\r',
+//    form feed ...), DEL and the Unicode spaces U+2000-200A, 202F, 205F: one
+//    plain space per run.
+//  - NBSP and the ideographic space U+3000 are real spacing: a run of them is
+//    collapsed to one, never dropped except at a line edge.
+inline bool isInvisible(const uint32_t cp) { return cp == 0xFEFF || cp == 0x200B || cp == 0x2060; }
+
+inline bool isAsciiSpace(const uint32_t cp) {
+  return cp == ' ' || (cp < 0x20 && cp != '\n') || cp == 0x7F || (cp >= 0x2000 && cp <= 0x200A) || cp == 0x202F ||
+         cp == 0x205F;
+}
+
+inline bool isSpaceLike(const uint32_t cp) { return isAsciiSpace(cp) || cp == 0x00A0 || cp == 0x3000; }
+
 // Whether a book sample is CJK-dominant, so its paragraphs get the CJK style
 // (stripped leading whitespace, two-em first-line indent, no blank lines).
 inline bool isCjkDominant(const char* text, const size_t length) {

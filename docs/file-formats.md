@@ -4,6 +4,18 @@ These formats describe the SD-card cache files under `/.crosspoint/epub_<hash>/`
 All POD fields are written in the ESP32 little-endian representation used by
 `Serialization.h`; strings are length-prefixed UTF-8.
 
+The EPUB cache key is `std::hash<std::string>` of the original document path.
+Native EPUB callers use that same path whether they supply it explicitly or let
+the constructor default it; converted documents retain their original source
+path rather than the temporary EPUB path. Reader, Home, sleep-cover and per-book
+cache clearing must therefore resolve the same directory.
+
+Per-book clearing removes only the selected book's cache directory. Older
+firmware could incorrectly share the empty-path hash among two-argument EPUB
+callers. That directory is not migrated or deleted by this operation: its
+contents cannot be attributed reliably to a particular book. Any separate
+cleanup must first confirm that no retained cache references still use it.
+
 ## `book.bin`
 
 ### Version 10
@@ -89,6 +101,19 @@ if (parsedSize != fileSize) {
 ```
 
 ## `section.bin`
+
+### Version 50
+
+The serialized layout is unchanged. Cached pages are rebuilt because justification
+expansion is bounded, line-breaking whitespace handling is corrected, and `<br>`
+continues the same paragraph without adding the user's paragraph gap or clearing
+its text style. Ordinary HTML whitespace collapses across inline nodes; explicit
+nonbreaking spaces remain preserved.
+
+### Version 49
+
+Book-style paragraphs without an explicit alignment fall back to left alignment
+instead of justification. The serialized layout is unchanged.
 
 ### Version 48
 
@@ -200,7 +225,7 @@ import std.mem;
 import std.string;
 import std.core;
 
-#define EXPECTED_VERSION 48
+#define EXPECTED_VERSION 50
 #define MAX_STRING_LENGTH 65535
 #define FOOTNOTE_NUMBER_LEN 32
 #define FOOTNOTE_HREF_LEN 256

@@ -37,7 +37,7 @@ inline constexpr uint32_t FORMAT_MAGIC = 0x54585449;
 inline constexpr uint8_t FORMAT_VERSION = 4;
 inline constexpr size_t HEADER_BYTES = 52;
 // Bumped whenever line breaking or paragraph style moves page starts, so every book is paginated once more.
-inline constexpr uint32_t LAYOUT_REVISION = 2;
+inline constexpr uint32_t LAYOUT_REVISION = 3;
 inline constexpr uint8_t LAYOUT_CJK_PARAGRAPHS = 0x01;
 
 // The version 3 index written by earlier firmware: magic, u8 version 3, u32 file size, five layout fields, u32
