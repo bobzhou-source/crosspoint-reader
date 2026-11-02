@@ -62,11 +62,17 @@ struct BlockStyle {
     return result;
   }
 
-  // Return a copy with bottom margins/padding collapsed (max) with the source's.
-  // Uses CSS margin collapsing: adjacent parent-child margins resolve to the larger value.
+  // CSS 2.1 §8.3.1 margin collapsing for two adjoining vertical margins: the largest positive
+  // margin plus the most negative one. 4em and -1.1em collapse to 2.9em; two negatives keep the
+  // more negative. A negative result never pulls content up at layout time.
+  [[nodiscard]] static int16_t collapseMargins(const int16_t a, const int16_t b) {
+    return static_cast<int16_t>(std::max({a, b, int16_t{0}}) + std::min({a, b, int16_t{0}}));
+  }
+
+  // Return a copy with bottom margins collapsed with the source's and bottom padding added.
   [[nodiscard]] BlockStyle addBottom(const BlockStyle& source) const {
     BlockStyle result = *this;
-    result.marginBottom = std::max(marginBottom, source.marginBottom);
+    result.marginBottom = collapseMargins(marginBottom, source.marginBottom);
     result.paddingBottom = static_cast<int16_t>(paddingBottom + source.paddingBottom);
     return result;
   }
@@ -95,8 +101,8 @@ struct BlockStyle {
         result.textAlignDefined = true;
       }
     } else {
-      result.marginTop = std::max(child.marginTop, marginTop);
-      result.marginBottom = std::max(child.marginBottom, marginBottom);
+      result.marginTop = collapseMargins(child.marginTop, marginTop);
+      result.marginBottom = collapseMargins(child.marginBottom, marginBottom);
       result.paddingTop = static_cast<int16_t>(child.paddingTop + paddingTop);
       result.paddingBottom = static_cast<int16_t>(child.paddingBottom + paddingBottom);
     }

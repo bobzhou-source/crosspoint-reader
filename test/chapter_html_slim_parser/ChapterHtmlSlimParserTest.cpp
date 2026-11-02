@@ -613,3 +613,63 @@ TEST_F(ChapterHtmlSlimParserTest, InFlowInlineElementsKeepTheirSourceSpace) {
   EXPECT_STREQ(second->wordText(1), "x");
   EXPECT_STREQ(second->wordText(2), "y");
 }
+
+TEST(BlockStyleMarginCollapse, PositiveMarginsResolveToTheLarger) {
+  EXPECT_EQ(BlockStyle::collapseMargins(20, 40), 40);
+  EXPECT_EQ(BlockStyle::collapseMargins(40, 20), 40);
+  EXPECT_EQ(BlockStyle::collapseMargins(0, 40), 40);
+}
+
+TEST(BlockStyleMarginCollapse, PositiveAndNegativeMarginsAreSummed) {
+  EXPECT_EQ(BlockStyle::collapseMargins(64, -18), 46);
+  EXPECT_EQ(BlockStyle::collapseMargins(-18, 64), 46);
+  EXPECT_EQ(BlockStyle::collapseMargins(10, -18), -8);
+  EXPECT_EQ(BlockStyle::collapseMargins(0, -18), -18);
+}
+
+TEST(BlockStyleMarginCollapse, NegativeMarginsResolveToTheMostNegative) {
+  EXPECT_EQ(BlockStyle::collapseMargins(-18, -10), -18);
+  EXPECT_EQ(BlockStyle::collapseMargins(-10, -18), -18);
+}
+
+TEST(BlockStyleMarginCollapse, VerticalCombineAndAddBottomKeepNegativeMargins) {
+  BlockStyle spacer;
+  spacer.marginTop = -18;
+  spacer.paddingTop = 19;
+  spacer.marginBottom = 6;
+  spacer.marginLeft = 7;
+  BlockStyle paragraph;
+  paragraph.marginTop = 64;
+  paragraph.paddingTop = 2;
+  paragraph.marginBottom = -4;
+  paragraph.marginLeft = 3;
+  const auto merged = spacer.getCombinedBlockStyle(paragraph, BlockStyle::CombineAxis::Vertical);
+  EXPECT_EQ(merged.marginTop, 46);
+  EXPECT_EQ(merged.paddingTop, 21);
+  EXPECT_EQ(merged.marginBottom, 2);
+  EXPECT_EQ(merged.marginLeft, 3);  // the other axis is the child's, unchanged
+
+  BlockStyle closing;
+  closing.marginBottom = -9;
+  closing.paddingBottom = 5;
+  const auto closed = merged.addBottom(closing);
+  EXPECT_EQ(closed.marginBottom, -7);
+  EXPECT_EQ(closed.paddingBottom, 5);
+  EXPECT_EQ(paragraph.addBottom(closing).marginBottom, -9);
+}
+
+TEST_F(ChapterHtmlSlimParserTest, EmptySpacerMarginCollapsesWithTheNextParagraph) {
+  // Line height is 16 px. Gap = 16 + collapsed margin (only if positive) + spacer padding 12.
+  const auto gapAfterSpacer = [&](const char* spacerMarginTop, const char* paragraphMarginTop) {
+    const auto pages = parseMarkup(std::string("<p style=\"text-indent:0;margin:0\">Alpha</p>"
+                                               "<div style=\"margin:0;padding-top:12px;margin-top:") +
+                                   spacerMarginTop + "\"></div><p style=\"text-indent:0;margin:0;margin-top:" +
+                                   paragraphMarginTop + "\">Beta</p>");
+    const auto rendered = lines(pages);
+    EXPECT_EQ(rendered.size(), 2u);
+    return rendered.size() == 2u ? rendered[1]->yPos - rendered[0]->yPos : -1;
+  };
+  EXPECT_EQ(gapAfterSpacer("20px", "40px"), 16 + 40 + 12);   // pos/pos: the larger margin
+  EXPECT_EQ(gapAfterSpacer("-10px", "40px"), 16 + 30 + 12);  // pos/neg: summed (was 16 + 40 + 12)
+  EXPECT_EQ(gapAfterSpacer("-10px", "-4px"), 16 + 12);       // neg/neg: negative, adds nothing
+}

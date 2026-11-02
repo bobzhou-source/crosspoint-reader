@@ -1155,7 +1155,8 @@ void XMLCALL ChapterHtmlSlimParser::startElement(void* userData, const XML_Char*
                 int16_t imageMarginBottom = 0;
                 if (self->currentTextBlock && self->currentTextBlock->isEmpty()) {
                   const auto& bs = self->currentTextBlock->getBlockStyle();
-                  imageMarginTop = bs.topInset();
+                  // Same rule as text lines: a negative collapsed margin never pulls content up.
+                  imageMarginTop = static_cast<int16_t>(std::max<int16_t>(bs.marginTop, 0) + bs.paddingTop);
                   if (self->blockStyleStack.size() > 1) {
                     imageMarginBottom = self->blockStyleStack.back().bottomInset();
                   }
