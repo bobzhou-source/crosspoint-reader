@@ -102,6 +102,16 @@ if (parsedSize != fileSize) {
 
 ## `section.bin`
 
+### Version 52
+
+The serialized layout is unchanged. Cached pages are rebuilt because adjoining
+vertical margins (an empty container merged into the block that follows it, and a
+closing element's bottom margin) now collapse the way CSS does: the largest
+positive margin plus the most negative one. A spacer such as
+`<div style="margin-top:-1.1em;padding-top:1.2em"></div>` followed by a paragraph
+with `margin-top:4em` now gives 2.9em of margin plus 1.2em of padding (it used to
+keep only the 4em). A negative result still never moves content upward.
+
 ### Version 51
 
 The serialized layout is unchanged. Cached pages are rebuilt because EPUB
