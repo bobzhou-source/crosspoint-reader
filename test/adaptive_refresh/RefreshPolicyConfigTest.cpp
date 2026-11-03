@@ -37,6 +37,7 @@ TEST(RefreshPolicyConfig, CompiledDefaultsAreThePublishedPolicyConstants) {
   EXPECT_EQ(kCompiled.weightGrayscaleImageExtraPermille, 500u);
   EXPECT_EQ(kCompiled.frameChargePermille, 0u);
   EXPECT_TRUE(kCompiled.clearAfterImage);
+  EXPECT_FALSE(kCompiled.imageClearRegion) << "region clears are opt-in; off is the rc9.2.2 rule";
   EXPECT_EQ(kCompiled.imageWaveform, AdaptiveRefreshPolicy::ImageWaveform::Quality);
 }
 
@@ -87,6 +88,26 @@ TEST(RefreshPolicyConfig, ImageKeysTakeOnlyTheirOwnTypes) {
   expectRejected(R"({"schema":1,"image_waveform":1})", "not quality/fast: image_waveform");
   expectRejected(R"({"schema":1,"image_waveform":true})", "not quality/fast: image_waveform");
   expectRejected(R"({"schema":1,"clear_after_image":false,"image_waveform":"fastest"})", "image_waveform");
+}
+
+TEST(RefreshPolicyConfig, ImageClearRegionIsAnOptInBool) {
+  const State on = parseText(R"({"schema":1,"policy":"adaptive-content-v2","image_clear_region":true})");
+  EXPECT_EQ(on.source, Source::File);
+  Config expected;
+  expected.imageClearRegion = true;
+  EXPECT_EQ(on.config, expected) << "the region key must leave every other tunable compiled";
+
+  const State off = parseText(R"({"schema":1,"image_clear_region":false})");
+  EXPECT_EQ(off.source, Source::File);
+  EXPECT_EQ(off.config, kCompiled);
+
+  const State both = parseText(R"({"schema":1,"clear_after_image":false,"image_clear_region":true})");
+  EXPECT_FALSE(both.config.clearAfterImage);
+  EXPECT_TRUE(both.config.imageClearRegion);
+
+  expectRejected(R"({"schema":1,"image_clear_region":1})", "not a bool: image_clear_region");
+  expectRejected(R"({"schema":1,"image_clear_region":"true"})", "not a bool: image_clear_region");
+  expectRejected(R"({"schema":1,"image_clear_region":null})", "not a bool: image_clear_region");
 }
 
 TEST(RefreshPolicyConfig, MissingTunablesKeepDefaultsAndNightFollowsDay) {

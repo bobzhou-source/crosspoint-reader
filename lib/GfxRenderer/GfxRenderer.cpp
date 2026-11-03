@@ -2314,6 +2314,13 @@ bool GfxRenderer::displayGrayscaleBase(HalDisplay::GrayscaleMode mode, HalDispla
   return true;
 }
 
+bool GfxRenderer::prepareRegionClear() const { return display.prepareRegionClear(); }
+
+bool GfxRenderer::clearRegion(const int x, const int y, const int w, const int h) const {
+  const AlignedMemRect rect = screenRectToAlignedMemRect(orientation, x, y, w, h, panelWidth, panelHeight);
+  return rect.valid && display.clearRegion(rect.x, rect.y, rect.w, rect.h);
+}
+
 void GfxRenderer::preconditionGrayscale() const { display.preconditionGrayscale(); }
 
 void GfxRenderer::preconditionGrayscale(int x, int y, int w, int h) const {

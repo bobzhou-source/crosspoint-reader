@@ -22,7 +22,8 @@
 //   2. run the physical refresh with the returned mode (or whatever promotion
 //      actually applies - manual/popup/inversion promotions are real clears).
 //   3. commit(actual)   once, only if that refresh really reached the panel.
-//                       Pass Clear whenever the hardware ran HALF or FULL.
+//                       Pass Clear whenever the hardware ran HALF or FULL,
+//                       Region when a fast frame plus its windowed clear ran.
 //      Not committing (display failed/aborted) leaves all state untouched: the
 //      panel still shows the previous frame.
 // Frames whose refresh mode is dictated elsewhere (overlays, menus) that should
@@ -30,7 +31,10 @@
 class AdaptiveRefreshPolicy {
  public:
   // Clear maps to the app's HALF refresh (FULL stays a manual/GfxRenderer promotion).
-  enum class Refresh : uint8_t { Fast, Clear };
+  // Region: the frame is drawn fast, then a clearing waveform runs over
+  // Decision::region only (Config::imageClearRegion). Returned only to callers
+  // that set Inputs::regionClearAvailable.
+  enum class Refresh : uint8_t { Fast, Clear, Region };
 
   enum class Reason : uint8_t {
     None,            // Fast: debt is within budget
@@ -46,6 +50,29 @@ class AdaptiveRefreshPolicy {
   // Who asked for a Requested/External clear. Bookkeeping for the usage log
   // only; it never changes a decision. Manual outranks every other source.
   enum class ClearSource : uint8_t { None, Other, Image, Popup, External, Manual };
+
+  // Logical screen rectangle (the renderer's coordinates). No member
+  // initializers (the class uses Rect{} inside its own definition); Rect{}
+  // is the empty rect.
+  struct Rect {
+    int16_t x;
+    int16_t y;
+    int16_t w;
+    int16_t h;
+    bool empty() const { return w <= 0 || h <= 0; }
+    bool operator==(const Rect&) const = default;
+  };
+
+  // Why a picture clear in region mode covered the whole screen. Persisted in
+  // benchmark rows: append only.
+  enum class RegionFallback : uint8_t {
+    None,         // not region mode, or the region clear ran
+    Unknown,      // a picture page did not say where its pictures were
+    OffScreen,    // the pictures' area is empty once clamped to the screen
+    TooLarge,     // the area exceeds kRegionMaxPermille of the screen
+    Unavailable,  // the panel cannot run a windowed clear right now
+    Overruled     // a stronger reason (debt, safety cap, polarity, ...) needs the whole screen
+  };
 
   struct Inputs {
     freeink::FrameChangeMetrics frame;
@@ -63,11 +90,19 @@ class AdaptiveRefreshPolicy {
     // The queued renderer promotion came from a user's refresh command (the
     // control center's refresh tile). Only labels the clear; see ClearRecord.
     bool externalManual = false;
+    // The renderer can run a windowed clear after this frame
+    // (GfxRenderer::prepareRegionClear() succeeded). Only read with
+    // Config::imageClearRegion; leave false everywhere else.
+    bool regionClearAvailable = false;
+    // Logical screen size, to clamp the pictures' area.
+    uint16_t screenWidth = 0;
+    uint16_t screenHeight = 0;
   };
 
   struct Decision {
     Refresh refresh;
     Reason reason;
+    Rect region{};  // Refresh::Region only: the logical rect to clear
   };
 
   // One committed clear, for the benchmark recorder's refresh rows. Counts
@@ -83,9 +118,15 @@ class AdaptiveRefreshPolicy {
     bool inverted = false;
     bool image = false;      // the clearing frame itself has a page image
     bool grayscale = false;  // the clearing frame itself has a visible grayscale pass
+    // A region clear: only `region` was cleared and the counts above carry on
+    // to the next full clear (it does not end the debt window).
+    bool regionOnly = false;
+    RegionFallback regionFallback = RegionFallback::None;
+    Rect region{};
     bool manual() const { return source == ClearSource::Manual; }
   };
-  // Called from commit(Clear) only; never on a fast refresh. No I/O expected.
+  // Called from commit(Clear) and commit(Region) only; never on a fast
+  // refresh. No I/O expected.
   using ClearObserver = void (*)(void* context, const ClearRecord& record);
 
   // --- Identity: bump BOTH whenever a threshold, weight or rule below changes, so
@@ -116,6 +157,12 @@ class AdaptiveRefreshPolicy {
   // is charged like any other frame (the image weights above) and the clear
   // waits for the debt threshold.
   static constexpr bool kClearAfterImage = true;
+  // Region mode (only with clearAfterImage): the clear after a picture page
+  // runs over the union of the pictures' rects instead of the whole screen,
+  // unless that union exceeds this share of the screen. Text debt, the safety
+  // cap and every other clear reason still clear the whole screen.
+  static constexpr bool kImageClearRegion = false;
+  static constexpr uint32_t kRegionMaxPermille = 600;
 
   // How EPUB picture pages are drawn on panels with absolute grayscale planes
   // (UC8279). Quality: absolute four-grey planes on the quality waveform,
@@ -138,6 +185,7 @@ class AdaptiveRefreshPolicy {
     uint32_t frameChargePermille = kFrameChargePermille;
     bool clearAfterImage = kClearAfterImage;
     ImageWaveform imageWaveform = kImageWaveform;
+    bool imageClearRegion = kImageClearRegion;
 
     bool operator==(const Config&) const = default;
   };
@@ -168,7 +216,18 @@ class AdaptiveRefreshPolicy {
   // picture's charge stays in the debt; when the picture page was itself the
   // clear, its greys were laid down after the clearing base, so its charge
   // opens the new budget instead of vanishing with the cleared debt.
-  void imagePageShown();
+  // `pictures` is the logical rect the page's pictures cover; empty means
+  // unknown (region mode then clears the whole screen). Rects of picture
+  // pages shown before the clear runs accumulate.
+  void imagePageShown(Rect pictures = {});
+
+  // The next decide() may answer Region: the pending clear is the picture
+  // clear and region mode is on. Ask the renderer to prepare a windowed
+  // clear (and set Inputs::regionClearAvailable) only then.
+  bool regionClearWanted() const {
+    return config_.imageClearRegion && config_.clearAfterImage && !initialClear_ && clearRequested_ &&
+           clearSource_ == ClearSource::Image;
+  }
 
   // The previous frame's ink is unknown (frames the policy never saw, buffer
   // lend/return). The fallback estimate then assumes the previous frame had the
@@ -199,6 +258,7 @@ class AdaptiveRefreshPolicy {
  private:
   uint32_t chargeFor(const Inputs& in) const;
   ClearRecord labelFor(const Inputs& in, Reason reason) const;
+  RegionFallback regionFor(const Inputs& in, Rect& region) const;
 
   Config config_;
   uint32_t debt_ = 0;            // weighted changed pixels since the last clear (saturating)
@@ -220,4 +280,8 @@ class AdaptiveRefreshPolicy {
   ClearSource clearSource_ = ClearSource::None;
   uint16_t imagePages_ = 0;
   uint16_t grayPages_ = 0;
+
+  // Region mode: union of the rects of picture pages since the last clear.
+  Rect imageRegion_{};
+  bool imageRegionUnknown_ = false;
 };

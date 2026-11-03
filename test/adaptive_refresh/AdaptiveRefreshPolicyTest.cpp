@@ -1,6 +1,7 @@
 #include <gtest/gtest.h>
 
 #include <cstdint>
+#include <vector>
 
 #include "AdaptiveRefreshPolicy.h"
 
@@ -471,4 +472,274 @@ TEST(AdaptiveRefreshPolicyImages, PictureChargeFollowsTheImageWeights) {
   (void)step(p, readerPage(100, true));
   p.imagePageShown();
   EXPECT_EQ(p.debtPixels(), 125u) << "image weights 0: a picture page costs like an AA text page";
+}
+
+namespace {
+
+using Rect = Policy::Rect;
+using Fallback = Policy::RegionFallback;
+using Source = Policy::ClearSource;
+
+constexpr uint16_t kScreenW = 480;  // the X4 in portrait, logical pixels
+constexpr uint16_t kScreenH = 800;
+
+Policy::Config regionMode() {
+  Policy::Config config;
+  config.imageClearRegion = true;
+  return config;
+}
+
+// A reader turn as EpubReaderActivity asks it: the windowed clear is prepared
+// only when the policy wants it and the panel agrees (`panelReady`).
+Policy::Inputs regionPage(const Policy& p, uint32_t changed, bool picture, bool panelReady = true) {
+  auto in = readerPage(changed, picture);
+  in.screenWidth = kScreenW;
+  in.screenHeight = kScreenH;
+  in.regionClearAvailable = p.regionClearWanted() && panelReady;
+  return in;
+}
+
+struct Records {
+  std::vector<Policy::ClearRecord> rows;
+  static void observe(void* context, const Policy::ClearRecord& record) {
+    static_cast<Records*>(context)->rows.push_back(record);
+  }
+};
+
+// A picture page showing `pictures`, then the decision for the text page after it.
+Policy::Decision afterPicture(Policy& p, const Rect pictures, const bool panelReady = true) {
+  (void)step(p, regionPage(p, 100, true));
+  p.imagePageShown(pictures);
+  return p.decide(regionPage(p, 100, false, panelReady));
+}
+
+// The full-screen fallback of the picture clear, as the benchmark row reports it.
+Fallback fallbackAfterPicture(const Rect pictures, const bool panelReady = true) {
+  Policy p(false, regionMode());
+  Records records;
+  p.setClearObserver(&Records::observe, &records);
+  const auto decision = afterPicture(p, pictures, panelReady);
+  EXPECT_EQ(decision.refresh, Refresh::Clear);
+  EXPECT_EQ(decision.reason, Reason::Requested);
+  p.commit(decision.refresh);
+  EXPECT_EQ(p.debtPixels(), 0u) << "a full clear ends the debt window";
+  EXPECT_EQ(records.rows.size(), 1u);
+  if (records.rows.empty()) return Fallback::None;
+  EXPECT_FALSE(records.rows[0].regionOnly);
+  return records.rows[0].regionFallback;
+}
+
+bool sameRecord(const Policy::ClearRecord& a, const Policy::ClearRecord& b) {
+  return a.reason == b.reason && a.source == b.source && a.fastTurns == b.fastTurns && a.imagePages == b.imagePages &&
+         a.grayPages == b.grayPages && a.debtPermille == b.debtPermille && a.thresholdPermille == b.thresholdPermille &&
+         a.image == b.image && a.grayscale == b.grayscale && a.regionOnly == b.regionOnly &&
+         a.regionFallback == b.regionFallback && a.region == b.region;
+}
+
+}  // namespace
+
+TEST(AdaptiveRefreshPolicyRegion, TheClearAfterAPictureCoversOnlyThePicture) {
+  Policy p(false, regionMode());
+  Records records;
+  p.setClearObserver(&Records::observe, &records);
+  const Rect picture{40, 120, 400, 300};
+  const auto decision = afterPicture(p, picture);
+  EXPECT_EQ(decision.refresh, Refresh::Region);
+  EXPECT_EQ(decision.reason, Reason::Requested);
+  EXPECT_EQ(decision.region, picture);
+  p.commit(decision.refresh);
+  ASSERT_EQ(records.rows.size(), 1u);
+  const auto& row = records.rows[0];
+  EXPECT_TRUE(row.regionOnly);
+  EXPECT_EQ(row.region, picture);
+  EXPECT_EQ(row.regionFallback, Fallback::None);
+  EXPECT_EQ(row.source, Source::Image);
+  EXPECT_EQ(row.fastTurns, 1u) << "the picture page";
+  EXPECT_EQ(row.imagePages, 1u);
+  EXPECT_FALSE(p.clearPending()) << "the region clear settles the picture clear";
+  EXPECT_FALSE(p.regionClearWanted());
+  EXPECT_EQ(step(p, regionPage(p, 100, false)).refresh, Refresh::Fast);
+}
+
+TEST(AdaptiveRefreshPolicyRegion, OnlyThePictureClearIsOfferedAsARegion) {
+  Policy fresh(true, regionMode());
+  EXPECT_FALSE(fresh.regionClearWanted()) << "the first page clears the whole screen";
+
+  Policy p(false, regionMode());
+  EXPECT_FALSE(p.regionClearWanted()) << "nothing pending";
+  (void)step(p, regionPage(p, 100, true));
+  p.imagePageShown({0, 0, 100, 100});
+  EXPECT_TRUE(p.regionClearWanted());
+  p.requestClear(Source::Popup);
+  EXPECT_FALSE(p.regionClearWanted()) << "another reader request needs the whole screen";
+  EXPECT_EQ(p.decide(regionPage(p, 100, false)).refresh, Refresh::Clear);
+
+  Policy manual(false, regionMode());
+  (void)step(manual, regionPage(manual, 100, true));
+  manual.imagePageShown({0, 0, 100, 100});
+  manual.requestClear(Source::Manual);
+  auto in = regionPage(manual, 100, false);
+  in.regionClearAvailable = true;  // even if the caller offers one
+  EXPECT_EQ(manual.decide(in).refresh, Refresh::Clear);
+
+  Policy compiled(false);  // region mode off
+  (void)step(compiled, regionPage(compiled, 100, true));
+  compiled.imagePageShown({0, 0, 100, 100});
+  EXPECT_FALSE(compiled.regionClearWanted());
+  in = regionPage(compiled, 100, false);
+  in.regionClearAvailable = true;
+  EXPECT_EQ(compiled.decide(in).refresh, Refresh::Clear);
+}
+
+TEST(AdaptiveRefreshPolicyRegion, ARegionClearLeavesTheTextDebtWindowOpen) {
+  Policy p(false, regionMode());
+  for (int i = 0; i < 4; ++i) ASSERT_EQ(step(p, regionPage(p, 100, false)).refresh, Refresh::Fast);
+  ASSERT_EQ(p.debtPixels(), 500u);  // 4 AA text pages * 125
+  const auto decision = afterPicture(p, {40, 120, 400, 300});
+  ASSERT_EQ(decision.refresh, Refresh::Region);
+  p.commit(decision.refresh);
+  EXPECT_EQ(p.debtPixels(), 900u) << "500 + the picture page (275) + this text page (125)";
+  EXPECT_EQ(p.fastSinceClear(), 6u);
+  // 900 + 125 * 5 reaches 1500 on the fifth page: four fast turns, then the debt clear.
+  EXPECT_EQ(fastFramesBeforeClear(p, readerPage(100, false)), 4u);
+}
+
+TEST(AdaptiveRefreshPolicyRegion, PicturesShownBeforeTheClearRunsAreUnited) {
+  Policy p(false, regionMode());
+  (void)step(p, regionPage(p, 100, true));
+  p.imagePageShown({40, 100, 200, 150});
+  p.imagePageShown({120, 400, 300, 100});  // a second picture page before the clear ran
+  EXPECT_EQ(p.decide(regionPage(p, 100, false)).region, (Rect{40, 100, 380, 400}));
+
+  // Consecutive picture pages: each page clears its predecessor's pictures only.
+  Policy book(false, regionMode());
+  const Rect first{0, 0, 480, 300};
+  const Rect second{40, 500, 400, 200};
+  (void)step(book, regionPage(book, 100, true));
+  book.imagePageShown(first);
+  const auto onSecond = step(book, regionPage(book, 100, true));
+  ASSERT_EQ(onSecond.refresh, Refresh::Region);
+  EXPECT_EQ(onSecond.region, first);
+  book.imagePageShown(second);
+  EXPECT_EQ(book.decide(regionPage(book, 100, false)).region, second) << "the clear that ran forgets the first";
+}
+
+TEST(AdaptiveRefreshPolicyRegion, TheAreaIsClampedToTheScreen) {
+  Policy p(false, regionMode());
+  EXPECT_EQ(afterPicture(p, {-16, 700, 200, 200}).region, (Rect{0, 700, 184, 100}));
+  EXPECT_EQ(fallbackAfterPicture({480, 0, 100, 100}), Fallback::OffScreen);
+  EXPECT_EQ(fallbackAfterPicture({-200, 10, 200, 100}), Fallback::OffScreen);
+}
+
+TEST(AdaptiveRefreshPolicyRegion, PicturesOverSixtyPercentOfTheScreenClearItAll) {
+  Policy p(false, regionMode());
+  const Rect sixty{0, 0, 480, 480};  // 230400 of 384000 pixels: exactly 60 %
+  const auto decision = afterPicture(p, sixty);
+  EXPECT_EQ(decision.refresh, Refresh::Region);
+  EXPECT_EQ(decision.region, sixty);
+  EXPECT_EQ(fallbackAfterPicture({0, 0, 480, 481}), Fallback::TooLarge);
+  EXPECT_EQ(fallbackAfterPicture({0, 0, 480, 800}), Fallback::TooLarge);
+  // Two small pictures far apart unite into one tall rect.
+  Policy spread(false, regionMode());
+  (void)step(spread, regionPage(spread, 100, true));
+  spread.imagePageShown({0, 0, 480, 100});
+  spread.imagePageShown({0, 700, 480, 100});
+  EXPECT_EQ(spread.decide(regionPage(spread, 100, false)).refresh, Refresh::Clear);
+}
+
+TEST(AdaptiveRefreshPolicyRegion, AnUnknownOrUnavailableRegionClearsTheWholeScreen) {
+  EXPECT_EQ(fallbackAfterPicture({}), Fallback::Unknown);
+  EXPECT_EQ(fallbackAfterPicture({40, 120, 400, 300}, /*panelReady=*/false), Fallback::Unavailable);
+
+  Policy p(false, regionMode());
+  (void)step(p, regionPage(p, 100, true));
+  p.imagePageShown({40, 120, 100, 100});
+  p.imagePageShown({});  // one page did not say where its pictures were
+  EXPECT_EQ(p.decide(regionPage(p, 100, false)).refresh, Refresh::Clear);
+}
+
+TEST(AdaptiveRefreshPolicyRegion, StrongerReasonsStillClearTheWholeScreen) {
+  // Debt: 9 text pages (1125) + the picture page (275) + the next page (125) reach 1500.
+  Policy debt(false, regionMode());
+  Records records;
+  debt.setClearObserver(&Records::observe, &records);
+  for (int i = 0; i < 9; ++i) ASSERT_EQ(step(debt, regionPage(debt, 100, false)).refresh, Refresh::Fast);
+  const auto atDebt = afterPicture(debt, {40, 120, 100, 100});
+  EXPECT_EQ(atDebt.refresh, Refresh::Clear);
+  debt.commit(atDebt.refresh);
+  ASSERT_EQ(records.rows.size(), 1u);
+  EXPECT_EQ(records.rows[0].regionFallback, Fallback::Overruled);
+  EXPECT_EQ(debt.debtPixels(), 0u);
+
+  // Safety cap: the third fast frame in a row reaches a cap of 3.
+  auto capped = regionMode();
+  capped.safetyCap = 3;
+  Policy cap(false, capped);
+  ASSERT_EQ(step(cap, regionPage(cap, 10, false)).refresh, Refresh::Fast);
+  ASSERT_EQ(step(cap, regionPage(cap, 10, false)).refresh, Refresh::Fast);
+  EXPECT_EQ(afterPicture(cap, {40, 120, 100, 100}).refresh, Refresh::Clear);
+
+  // A renderer promotion (popup close, manual refresh tile) already queued.
+  Policy promoted(false, regionMode());
+  (void)step(promoted, regionPage(promoted, 100, true));
+  promoted.imagePageShown({40, 120, 100, 100});
+  auto in = regionPage(promoted, 100, false);
+  in.externalClearPending = true;
+  EXPECT_EQ(promoted.decide(in).refresh, Refresh::Clear);
+
+  // Night-mode polarity flip and unreadable frames rewrite everything.
+  Policy flipped(false, regionMode());
+  (void)step(flipped, regionPage(flipped, 100, true));
+  flipped.imagePageShown({40, 120, 100, 100});
+  in = regionPage(flipped, 100, false);
+  in.frame.polarityChangePending = true;
+  EXPECT_EQ(flipped.decide(in).refresh, Refresh::Clear);
+  in = regionPage(flipped, 100, false);
+  in.frame.frameValid = false;
+  EXPECT_EQ(flipped.decide(in).refresh, Refresh::Clear);
+}
+
+TEST(AdaptiveRefreshPolicyRegion, RegionModeOffIsTheRc922RuleExactly) {
+  // The key off (compiled) must give rc9.2.2's decisions, reasons, debt and
+  // clear rows on every page, whatever the reader now passes in. With
+  // clear_after_image off the region key has nothing to act on.
+  Policy::Config noClearAfter;
+  noClearAfter.clearAfterImage = false;
+  Policy::Config noClearAfterRegion = noClearAfter;
+  noClearAfterRegion.imageClearRegion = true;
+  const Policy::Config pairs[][2] = {{Policy::Config{}, Policy::Config{}}, {noClearAfter, noClearAfterRegion}};
+  for (const auto& pair : pairs) {
+    Policy rc922(true, pair[0]);
+    Policy candidate(true, pair[1]);
+    Records rc922Rows;
+    Records candidateRows;
+    rc922.setClearObserver(&Records::observe, &rc922Rows);
+    candidate.setClearObserver(&Records::observe, &candidateRows);
+    uint32_t seed = 777;
+    for (int i = 0; i < 600; ++i) {
+      seed = seed * 1103515245u + 12345u;
+      const uint32_t changed = 20 + (seed >> 8) % 600;
+      const bool picture = (seed >> 20) % 5 == 0;
+      const auto plain = readerPage(changed, picture);
+      auto rich = regionPage(candidate, changed, picture);
+      rich.regionClearAvailable = true;  // a reader that always offers a window
+      const auto a = rc922.decide(plain);
+      const auto b = candidate.decide(rich);
+      ASSERT_EQ(a.refresh, b.refresh) << "page " << i;
+      ASSERT_EQ(a.reason, b.reason) << "page " << i;
+      rc922.commit(a.refresh);
+      candidate.commit(b.refresh);
+      if (picture) {
+        rc922.imagePageShown();
+        candidate.imagePageShown({static_cast<int16_t>(seed % 200), static_cast<int16_t>(seed % 500), 200, 200});
+      }
+      ASSERT_EQ(rc922.debtPixels(), candidate.debtPixels()) << "page " << i;
+      ASSERT_EQ(rc922.clearPending(), candidate.clearPending()) << "page " << i;
+    }
+    ASSERT_EQ(rc922Rows.rows.size(), candidateRows.rows.size());
+    EXPECT_GT(rc922Rows.rows.size(), 20u);
+    for (size_t i = 0; i < rc922Rows.rows.size(); ++i) {
+      EXPECT_TRUE(sameRecord(rc922Rows.rows[i], candidateRows.rows[i])) << "clear " << i;
+    }
+  }
 }

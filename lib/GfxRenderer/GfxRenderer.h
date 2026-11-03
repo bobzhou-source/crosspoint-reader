@@ -381,6 +381,13 @@ class GfxRenderer {
   // frame is displayed and before the grayscale planes are written.
   void preconditionGrayscale() const;
   void preconditionGrayscale(int x, int y, int w, int h) const;
+  // Windowed ghost clear. prepareRegionClear() before painting a page that
+  // clearRegion() will follow (false: clear the whole screen as usual).
+  // clearRegion() takes a LOGICAL rect, snaps it outward to the panel's byte
+  // grid and runs the clearing waveform there only, after the page is shown
+  // (absolute grayscale: between the base and the plane writes).
+  bool prepareRegionClear() const;
+  bool clearRegion(int x, int y, int w, int h) const;
   // Display the framebuffer as the base frame for a grayscale overlay that
   // follows (X3: OEM differential base waveform; others: plain display with
   // `fallback`).

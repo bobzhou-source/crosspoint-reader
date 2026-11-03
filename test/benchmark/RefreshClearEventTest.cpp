@@ -107,7 +107,48 @@ TEST(RefreshClearRows, DebtClearCarriesTurnsDebtPicturesAndThreshold) {
   EXPECT_EQ(row.data[7], 1500u);
   EXPECT_EQ(encode(row),
             "{\"event\":\"refresh_clear\",\"seq\":1,\"start_us\":2000,\"end_us\":2000,\"duration_us\":0,"
-            "\"data\":[2,3,1625,1,1,0,1592594996,1500]}\n");
+            "\"data\":[2,3,1625,1,1,0,1592594996,1500],\"region\":[0,0,0,0]}\n");
+}
+
+TEST(RefreshClearRows, RegionClearRowCarriesItsRectAndKeepsTheDebtWindow) {
+  Recorder recorder;
+  Policy::Config config;
+  config.imageClearRegion = true;
+  Policy policy = attached(recorder, config);
+  auto picturePage = page(200, /*image=*/true);
+  ASSERT_EQ(step(policy, picturePage), Refresh::Fast);
+  policy.imagePageShown({40, 120, 400, 300});
+  auto next = page(100);
+  next.screenWidth = 480;
+  next.screenHeight = 800;
+  next.regionClearAvailable = true;
+  ASSERT_EQ(step(policy, next), Refresh::Region);
+  // The second picture is too large for a window (64 % of the screen).
+  ASSERT_EQ(step(policy, picturePage), Refresh::Fast);
+  policy.imagePageShown({0, 0, 480, 512});
+  ASSERT_EQ(step(policy, next), Refresh::Clear);
+  const auto rows = recorder.drain();
+  ASSERT_EQ(rows.size(), 2u);
+
+  const Event& region = rows[0];
+  EXPECT_EQ(region.type, EventType::RefreshClear);
+  EXPECT_EQ(region.data[0], static_cast<uint32_t>(ClearCause::Image));
+  EXPECT_EQ(region.data[1], 1u);    // the picture page
+  EXPECT_EQ(region.data[2], 500u);  // 400 + this page's 100
+  EXPECT_EQ(region.data[5], CLEAR_FLAG_REGION);
+  EXPECT_EQ(encode(region),
+            "{\"event\":\"refresh_clear\",\"seq\":1,\"start_us\":2000,\"end_us\":2000,\"duration_us\":0,"
+            "\"data\":[4,1,500,1,0,16,1592594996,1500],\"region\":[40,120,400,300]}\n");
+
+  const Event& full = rows[1];
+  EXPECT_EQ(full.data[0], static_cast<uint32_t>(ClearCause::Image));
+  EXPECT_EQ(full.data[1], 3u) << "the region clear did not end the run of fast turns";
+  EXPECT_EQ(full.data[2], 1000u);  // 500 + 400 + 100: the region clear kept the debt
+  EXPECT_EQ(full.data[3], 2u);
+  EXPECT_EQ((full.data[5] & CLEAR_REGION_FALLBACK_MASK) >> CLEAR_REGION_FALLBACK_SHIFT,
+            static_cast<uint32_t>(Policy::RegionFallback::TooLarge));
+  EXPECT_EQ(full.data[5] & CLEAR_FLAG_REGION, 0u);
+  EXPECT_NE(encode(full).find(",\"region\":[0,0,0,0]}"), std::string::npos);
 }
 
 TEST(RefreshClearRows, CountersRestartAfterEachClear) {

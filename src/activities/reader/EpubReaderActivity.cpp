@@ -77,6 +77,14 @@ int clampPercent(int percent) {
   return percent;
 }
 
+// Screen rect of the page's pictures for image_clear_region; empty (unknown)
+// when the page reports none.
+AdaptiveRefreshPolicy::Rect pictureRect(const Page& page, const int marginLeft, const int marginTop) {
+  int16_t x = 0, y = 0, w = 0, h = 0;
+  if (!page.getImageBoundingBox(x, y, w, h)) return {};
+  return {static_cast<int16_t>(x + marginLeft), static_cast<int16_t>(y + marginTop), w, h};
+}
+
 constexpr char READ_FOLDER[] = "/read";
 
 bool isInReadFolder(const std::string& path) {
@@ -1923,6 +1931,13 @@ void EpubReaderActivity::renderContents(std::unique_ptr<Page> page, const int or
     if (absoluteImageGrayscale) renderStatusBar();
   };
 
+  // image_clear_region: the clear owed after the previous picture page runs as
+  // a windowed clear once this page is shown, so neither the placeholder nor
+  // this page takes the full clear the panel queued after the picture. It needs
+  // the page's base on the glass first, so a combined base+gray drive opts out.
+  const bool regionClearAvailable =
+      !combinedGrayscaleBase && refreshPolicy.regionClearWanted() && renderer.prepareRegionClear();
+
   if (pageHasImagesNeedingDecode) {
     // The placeholder frame consumes a queued clearing promotion; carry the
     // clear over to the decoded page as well.
@@ -1950,14 +1965,17 @@ void EpubReaderActivity::renderContents(std::unique_ptr<Page> page, const int or
   benchmark::intervalMs(benchmark::EventType::Phase, tPrewarm, tBwRender,
                         static_cast<uint32_t>(benchmark::Phase::BwRender), prerenderDetail);
 
-  const auto refresh = ReaderUtils::decideRefresh(renderer, refreshPolicy, pageHasImages, needsAnyGrayscale);
+  const auto decision = ReaderUtils::decideRefreshWithRegion(renderer, refreshPolicy, pageHasImages, needsAnyGrayscale,
+                                                             regionClearAvailable);
+  const auto refresh = decision.refresh;
+  const bool regionClear = refresh == AdaptiveRefreshPolicy::Refresh::Region;
   const auto refreshMode = ReaderUtils::refreshModeFor(refresh);
   if (absoluteImageGrayscale) {
     if (!renderer.displayGrayscaleBase(HalDisplay::GrayscaleMode::Absolute, refreshMode)) {
       LOG_ERR("ERS", "Could not start absolute image page; displaying B/W");
       markBenchmarkRenderFailed();
       renderer.displayBuffer(refreshMode);
-      refreshPolicy.commit(refresh);
+      refreshPolicy.commit(regionClear ? AdaptiveRefreshPolicy::Refresh::Fast : refresh);
       refreshPolicy.requestClear();
       return;
     }
@@ -1984,10 +2002,20 @@ void EpubReaderActivity::renderContents(std::unique_ptr<Page> page, const int or
   } else {
     renderer.displayBuffer(refreshMode);
   }
-  refreshPolicy.commit(refresh);
+  // Region clear: after the page's B/W base, before any grayscale plane is
+  // written. If it cannot run, the page stays a fast frame and the next page
+  // clears the whole screen.
+  if (regionClear &&
+      !renderer.clearRegion(decision.region.x, decision.region.y, decision.region.w, decision.region.h)) {
+    LOG_ERR("ERS", "Region clear failed; clearing the next page");
+    refreshPolicy.commit(AdaptiveRefreshPolicy::Refresh::Fast);
+    refreshPolicy.requestClear();
+  } else {
+    refreshPolicy.commit(refresh);
+  }
   // Image pages leave residue (gray waveforms, dithered fills) that FAST text
   // refreshes do not settle; by default the next page clears it.
-  if (pageHasImages) refreshPolicy.imagePageShown();
+  if (pageHasImages) refreshPolicy.imagePageShown(pictureRect(*page, orientedMarginLeft, orientedMarginTop));
   const auto tDisplay = millis();
   benchmark::intervalMs(benchmark::EventType::Phase, tBwRender, tDisplay,
                         static_cast<uint32_t>(benchmark::Phase::Display));

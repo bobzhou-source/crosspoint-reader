@@ -56,17 +56,26 @@ Writer::Result Writer::event(const Event& event, bool terminal) {
     live = false;
     return Result::Failed;
   }
-  const int length = snprintf(encoded, sizeof(encoded),
-                              "{\"event\":\"%s\",\"seq\":%u,\"start_us\":%llu,\"end_us\":%llu,"
-                              "\"duration_us\":%llu,\"data\":[%u,%u,%u,%u,%u,%u,%u,%u]}\n",
-                              NAMES[type], static_cast<unsigned>(event.sequence),
-                              static_cast<unsigned long long>(event.startUs),
-                              static_cast<unsigned long long>(event.endUs),
-                              static_cast<unsigned long long>(event.endUs - event.startUs),
-                              static_cast<unsigned>(event.data[0]), static_cast<unsigned>(event.data[1]),
-                              static_cast<unsigned>(event.data[2]), static_cast<unsigned>(event.data[3]),
-                              static_cast<unsigned>(event.data[4]), static_cast<unsigned>(event.data[5]),
-                              static_cast<unsigned>(event.data[6]), static_cast<unsigned>(event.data[7]));
+  int length = snprintf(encoded, sizeof(encoded),
+                        "{\"event\":\"%s\",\"seq\":%u,\"start_us\":%llu,\"end_us\":%llu,"
+                        "\"duration_us\":%llu,\"data\":[%u,%u,%u,%u,%u,%u,%u,%u]",
+                        NAMES[type], static_cast<unsigned>(event.sequence),
+                        static_cast<unsigned long long>(event.startUs), static_cast<unsigned long long>(event.endUs),
+                        static_cast<unsigned long long>(event.endUs - event.startUs),
+                        static_cast<unsigned>(event.data[0]), static_cast<unsigned>(event.data[1]),
+                        static_cast<unsigned>(event.data[2]), static_cast<unsigned>(event.data[3]),
+                        static_cast<unsigned>(event.data[4]), static_cast<unsigned>(event.data[5]),
+                        static_cast<unsigned>(event.data[6]), static_cast<unsigned>(event.data[7]));
+  if (length >= 0 && static_cast<size_t>(length) < sizeof(encoded)) {
+    // Refresh rows append the cleared rect (all zero: the whole screen).
+    const bool refreshRow = event.type == EventType::RefreshClear || event.type == EventType::ManualRefresh;
+    const int tail =
+        refreshRow ? snprintf(encoded + length, sizeof(encoded) - length, ",\"region\":[%u,%u,%u,%u]}\n",
+                              static_cast<unsigned>(event.region[0]), static_cast<unsigned>(event.region[1]),
+                              static_cast<unsigned>(event.region[2]), static_cast<unsigned>(event.region[3]))
+                   : snprintf(encoded + length, sizeof(encoded) - length, "}\n");
+    length = tail < 0 ? tail : length + tail;
+  }
   if (length < 0 || static_cast<size_t>(length) >= sizeof(encoded)) {
     live = false;
     return Result::Failed;

@@ -98,6 +98,12 @@ class HalDisplay {
   void preconditionGrayscale();
   void preconditionGrayscale(uint16_t x, uint16_t y, uint16_t w, uint16_t h);
 
+  // Windowed ghost clear (X4). prepareRegionClear() before painting the page,
+  // clearRegion() after it is displayed, on a panel-memory rect whose x and w
+  // are multiples of 8. See EInkDisplay::prepareRegionClear/clearRegion.
+  bool prepareRegionClear();
+  bool clearRegion(uint16_t x, uint16_t y, uint16_t w, uint16_t h);
+
   // Display the framebuffer as the base frame for a grayscale overlay that
   // follows. On X3, HALF fallback first requests a resync to match
   // displayBuffer(HALF); FAST fallback keeps the OEM differential base waveform

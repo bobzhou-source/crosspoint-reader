@@ -16,13 +16,15 @@
 //    "safety_cap": 60, "weight_grayscale_permille": 250,
 //    "weight_image_permille": 1000, "weight_grayscale_image_extra_permille": 500,
 //    "frame_charge_permille": 0, "clear_after_image": true,
-//    "image_waveform": "quality", "meta": {...}}
+//    "image_waveform": "quality", "image_clear_region": false, "meta": {...}}
 // "schema" (must be 1) is required; "policy", when present, must equal
 // AdaptiveRefreshPolicy::kName. Every tunable is optional and falls back to
 // the compiled default, except that a missing night threshold follows the
 // day threshold. Numeric tunables must be JSON integers; values outside their
-// range are clamped (and reported). "clear_after_image" must be a JSON bool
-// and "image_waveform" the string "quality" or "fast". "meta" (any object) is
+// range are clamped (and reported). "clear_after_image" and
+// "image_clear_region" must be JSON bools and "image_waveform" the string
+// "quality" or "fast". "image_clear_region" only matters while
+// clear_after_image is true. "meta" (any object) is
 // ignored. Any other key, a wrongly typed tunable, an unknown waveform name or
 // malformed JSON rejects the whole file: the compiled policy runs and the
 // reason is reported.

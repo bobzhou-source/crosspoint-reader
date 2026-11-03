@@ -88,9 +88,12 @@ State parse(const char* data, const size_t length) {
       if (!pair.value().is<JsonObjectConst>()) return invalid("meta is not an object");
       continue;
     }
-    if (strcmp(key, "clear_after_image") == 0) {
+    bool* const flag = strcmp(key, "clear_after_image") == 0    ? &state.config.clearAfterImage
+                       : strcmp(key, "image_clear_region") == 0 ? &state.config.imageClearRegion
+                                                                 : nullptr;
+    if (flag) {
       if (!pair.value().is<bool>()) return invalid("not a bool", key);
-      state.config.clearAfterImage = pair.value().as<bool>();
+      *flag = pair.value().as<bool>();
       continue;
     }
     if (strcmp(key, "image_waveform") == 0) {

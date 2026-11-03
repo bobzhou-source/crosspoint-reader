@@ -40,10 +40,19 @@ Event refreshClearEvent(const AdaptiveRefreshPolicy::ClearRecord& record, const 
   event.data[2] = record.debtPermille;
   event.data[3] = record.imagePages;
   event.data[4] = record.grayPages;
-  event.data[5] = (record.inverted ? CLEAR_FLAG_NIGHT : 0) | (policyFile ? CLEAR_FLAG_POLICY_FILE : 0) |
-                  (record.image ? CLEAR_FLAG_IMAGE : 0) | (record.grayscale ? CLEAR_FLAG_GRAYSCALE : 0);
+  event.data[5] =
+      (record.inverted ? CLEAR_FLAG_NIGHT : 0) | (policyFile ? CLEAR_FLAG_POLICY_FILE : 0) |
+      (record.image ? CLEAR_FLAG_IMAGE : 0) | (record.grayscale ? CLEAR_FLAG_GRAYSCALE : 0) |
+      (record.regionOnly ? CLEAR_FLAG_REGION : 0) |
+      ((static_cast<uint32_t>(record.regionFallback) << CLEAR_REGION_FALLBACK_SHIFT) & CLEAR_REGION_FALLBACK_MASK);
   event.data[6] = bookId;
   event.data[7] = record.thresholdPermille;
+  if (record.regionOnly) {
+    event.region[0] = static_cast<uint16_t>(record.region.x);
+    event.region[1] = static_cast<uint16_t>(record.region.y);
+    event.region[2] = static_cast<uint16_t>(record.region.w);
+    event.region[3] = static_cast<uint16_t>(record.region.h);
+  }
   return event;
 }
 
