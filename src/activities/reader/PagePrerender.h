@@ -2,6 +2,7 @@
 
 #include <Epub/FootnoteEntry.h>
 #include <Epub/PageLink.h>
+#include <Epub/PagePicture.h>
 #include <HalMemory.h>
 
 #include <cstddef>
@@ -13,7 +14,7 @@
 // Spare-PSRAM storage for the EPUB reader's idle prerender: one full-panel B/W
 // body buffer and, when the grayscale route needs them, the two text-grayscale
 // planes, plus the per-page metadata a presented page must republish
-// (visible text offset, footnotes, links).
+// (visible text offset, footnotes, links, picture tap targets).
 //
 // The buffers are separate from the display framebuffer and are only ever used
 // as GfxRenderer strip targets, so a build never touches what is on screen.
@@ -39,6 +40,7 @@ class PagePrerender {
   uint32_t visibleTextOffset = 0;
   std::vector<FootnoteEntry> footnotes;
   std::vector<PageLink> links;
+  std::vector<PagePicture> pictures;
 
   // Do not attempt another allocation before this millis() value after a
   // refusal, so a memory-starved device does not re-query PSRAM every page.

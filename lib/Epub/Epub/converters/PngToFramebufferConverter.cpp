@@ -340,6 +340,7 @@ bool PngToFramebufferConverter::getDimensionsStatic(const std::string& imagePath
 bool PngToFramebufferConverter::decodeToFramebuffer(const std::string& imagePath, GfxRenderer& renderer,
                                                     const RenderConfig& config) {
   LOG_DBG("PNG", "Decoding PNG: %s", imagePath.c_str());
+  decodeTooLarge = false;
 
   size_t freeHeap = ESP.getFreeHeap();
   if (freeHeap < MIN_FREE_HEAP_FOR_PNG) {
@@ -413,6 +414,7 @@ bool PngToFramebufferConverter::decodeToFramebuffer(const std::string& imagePath
         "PNG row buffer too small: need %d bytes for width=%d type=%d bpp=%d, configured PNG_MAX_BUFFERED_PIXELS=%d",
         requiredInternal, ctx.srcWidth, pixelType, bitsPerSample, PNG_MAX_BUFFERED_PIXELS);
     LOG_ERR("PNG", "Aborting decode to avoid PNGdec internal buffer overflow");
+    decodeTooLarge = true;
     return false;
   }
 

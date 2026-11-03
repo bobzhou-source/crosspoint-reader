@@ -1,0 +1,3 @@
+add_executable(PagePictureTest PagePictureTest.cpp)
+target_link_libraries(PagePictureTest PRIVATE crosspoint_test_common GTest::gtest_main)
+gtest_discover_tests(PagePictureTest)

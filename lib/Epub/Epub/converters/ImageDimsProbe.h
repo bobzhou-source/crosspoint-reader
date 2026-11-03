@@ -20,6 +20,14 @@ class ImageDimsProbe : public Print {
 
   // True only when a valid header was found; fills `out`.
   bool getDimensions(ImageDimensions& out) const;
+  // Header dimensions without the decoder size limits, so a caller can tell an
+  // oversized picture from a broken one. True once a header was parsed.
+  bool getRawDimensions(uint32_t& outWidth, uint32_t& outHeight) const {
+    if (state != State::Done) return false;
+    outWidth = width;
+    outHeight = height;
+    return true;
+  }
 
  private:
   bool feed(uint8_t b);  // returns false once parsing is finished (found or failed)

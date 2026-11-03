@@ -217,6 +217,41 @@ TEST_F(ChapterHtmlSlimParserTest, PageImageDeserializeRejectsMissingImageBlock) 
   EXPECT_EQ(PageImage::deserialize(input), nullptr);
 }
 
+TEST(PagePictureTargets, CollectsEveryPictureWithItsElementIndex) {
+  Page page;
+  page.elements.push_back(std::make_unique<PageHorizontalRule>(400, 2, 20, 10));
+  page.elements.push_back(
+      std::make_unique<PageImage>(std::make_unique<ImageBlock>("/cache/img_1.jpg", "OEBPS/a.jpg", 300, 200), 70, 40));
+  page.elements.push_back(std::make_unique<PageHorizontalRule>(400, 2, 20, 260));
+  page.elements.push_back(
+      std::make_unique<PageImage>(std::make_unique<ImageBlock>("/cache/img_2.png", "OEBPS/b.png", 20, 20), 0, 300));
+
+  std::vector<PagePicture> pictures;
+  page.collectPictures(pictures);
+  ASSERT_EQ(pictures.size(), 2u);
+  EXPECT_EQ(pictures[0].element, 1u);
+  EXPECT_EQ(pictures[0].x, 70);
+  EXPECT_EQ(pictures[0].y, 40);
+  EXPECT_EQ(pictures[0].width, 300);
+  EXPECT_EQ(pictures[0].height, 200);
+  EXPECT_EQ(pictures[1].element, 3u);
+
+  // A tap on the photo (reader margins 16/40) finds that element; the 20x20
+  // ornament and the rules are not targets.
+  const int hit = page_picture::pictureAtPoint(pictures, 16 + 70 + 150, 40 + 40 + 100, 16, 40);
+  ASSERT_EQ(hit, 0);
+  EXPECT_EQ(static_cast<const PageImage&>(*page.elements[pictures[hit].element]).getImageBlock().getImagePath(),
+            "/cache/img_1.jpg");
+  EXPECT_EQ(page_picture::pictureAtPoint(pictures, 16 + 5, 40 + 305, 16, 40), -1);
+  EXPECT_EQ(page_picture::pictureAtPoint(pictures, 16 + 200, 40 + 11, 16, 40), -1);
+
+  // The next page's targets replace the previous page's.
+  Page textOnly;
+  textOnly.elements.push_back(std::make_unique<PageHorizontalRule>(400, 2, 20, 10));
+  textOnly.collectPictures(pictures);
+  EXPECT_TRUE(pictures.empty());
+}
+
 TEST_P(ChapterHtmlSlimParserTest, KeepsCssVerticalAlignAndInternalLinkMetadata) {
   const char* verticalAlign = GetParam();
   const char* expectedHref = "#note-target";
