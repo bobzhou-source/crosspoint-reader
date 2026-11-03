@@ -697,11 +697,11 @@ If the device goes to sleep or you close the book while viewing a footnote, the 
 
 ### Picture Viewer
 
-On a touchscreen (X4 Pro, with touch reader controls on), a short tap on a picture in an EPUB page shows it full-screen. The picture is decoded again from the book's original image file at screen size, not enlarged from the page copy, and fit to the screen with its proportions kept: small pictures are scaled up, large ones down. A landscape picture that would come out clearly larger turned a quarter is shown sideways; turn the reader to look at it. The first view of a picture shows **Loading** while it decodes; the full-screen copy is then kept in the book's cache, so looking at it again opens without the wait.
+On a touchscreen (X4 Pro, with touch reader controls on), a short tap on a picture in an EPUB page shows it full-screen. The picture is decoded again from the book's original image file at screen size, not enlarged from the page copy, and fit to the screen with its proportions kept: small pictures are scaled up, large ones down. A landscape picture that would come out clearly larger turned a quarter is shown sideways, its top along the left edge; turn the reader a quarter clockwise to look at it. The first view of a picture shows **Loading** while it decodes; the full-screen copy is then kept in the book's cache, so looking at it again opens without the wait.
 
-Tap anywhere or press any button to return to the same page. The page is redrawn with a clearing refresh but not re-paginated, and your reading position does not change.
+Tap anywhere, swipe Back from the left edge, or press any button to return to the same page. The page is redrawn with a clearing refresh but not re-paginated, and your reading position does not change.
 
-Only pictures at least 48 pixels wide and tall on the page count as tap targets, so small ornaments and inline icons keep the normal page-turn and menu taps; taps beside a picture also behave as before. A link on a picture wins over the picture. Holding a tap on a picture still skips a chapter. Pictures over 8 megapixels (or wider or taller than 32767 pixels) show **Picture too large to show** instead, and a file the reader cannot decode shows **Cannot open file**.
+Only pictures at least 48 pixels wide and tall on the page count as tap targets, so small ornaments and inline icons keep the normal page-turn and menu taps; taps beside a picture also behave as before. A link on a picture wins over the picture. A held tap on a picture is not a picture tap: it does what it did before (with tap page turns, a chapter skip). A picture the page can only show as a placeholder box because it is too large to decode (for example a very wide PNG) shows **Picture too large to show**, and a file the reader cannot decode shows **Cannot open file**.
 
 ### Annotations
 
