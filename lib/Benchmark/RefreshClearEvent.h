@@ -26,13 +26,21 @@ inline constexpr uint32_t CLEAR_FLAG_NIGHT = 1u << 0;
 inline constexpr uint32_t CLEAR_FLAG_POLICY_FILE = 1u << 1;
 inline constexpr uint32_t CLEAR_FLAG_IMAGE = 1u << 2;
 inline constexpr uint32_t CLEAR_FLAG_GRAYSCALE = 1u << 3;
+// The clear covered only the row's "region" rect (image_clear_region); the
+// turn counts carry on to the next full clear.
+inline constexpr uint32_t CLEAR_FLAG_REGION = 1u << 4;
+// Bits 5-7: AdaptiveRefreshPolicy::RegionFallback, why a picture clear in
+// region mode still covered the whole screen (0 none).
+inline constexpr unsigned CLEAR_REGION_FALLBACK_SHIFT = 5;
+inline constexpr uint32_t CLEAR_REGION_FALLBACK_MASK = 7u << CLEAR_REGION_FALLBACK_SHIFT;
 
 ClearCause clearCause(const AdaptiveRefreshPolicy::ClearRecord& record);
 
 // One instant row per committed clear: manual_refresh when the user asked for it,
 // refresh_clear otherwise. Slots: cause, fast turns since the previous clear, debt
 // permille, picture pages and grayscale pages among those turns, flags, book ID,
-// threshold permille in force.
+// threshold permille in force. "region": the logical rect of a region clear
+// (x, y, w, h), all zero for a whole-screen clear.
 Event refreshClearEvent(const AdaptiveRefreshPolicy::ClearRecord& record, bool policyFile, uint32_t bookId,
                         uint64_t nowUs);
 

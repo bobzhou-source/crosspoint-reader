@@ -34,6 +34,8 @@ void AdaptiveRefreshPolicy::reset(bool initialClearRequired) {
   clearSource_ = ClearSource::None;
   imagePages_ = 0;
   grayPages_ = 0;
+  imageRegion_ = Rect{};
+  imageRegionUnknown_ = false;
 }
 
 uint32_t AdaptiveRefreshPolicy::estimateChangedPixels(const freeink::FrameChangeMetrics& frame) const {
@@ -85,7 +87,43 @@ AdaptiveRefreshPolicy::Decision AdaptiveRefreshPolicy::decide(const Inputs& in) 
     reason = Reason::SafetyCap;
   }
   pendingRecord_ = labelFor(in, reason);
+  if (reason == Reason::Requested && clearSource_ == ClearSource::Image && config_.imageClearRegion) {
+    Rect region{};
+    pendingRecord_.regionFallback = regionFor(in, region);
+    if (pendingRecord_.regionFallback == RegionFallback::None) {
+      pendingRecord_.regionOnly = true;
+      pendingRecord_.region = region;
+      return {Refresh::Region, reason, region};
+    }
+  }
   return {reason == Reason::None ? Refresh::Fast : Refresh::Clear, reason};
+}
+
+AdaptiveRefreshPolicy::RegionFallback AdaptiveRefreshPolicy::regionFor(const Inputs& in, Rect& region) const {
+  const auto& f = in.frame;
+  // The rest of decide()'s chain: any of these needs the whole screen.
+  if (in.externalClearPending || !pendingFrameValid_ || f.polarityChangePending ||
+      static_cast<uint64_t>(debt_) + pendingCharge_ >=
+          static_cast<uint64_t>(f.pixelCount) *
+              (in.invertedOutput ? config_.nightClearThresholdPermille : config_.clearThresholdPermille) / 1000 ||
+      fastSinceClear_ >= config_.safetyCap) {
+    return RegionFallback::Overruled;
+  }
+  if (imageRegionUnknown_) return RegionFallback::Unknown;
+  const int32_t x0 = imageRegion_.x > 0 ? imageRegion_.x : 0;
+  const int32_t y0 = imageRegion_.y > 0 ? imageRegion_.y : 0;
+  const int32_t right = static_cast<int32_t>(imageRegion_.x) + imageRegion_.w;
+  const int32_t bottom = static_cast<int32_t>(imageRegion_.y) + imageRegion_.h;
+  const int32_t x1 = right < in.screenWidth ? right : in.screenWidth;
+  const int32_t y1 = bottom < in.screenHeight ? bottom : in.screenHeight;
+  if (imageRegion_.empty() || x1 <= x0 || y1 <= y0) return RegionFallback::OffScreen;
+  const uint64_t area = static_cast<uint64_t>(x1 - x0) * static_cast<uint64_t>(y1 - y0);
+  const uint64_t screen = static_cast<uint64_t>(in.screenWidth) * in.screenHeight;
+  if (area * 1000 > screen * kRegionMaxPermille) return RegionFallback::TooLarge;
+  if (!in.regionClearAvailable) return RegionFallback::Unavailable;
+  region = {static_cast<int16_t>(x0), static_cast<int16_t>(y0), static_cast<int16_t>(x1 - x0),
+            static_cast<int16_t>(y1 - y0)};
+  return RegionFallback::None;
 }
 
 AdaptiveRefreshPolicy::ClearRecord AdaptiveRefreshPolicy::labelFor(const Inputs& in, const Reason reason) const {
@@ -126,7 +164,26 @@ void AdaptiveRefreshPolicy::commit(Refresh displayed) {
     clearSource_ = ClearSource::None;
     imagePages_ = 0;
     grayPages_ = 0;
+    imageRegion_ = Rect{};
+    imageRegionUnknown_ = false;
   } else {
+    if (displayed == Refresh::Region) {
+      // Ends the picture clear only; the frame itself was drawn fast and the
+      // debt window carries on.
+      if (observer_) {
+        ClearRecord record = pendingValid_ ? pendingRecord_ : ClearRecord{};
+        if (!pendingValid_) record.source = clearSource_;
+        record.regionOnly = true;
+        record.fastTurns = fastSinceClear_;
+        record.imagePages = imagePages_;
+        record.grayPages = grayPages_;
+        observer_(observerContext_, record);
+      }
+      clearRequested_ = false;
+      clearSource_ = ClearSource::None;
+      imageRegion_ = Rect{};
+      imageRegionUnknown_ = false;
+    }
     clearedCharge_ = 0;
     if (pendingValid_) {
       debt_ = saturate(static_cast<uint64_t>(debt_) + pendingCharge_);
@@ -144,8 +201,22 @@ void AdaptiveRefreshPolicy::commit(Refresh displayed) {
   pendingValid_ = false;
 }
 
-void AdaptiveRefreshPolicy::imagePageShown() {
+void AdaptiveRefreshPolicy::imagePageShown(const Rect pictures) {
   if (config_.clearAfterImage) {
+    if (pictures.empty()) {
+      imageRegionUnknown_ = true;
+    } else if (imageRegion_.empty()) {
+      imageRegion_ = pictures;
+    } else {
+      const int32_t x0 = imageRegion_.x < pictures.x ? imageRegion_.x : pictures.x;
+      const int32_t y0 = imageRegion_.y < pictures.y ? imageRegion_.y : pictures.y;
+      const int32_t x1 = imageRegion_.x + imageRegion_.w > pictures.x + pictures.w ? imageRegion_.x + imageRegion_.w
+                                                                                   : pictures.x + pictures.w;
+      const int32_t y1 = imageRegion_.y + imageRegion_.h > pictures.y + pictures.h ? imageRegion_.y + imageRegion_.h
+                                                                                   : pictures.y + pictures.h;
+      imageRegion_ = {static_cast<int16_t>(x0), static_cast<int16_t>(y0), static_cast<int16_t>(x1 - x0),
+                      static_cast<int16_t>(y1 - y0)};
+    }
     requestClear(ClearSource::Image);
     return;
   }

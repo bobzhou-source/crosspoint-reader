@@ -14,7 +14,7 @@ enum class StopReason : uint8_t {
   Sleep = 0, UsbDrive = 1, Restart = 2, Limit = 3, User = 4, Complete = 5, Cancelled = 6, Failure = 7
 };
 enum class DisplayCall : uint8_t {
-  Buffer, AsyncSubmit, AsyncWait, Refresh, GrayBase, Gray, Precondition, Sleep, ConfiguredGrayBase
+  Buffer, AsyncSubmit, AsyncWait, Refresh, GrayBase, Gray, Precondition, Sleep, ConfiguredGrayBase, RegionClear
 };
 // Phase rows carry a detail slot (data[3]). Prerender (13) is the idle EPUB page prerender: its detail is a
 // page_prerender::Outcome. On a page render, detail 1 marks a page presented from a prerendered body.
@@ -27,6 +27,9 @@ struct Event {
   uint32_t sequence = 0;
   EventType type = EventType::Activity;
   uint32_t data[8] = {};
+  // refresh_clear / manual_refresh only: the logical rect a region clear
+  // covered (x, y, w, h), all zero for a whole-screen clear.
+  uint16_t region[4] = {};
 };
 
 // Synchronization belongs to the caller; no allocation, strings, or I/O on push.

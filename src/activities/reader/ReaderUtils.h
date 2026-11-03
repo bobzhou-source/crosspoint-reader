@@ -221,8 +221,13 @@ inline HalDisplay::RefreshMode refreshModeFor(const AdaptiveRefreshPolicy::Refre
 // policy whether this frame needs a clearing refresh. Call after the whole
 // page (including overlays) is drawn and before any grayscale plane overwrites
 // the framebuffer; commit the refresh that actually ran afterwards.
-inline AdaptiveRefreshPolicy::Refresh decideRefresh(const GfxRenderer& renderer, AdaptiveRefreshPolicy& policy,
-                                                    const bool hasImage, const bool visibleGrayscale) {
+// regionClearAvailable: renderer.prepareRegionClear() succeeded for this
+// frame, so the answer may be Refresh::Region (a fast frame plus
+// renderer.clearRegion(decision.region)).
+inline AdaptiveRefreshPolicy::Decision decideRefreshWithRegion(const GfxRenderer& renderer,
+                                                               AdaptiveRefreshPolicy& policy, const bool hasImage,
+                                                               const bool visibleGrayscale,
+                                                               const bool regionClearAvailable) {
   AdaptiveRefreshPolicy::Inputs inputs;
   inputs.frame = renderer.measureFrameChange();
   inputs.hasImage = hasImage;
@@ -230,13 +235,23 @@ inline AdaptiveRefreshPolicy::Refresh decideRefresh(const GfxRenderer& renderer,
   inputs.externalClearPending = renderer.hasPendingClearingRefresh();
   inputs.externalManual = renderer.hasPendingManualRefresh();
   inputs.invertedOutput = display.isInverted();
+  inputs.regionClearAvailable = regionClearAvailable;
+  inputs.screenWidth = static_cast<uint16_t>(renderer.getScreenWidth());
+  inputs.screenHeight = static_cast<uint16_t>(renderer.getScreenHeight());
   const auto decision = policy.decide(inputs);
   LOG_DBG("READER", "Refresh %s: reason=%u debt=%lu fast=%u changed=%lu exact=%d",
-          decision.refresh == AdaptiveRefreshPolicy::Refresh::Clear ? "clear" : "fast",
+          decision.refresh == AdaptiveRefreshPolicy::Refresh::Clear    ? "clear"
+          : decision.refresh == AdaptiveRefreshPolicy::Refresh::Region ? "region"
+                                                                       : "fast",
           static_cast<unsigned>(decision.reason), static_cast<unsigned long>(policy.debtPixels()),
           static_cast<unsigned>(policy.fastSinceClear()), static_cast<unsigned long>(inputs.frame.changedPixels),
           inputs.frame.historyValid ? 1 : 0);
-  return decision.refresh;
+  return decision;
+}
+
+inline AdaptiveRefreshPolicy::Refresh decideRefresh(const GfxRenderer& renderer, AdaptiveRefreshPolicy& policy,
+                                                    const bool hasImage, const bool visibleGrayscale) {
+  return decideRefreshWithRegion(renderer, policy, hasImage, visibleGrayscale, /*regionClearAvailable=*/false).refresh;
 }
 
 // One helper, blocking or deferred: the async form starts the refresh and

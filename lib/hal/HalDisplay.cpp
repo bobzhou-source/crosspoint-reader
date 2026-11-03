@@ -163,6 +163,15 @@ void HalDisplay::preconditionGrayscale() {
   einkDisplay.preconditionGrayscale();
 }
 
+bool HalDisplay::prepareRegionClear() { return einkDisplay.prepareRegionClear(); }
+
+bool HalDisplay::clearRegion(uint16_t x, uint16_t y, uint16_t w, uint16_t h) {
+  // display_call row: mode = x << 16 | y, detail = w << 16 | h (panel memory).
+  benchmark::DisplaySpan measurement(benchmark::DisplayCall::RegionClear, (static_cast<uint32_t>(x) << 16) | y,
+                                     (static_cast<uint32_t>(w) << 16) | h);
+  return einkDisplay.clearRegion(x, y, w, h);
+}
+
 void HalDisplay::preconditionGrayscale(uint16_t x, uint16_t y, uint16_t w, uint16_t h) {
   benchmark::DisplaySpan measurement(benchmark::DisplayCall::Precondition);
   einkDisplay.preconditionGrayscale(x, y, w, h);

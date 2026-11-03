@@ -267,7 +267,8 @@ bool begin(SessionMode mode) {
                       "\"memory_unit\":\"bytes\",\"index_phase_clock_unit\":\"ms\",\"id_algorithm\":\"fnv1a32\","
                       "\"refresh_policy\":\"%s\",\"refresh_policy_version\":%u,"
                       "\"refresh_policy_source\":\"%s\",\"refresh_policy_config\":[%lu,%lu,%u,%lu,%lu,%lu,%lu],"
-                      "\"refresh_policy_clear_after_image\":%s,\"refresh_policy_image_waveform\":\"%s\"}\n",
+                      "\"refresh_policy_clear_after_image\":%s,\"refresh_policy_image_waveform\":\"%s\","
+                      "\"refresh_policy_image_clear_region\":%s}\n",
                       modeName, escaped, imageHash, app->date, app->time,
                       static_cast<unsigned long long>(nowUs()), static_cast<unsigned>(esp_reset_reason()),
                       static_cast<unsigned>(esp_sleep_get_wakeup_cause()), static_cast<unsigned>(bootWakeReason),
@@ -280,7 +281,8 @@ bool begin(SessionMode mode) {
                       static_cast<unsigned long>(policy.weightImagePermille),
                       static_cast<unsigned long>(policy.weightGrayscaleImageExtraPermille),
                       static_cast<unsigned long>(policy.frameChargePermille), policy.clearAfterImage ? "true" : "false",
-                      refresh_policy_config::imageWaveformName(policy.imageWaveform))) {
+                      refresh_policy_config::imageWaveformName(policy.imageWaveform),
+                      policy.imageClearRegion ? "true" : "false")) {
     return false;  // metadataLocked disabled the session.
   }
   if (!file.sync()) {

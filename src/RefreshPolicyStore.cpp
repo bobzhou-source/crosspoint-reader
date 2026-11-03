@@ -41,14 +41,14 @@ const refresh_policy_config::State& load() {
   const auto& c = state.config;
   LOG_INF("RPOL",
           "Refresh policy %s from %s%s%s: clear=%lu night=%lu cap=%u gray=%lu image=%lu grayImage=%lu frame=%lu "
-          "clearAfterImage=%d imageWaveform=%s",
+          "clearAfterImage=%d imageWaveform=%s imageClearRegion=%d",
           AdaptiveRefreshPolicy::kName, refresh_policy_config::sourceName(state.source), state.detail[0] ? " - " : "",
           state.detail, static_cast<unsigned long>(c.clearThresholdPermille),
           static_cast<unsigned long>(c.nightClearThresholdPermille), static_cast<unsigned>(c.safetyCap),
           static_cast<unsigned long>(c.weightGrayscalePermille), static_cast<unsigned long>(c.weightImagePermille),
           static_cast<unsigned long>(c.weightGrayscaleImageExtraPermille),
           static_cast<unsigned long>(c.frameChargePermille), c.clearAfterImage ? 1 : 0,
-          refresh_policy_config::imageWaveformName(c.imageWaveform));
+          refresh_policy_config::imageWaveformName(c.imageWaveform), c.imageClearRegion ? 1 : 0);
   return refresh_policy_config::active();
 }
 
