@@ -5,6 +5,7 @@
 #include <FsHelpers.h>
 #include <HalStorage.h>
 #include <Memory.h>
+#include <RefreshClearEvent.h>
 #include <RefreshPolicyConfig.h>
 
 #include <algorithm>
@@ -27,7 +28,18 @@ ReaderActivity::ReaderActivity(const char* name, GfxRenderer& renderer, MappedIn
                                std::string bookPath, const bool allowFastInitialRefresh)
     : Activity(name, renderer, mappedInput),
       bookPath(std::move(bookPath)),
-      refreshPolicy(/*initialClearRequired=*/!allowFastInitialRefresh, refresh_policy_config::active().config) {}
+      refreshPolicy(/*initialClearRequired=*/!allowFastInitialRefresh, refresh_policy_config::active().config),
+      bookId(benchmark::id(this->bookPath.c_str())) {
+  refreshPolicy.setClearObserver(&ReaderActivity::recordClear, this);
+}
+
+// Render task, under the render lock; only queues an event (no I/O). Fast refreshes never get here.
+void ReaderActivity::recordClear(void* context, const AdaptiveRefreshPolicy::ClearRecord& record) {
+  if (!benchmark::enabled()) return;
+  const auto* self = static_cast<const ReaderActivity*>(context);
+  const bool policyFile = refresh_policy_config::active().source == refresh_policy_config::Source::File;
+  benchmark::record(benchmark::refreshClearEvent(record, policyFile, self->bookId, benchmark::nowUs()));
+}
 
 std::unique_ptr<ReaderActivity> ReaderActivity::create(GfxRenderer& renderer, MappedInputManager& mappedInput,
                                                        std::string path, const bool allowFastInitialRefresh) {
@@ -416,7 +428,7 @@ bool ReaderActivity::handleForcedRefresh() {
   if (isBenchmarkActivity()) return true;
   {
     RenderLock lock(*this);
-    refreshPolicy.requestClear();
+    refreshPolicy.requestClear(AdaptiveRefreshPolicy::ClearSource::Manual);
   }
   requestUpdate();
   return true;

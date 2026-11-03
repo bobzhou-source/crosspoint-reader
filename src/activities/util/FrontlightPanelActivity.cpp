@@ -143,7 +143,7 @@ void FrontlightPanelActivity::runTile(const int idx) {
       // Refreshing with the panel still up would clean a frame the user is
       // about to dismiss anyway: drop the panel first and let the repaint of
       // the screen underneath carry the clean waveform instead.
-      renderer.promoteNextRefresh(HalDisplay::FULL_REFRESH);
+      renderer.promoteNextRefresh(HalDisplay::FULL_REFRESH, /*manual=*/true);
       close();
       break;
     case 2:  // Cycle the reading orientation

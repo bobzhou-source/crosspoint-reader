@@ -228,6 +228,7 @@ inline AdaptiveRefreshPolicy::Refresh decideRefresh(const GfxRenderer& renderer,
   inputs.hasImage = hasImage;
   inputs.visibleGrayscale = visibleGrayscale;
   inputs.externalClearPending = renderer.hasPendingClearingRefresh();
+  inputs.externalManual = renderer.hasPendingManualRefresh();
   inputs.invertedOutput = display.isInverted();
   const auto decision = policy.decide(inputs);
   LOG_DBG("READER", "Refresh %s: reason=%u debt=%lu fast=%u changed=%lu exact=%d",

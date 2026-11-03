@@ -50,7 +50,7 @@ Writer::Result Writer::event(const Event& event, bool terminal) {
   static constexpr const char* NAMES[] = {"activity", "render", "display_call", "busy_wait", "memory", "index",
                                           "epub_phase", "reader_input", "sleep_request", "loss", "flush", "end",
                                           "reader_settings", "display_settings", "run_step", "run_result",
-                                          "sync_run", "battery_sample"};
+                                          "sync_run", "battery_sample", "refresh_clear", "manual_refresh"};
   const auto type = static_cast<size_t>(event.type);
   if (type >= sizeof(NAMES) / sizeof(NAMES[0]) || event.endUs < event.startUs) {
     live = false;

@@ -331,7 +331,7 @@ bool EpubReaderActivity::buildTickHeapGate() {
 void EpubReaderActivity::showBuildPopup(GfxRenderer& renderer) {
   if (!buildPopupPending || !renderer.hasFrameBuffer()) return;
   GUI.drawPopup(renderer, tr(STR_INDEXING));
-  refreshPolicy.requestClear();
+  refreshPolicy.requestClear(AdaptiveRefreshPolicy::ClearSource::Popup);
   buildPopupPending = false;
 }
 
@@ -1317,7 +1317,7 @@ void EpubReaderActivity::renderBook() {
       const bool needsFullBuild = pendingPercentJump;
       if (needsFullBuild) {
         GUI.drawPopup(renderer, tr(STR_INDEXING));
-        refreshPolicy.requestClear();
+        refreshPolicy.requestClear(AdaptiveRefreshPolicy::ClearSource::Popup);
         const auto popupFn = [this]() {
           if (renderer.hasFrameBuffer()) GUI.drawPopup(renderer, tr(STR_INDEXING));
         };
@@ -1354,7 +1354,7 @@ void EpubReaderActivity::renderBook() {
           }
           if (showPopup) {
             GUI.drawPopup(renderer, tr(STR_INDEXING));
-            refreshPolicy.requestClear();
+            refreshPolicy.requestClear(AdaptiveRefreshPolicy::ClearSource::Popup);
           }
           buildPopupPending = !showPopup;
           // Section (re)builds are the heap-hungriest path (per-word
@@ -1449,7 +1449,7 @@ void EpubReaderActivity::renderBook() {
 
   if (section->isPartial() && section->currentPage >= static_cast<int>(section->pageCount)) {
     GUI.drawPopup(renderer, tr(STR_INDEXING));
-    refreshPolicy.requestClear();
+    refreshPolicy.requestClear(AdaptiveRefreshPolicy::ClearSource::Popup);
   }
   while (section->isPartial() && section->currentPage >= static_cast<int>(section->pageCount)) {
     if (!section->isBuilding() && !section->startBuild(renderSpec)) {
@@ -1926,7 +1926,10 @@ void EpubReaderActivity::renderContents(std::unique_ptr<Page> page, const int or
   if (pageHasImagesNeedingDecode) {
     // The placeholder frame consumes a queued clearing promotion; carry the
     // clear over to the decoded page as well.
-    if (renderer.hasPendingClearingRefresh()) refreshPolicy.requestClear();
+    if (renderer.hasPendingClearingRefresh()) {
+      refreshPolicy.requestClear(renderer.hasPendingManualRefresh() ? AdaptiveRefreshPolicy::ClearSource::Manual
+                                                                    : AdaptiveRefreshPolicy::ClearSource::External);
+    }
     page->renderWithImagePlaceholders(renderer, fontId, orientedMarginLeft, orientedMarginTop);
     renderStatusBar();
     renderer.displayBuffer(HalDisplay::FAST_REFRESH);

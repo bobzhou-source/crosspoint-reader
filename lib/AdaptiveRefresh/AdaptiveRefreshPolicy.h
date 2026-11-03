@@ -43,6 +43,10 @@ class AdaptiveRefreshPolicy {
     SafetyCap        // kSafetyCap fast refreshes in a row; bound only, not the normal rule
   };
 
+  // Who asked for a Requested/External clear. Bookkeeping for the usage log
+  // only; it never changes a decision. Manual outranks every other source.
+  enum class ClearSource : uint8_t { None, Other, Image, Popup, External, Manual };
+
   struct Inputs {
     freeink::FrameChangeMetrics frame;
     // Real page metadata (not a setting): the page contains a decoded image.
@@ -56,12 +60,33 @@ class AdaptiveRefreshPolicy {
     bool externalClearPending = false;
     // The panel output is inverted (night mode): the night threshold applies.
     bool invertedOutput = false;
+    // The queued renderer promotion came from a user's refresh command (the
+    // control center's refresh tile). Only labels the clear; see ClearRecord.
+    bool externalManual = false;
   };
 
   struct Decision {
     Refresh refresh;
     Reason reason;
   };
+
+  // One committed clear, for the benchmark recorder's refresh rows. Counts
+  // cover the fast refreshes since the previous committed clear.
+  struct ClearRecord {
+    Reason reason = Reason::None;  // None: the caller cleared although decide() said fast
+    ClearSource source = ClearSource::None;
+    uint16_t fastTurns = 0;   // fast refreshes since the previous clear (saturating)
+    uint16_t imagePages = 0;  // of those, frames with a page image
+    uint16_t grayPages = 0;   // of those, frames with a visible grayscale pass
+    uint32_t debtPermille = 0;       // debt plus this frame's charge, thousandths of a screen
+    uint32_t thresholdPermille = 0;  // clear threshold in force for this frame's polarity
+    bool inverted = false;
+    bool image = false;      // the clearing frame itself has a page image
+    bool grayscale = false;  // the clearing frame itself has a visible grayscale pass
+    bool manual() const { return source == ClearSource::Manual; }
+  };
+  // Called from commit(Clear) only; never on a fast refresh. No I/O expected.
+  using ClearObserver = void (*)(void* context, const ClearRecord& record);
 
   // --- Identity: bump BOTH whenever a threshold, weight or rule below changes, so
   // benchmark/settings metadata can never describe a different policy than the one
@@ -129,7 +154,14 @@ class AdaptiveRefreshPolicy {
   const Config& config() const { return config_; }
 
   // Sticky until a Clear is committed. Not charged as debt.
-  void requestClear() { clearRequested_ = true; }
+  void requestClear(ClearSource source = ClearSource::Other) {
+    clearRequested_ = true;
+    if (clearSource_ != ClearSource::Manual) clearSource_ = source;
+  }
+  void setClearObserver(ClearObserver observer, void* context) {
+    observer_ = observer;
+    observerContext_ = context;
+  }
 
   // Call right after committing a page with an inline picture. With
   // clearAfterImage the next page is a requested clear. Without it the
@@ -166,6 +198,7 @@ class AdaptiveRefreshPolicy {
 
  private:
   uint32_t chargeFor(const Inputs& in) const;
+  ClearRecord labelFor(const Inputs& in, Reason reason) const;
 
   Config config_;
   uint32_t debt_ = 0;            // weighted changed pixels since the last clear (saturating)
@@ -179,4 +212,12 @@ class AdaptiveRefreshPolicy {
   bool pendingValid_ = false;
   bool pendingFrameValid_ = false;
   bool prevInkKnown_ = false;
+
+  // Usage-log bookkeeping (never read by decide()).
+  ClearObserver observer_ = nullptr;
+  void* observerContext_ = nullptr;
+  ClearRecord pendingRecord_;  // this frame's labels, set by decide()
+  ClearSource clearSource_ = ClearSource::None;
+  uint16_t imagePages_ = 0;
+  uint16_t grayPages_ = 0;
 };

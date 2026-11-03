@@ -8,7 +8,7 @@ namespace benchmark {
 enum class SessionMode : uint8_t { Normal, Automatic };
 enum class EventType : uint8_t {
   Activity, Render, Display, Busy, Memory, Index, Phase, Input, Sleep, Loss, Flush, End, ReaderSettings, DisplaySettings,
-  RunStep, RunResult, SyncRun, Battery
+  RunStep, RunResult, SyncRun, Battery, RefreshClear, ManualRefresh
 };
 enum class StopReason : uint8_t {
   Sleep = 0, UsbDrive = 1, Restart = 2, Limit = 3, User = 4, Complete = 5, Cancelled = 6, Failure = 7

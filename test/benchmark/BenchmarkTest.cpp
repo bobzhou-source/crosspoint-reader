@@ -112,6 +112,8 @@ TEST(BenchmarkBuffer, SessionAndStopEnumsKeepAppendedSlots) {
   EXPECT_EQ(static_cast<uint8_t>(EventType::RunResult), 15);
   EXPECT_EQ(static_cast<uint8_t>(EventType::SyncRun), 16);
   EXPECT_EQ(static_cast<uint8_t>(EventType::Battery), 17);
+  EXPECT_EQ(static_cast<uint8_t>(EventType::RefreshClear), 18);
+  EXPECT_EQ(static_cast<uint8_t>(EventType::ManualRefresh), 19);
 }
 
 TEST(BenchmarkWriter, SerializesMonotonicPairsAndTypedNumericData) {
@@ -182,7 +184,7 @@ TEST(BenchmarkWriter, RejectsEventTypesPastTheNameTable) {
   Writer writer;
   writer.begin(Sink::write, &sink);
   Event event;
-  event.type = static_cast<EventType>(static_cast<uint8_t>(EventType::Battery) + 1);
+  event.type = static_cast<EventType>(static_cast<uint8_t>(EventType::ManualRefresh) + 1);
   EXPECT_EQ(writer.event(event), Writer::Result::Failed);
   EXPECT_TRUE(sink.output.empty());
 }

@@ -17,6 +17,8 @@ class ReaderActivity : public Activity {
   std::string bookPath;
   // Chooses fast vs clearing refreshes for this reader's pages; guarded by the render lock.
   AdaptiveRefreshPolicy refreshPolicy;
+  // FNV-1a of bookPath: identifies the book in benchmark refresh rows without recording the path.
+  uint32_t bookId;
 
   std::unique_ptr<EndOfBookOptions> endOfBookOptions;
   std::atomic<bool> endOfBookOptionsReady{false};
@@ -106,4 +108,6 @@ class ReaderActivity : public Activity {
   bool benchmarkInitialPage = true;
   bool benchmarkRenderFailed = false;
   bool benchmarkFinished = false;
+
+  static void recordClear(void* context, const AdaptiveRefreshPolicy::ClearRecord& record);
 };

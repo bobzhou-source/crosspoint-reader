@@ -30,6 +30,10 @@ void AdaptiveRefreshPolicy::reset(bool initialClearRequired) {
   pendingValid_ = false;
   pendingFrameValid_ = false;
   prevInkKnown_ = false;
+  pendingRecord_ = ClearRecord{};
+  clearSource_ = ClearSource::None;
+  imagePages_ = 0;
+  grayPages_ = 0;
 }
 
 uint32_t AdaptiveRefreshPolicy::estimateChangedPixels(const freeink::FrameChangeMetrics& frame) const {
@@ -80,21 +84,55 @@ AdaptiveRefreshPolicy::Decision AdaptiveRefreshPolicy::decide(const Inputs& in) 
   } else if (fastSinceClear_ >= config_.safetyCap) {
     reason = Reason::SafetyCap;
   }
+  pendingRecord_ = labelFor(in, reason);
   return {reason == Reason::None ? Refresh::Fast : Refresh::Clear, reason};
+}
+
+AdaptiveRefreshPolicy::ClearRecord AdaptiveRefreshPolicy::labelFor(const Inputs& in, const Reason reason) const {
+  ClearRecord record;
+  record.reason = reason;
+  if (reason == Reason::Requested) {
+    record.source = clearSource_ == ClearSource::None ? ClearSource::Other : clearSource_;
+  } else if (reason == Reason::External) {
+    record.source = ClearSource::External;
+  }
+  if ((reason == Reason::Requested || reason == Reason::External) && in.externalClearPending && in.externalManual) {
+    record.source = ClearSource::Manual;
+  }
+  const uint64_t pixels = pendingFrameValid_ ? in.frame.pixelCount : 0;
+  if (pixels) record.debtPermille = saturate((static_cast<uint64_t>(debt_) + pendingCharge_) * 1000 / pixels);
+  record.thresholdPermille = in.invertedOutput ? config_.nightClearThresholdPermille : config_.clearThresholdPermille;
+  record.inverted = in.invertedOutput;
+  record.image = in.hasImage;
+  record.grayscale = in.visibleGrayscale;
+  return record;
 }
 
 void AdaptiveRefreshPolicy::commit(Refresh displayed) {
   if (displayed == Refresh::Clear) {
+    if (observer_) {
+      ClearRecord record = pendingValid_ ? pendingRecord_ : ClearRecord{};
+      if (!pendingValid_) record.source = clearSource_;
+      record.fastTurns = fastSinceClear_;
+      record.imagePages = imagePages_;
+      record.grayPages = grayPages_;
+      observer_(observerContext_, record);
+    }
     debt_ = 0;
     fastSinceClear_ = 0;
     initialClear_ = false;
     clearRequested_ = false;
     clearedCharge_ = pendingValid_ ? pendingCharge_ : 0;
+    clearSource_ = ClearSource::None;
+    imagePages_ = 0;
+    grayPages_ = 0;
   } else {
     clearedCharge_ = 0;
     if (pendingValid_) {
       debt_ = saturate(static_cast<uint64_t>(debt_) + pendingCharge_);
       if (fastSinceClear_ != 0xFFFFu) ++fastSinceClear_;
+      if (pendingRecord_.image && imagePages_ != 0xFFFFu) ++imagePages_;
+      if (pendingRecord_.grayscale && grayPages_ != 0xFFFFu) ++grayPages_;
     }
   }
   if (pendingValid_ && pendingFrameValid_) {
@@ -108,7 +146,7 @@ void AdaptiveRefreshPolicy::commit(Refresh displayed) {
 
 void AdaptiveRefreshPolicy::imagePageShown() {
   if (config_.clearAfterImage) {
-    clearRequested_ = true;
+    requestClear(ClearSource::Image);
     return;
   }
   debt_ = saturate(static_cast<uint64_t>(debt_) + clearedCharge_);

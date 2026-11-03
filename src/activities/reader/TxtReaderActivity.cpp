@@ -302,7 +302,7 @@ bool TxtReaderActivity::indexThrough(const size_t offset, const int page) {
   if (indexFailed) return false;
 
   const Rect popup = GUI.drawPopup(renderer, tr(STR_INDEXING));
-  refreshPolicy.requestClear();
+  refreshPolicy.requestClear(AdaptiveRefreshPolicy::ClearSource::Popup);
 
   const size_t target = std::max<size_t>(1, std::min(offset, txt->getFileSize()));
   int shownPercent = 0;
@@ -707,7 +707,7 @@ void TxtReaderActivity::openMenu() {
             break;
           case TxtReaderMenuActivity::MenuAction::REFRESH_SCREEN: {
             RenderLock lock;
-            refreshPolicy.requestClear();
+            refreshPolicy.requestClear(AdaptiveRefreshPolicy::ClearSource::Manual);
             break;
           }
           case TxtReaderMenuActivity::MenuAction::FRONTLIGHT:

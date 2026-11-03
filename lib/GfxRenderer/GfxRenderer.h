@@ -77,6 +77,7 @@ class GfxRenderer {
   // displayBuffer() is const but must consume the flag.
   mutable bool promotedRefreshPending_ = false;
   mutable HalDisplay::RefreshMode promotedRefresh_ = HalDisplay::FAST_REFRESH;
+  mutable bool promotedManual_ = false;
   // Swap in (and clear) the promoted mode, if one is pending.
   HalDisplay::RefreshMode applyPromotedRefresh(HalDisplay::RefreshMode refreshMode) const;
 
@@ -221,16 +222,19 @@ class GfxRenderer {
   // call uses `mode` instead of what its caller asked for, then the override
   // clears itself. Lets a closing overlay (the control center's refresh tile)
   // hand a ghost-cleanup waveform to the repaint of whatever screen is
-  // underneath, which it cannot reach directly.
-  void promoteNextRefresh(const HalDisplay::RefreshMode mode) const {
+  // underneath, which it cannot reach directly. `manual` marks a user's refresh
+  // command; it only labels the clear in the benchmark refresh rows.
+  void promoteNextRefresh(const HalDisplay::RefreshMode mode, const bool manual = false) const {
     promotedRefreshPending_ = true;
     promotedRefresh_ = mode;
+    promotedManual_ = manual;
   }
   // True while a promotion to a clearing (HALF/FULL) refresh is queued, so a
   // reader's refresh policy can account the next frame as a clear.
   bool hasPendingClearingRefresh() const {
     return promotedRefreshPending_ && promotedRefresh_ != HalDisplay::FAST_REFRESH;
   }
+  bool hasPendingManualRefresh() const { return hasPendingClearingRefresh() && promotedManual_; }
   // Read-only pixel statistics of the composed framebuffer against the last
   // displayed frame; see HalDisplay::measureFrameChange. Call after drawing and
   // before displaying the frame.
