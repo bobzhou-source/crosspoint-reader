@@ -35,6 +35,10 @@ class ImageBlock final : public Block {
   // Epub, cleared on its exit.
   using ExtractFn = bool (*)(void* ctx, const char* srcPath, const char* destPath);
   static void setExtractor(void* ctx, ExtractFn fn);
+  // Extracts the source file out of the book if only its header was probed so
+  // far (render() does this lazily; the full-screen picture viewer reads the
+  // source too).
+  void ensureExtracted() const;
 
   BlockType getType() override { return IMAGE_BLOCK; }
   bool isEmpty() override { return false; }

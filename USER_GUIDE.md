@@ -43,6 +43,7 @@ Welcome to the **CrossPoint** firmware. This guide outlines the hardware control
     - [Auto Page Turn](#auto-page-turn)
     - [Tilt Page Turn (X3 only)](#tilt-page-turn-x3-only)
     - [Footnote Navigation](#footnote-navigation)
+    - [Picture Viewer](#picture-viewer)
     - [Dictionary Lookup](#dictionary-lookup)
     - [System Navigation](#system-navigation)
     - [Supported Languages](#supported-languages)
@@ -695,6 +696,14 @@ On the **Xteink X3**, the gyroscope can be used to turn pages by tilting the dev
 When reading an EPUB that contains footnotes, you can navigate to the footnote text by selecting the footnote reference in the book. From the footnote, you can return to your original reading position.
 
 If the device goes to sleep or you close the book while viewing a footnote, the book reopens to your original reading position, not the footnote.
+
+### Picture Viewer
+
+On a touchscreen (X4 Pro, with touch reader controls on), a short tap on a picture in an EPUB page shows it full-screen. The picture is decoded again from the book's original image file at screen size, not enlarged from the page copy, and fit to the screen with its proportions kept: small pictures are scaled up, large ones down. A landscape picture that would come out clearly larger turned a quarter is shown sideways, its top along the left edge; turn the reader a quarter clockwise to look at it. The first view of a picture shows **Loading** while it decodes; the full-screen copy is then kept in the book's cache, so looking at it again opens without the wait.
+
+Tap anywhere, swipe Back from the left edge, or press any button to return to the same page. The page is redrawn with a clearing refresh but not re-paginated, and your reading position does not change.
+
+Only pictures at least 48 pixels wide and tall on the page count as tap targets, so small ornaments and inline icons keep the normal page-turn and menu taps; taps beside a picture also behave as before. A link on a picture wins over the picture. A held tap on a picture is not a picture tap: it does what it did before (with tap page turns, a chapter skip). A picture the page can only show as a placeholder box because it is too large to decode (for example a very wide PNG) shows **Picture too large to show**, and a file the reader cannot decode shows **Cannot open file**.
 
 ### Annotations
 

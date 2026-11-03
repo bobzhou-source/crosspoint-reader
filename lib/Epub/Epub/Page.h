@@ -10,6 +10,7 @@
 
 #include "FootnoteEntry.h"
 #include "PageLink.h"
+#include "PagePicture.h"
 #include "blocks/ImageBlock.h"
 #include "blocks/TextBlock.h"
 
@@ -162,5 +163,22 @@ class Page {
       outH = maxY - minY;
     }
     return found;
+  }
+
+  // Tap targets for the full-screen picture viewer: every image's page rect.
+  // Reuses `out`'s capacity, so steady page turns do not allocate.
+  void collectPictures(std::vector<PagePicture>& out) const {
+    out.clear();
+    for (size_t i = 0; i < elements.size() && i <= UINT16_MAX; i++) {
+      if (elements[i]->getTag() != TAG_PageImage) continue;
+      const auto& img = static_cast<const PageImage&>(*elements[i]);
+      PagePicture picture;
+      picture.x = img.xPos;
+      picture.y = img.yPos;
+      picture.width = img.getImageBlock().getWidth();
+      picture.height = img.getImageBlock().getHeight();
+      picture.element = static_cast<uint16_t>(i);
+      out.push_back(picture);
+    }
   }
 };

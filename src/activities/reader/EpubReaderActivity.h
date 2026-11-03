@@ -122,6 +122,8 @@ class EpubReaderActivity : public ReaderActivity {
   // Footnote support
   std::vector<FootnoteEntry> currentPageFootnotes;
   std::vector<PageLink> currentPageLinks;
+  // Picture tap targets of the page on screen (same frame/margins as links).
+  std::vector<PagePicture> currentPagePictures;
   int currentPageLinkMarginLeft = 0;
   int currentPageLinkMarginTop = 0;
   struct SavedPosition {
@@ -196,6 +198,9 @@ class EpubReaderActivity : public ReaderActivity {
   void activateMoreRow(int row);
   void openFootnoteSelect(bool reopenMenuOnCancel);
   void openDictionaryWordSelect();
+  // Opens the picture at currentPagePictures[index] full-screen. False when the
+  // target is stale (no longer the page's picture) so the tap falls through.
+  bool openPictureViewer(size_t index);
   bool launchKOReaderSync();
   unsigned long confirmLongPressThreshold() const;
   void toggleAutoPageTurn(uint8_t selectedPageTurnOption);

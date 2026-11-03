@@ -35,6 +35,10 @@ class ImageToFramebufferDecoder {
 
   virtual const char* getFormatName() const = 0;
 
+  // True when the last decodeToFramebuffer() refused the source for its size
+  // (a limit of the decoder, not a broken file), so a viewer can say so.
+  bool lastDecodeTooLarge() const { return decodeTooLarge; }
+
   // Call from per-row/per-MCU decode callbacks (free functions, hence public):
   // yields one tick at most every 250 ms so multi-second decodes keep the idle
   // task (and its watchdog) fed. `lastYieldMs` is caller-held state,
@@ -45,7 +49,6 @@ class ImageToFramebufferDecoder {
   // representation. Shared by header probing and decoder fallbacks.
   static bool validateAndStoreDimensions(int64_t width, int64_t height, ImageDimensions& out, const char* format);
 
- protected:
   // Size validation helpers. The cap bounds decode TIME, not memory: both decoders
   // stream (JPEG in MCU bands at 1/2..1/8 coarse scale, PNG scanline-by-scanline
   // with its own width-based row-buffer guard), so RAM never scales with source
@@ -55,6 +58,9 @@ class ImageToFramebufferDecoder {
   // task's watchdog.
   static constexpr int64_t MAX_SOURCE_DIMENSION = INT16_MAX;
   static constexpr int64_t MAX_SOURCE_PIXELS = 8388608;  // 8 MP (e.g. 2048 * 4096)
+
+ protected:
+  bool decodeTooLarge = false;
 
   void warnUnsupportedFeature(const std::string& feature, const std::string& imagePath);
 };

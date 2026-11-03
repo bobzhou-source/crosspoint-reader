@@ -31,6 +31,7 @@
 #include "CrossPointSettings.h"
 #include "CrossPointState.h"
 #include "DictionaryWordSelectActivity.h"
+#include "EpubPictureViewerActivity.h"
 #include "EpubReaderBookmarksActivity.h"
 #include "EpubReaderChapterSelectionActivity.h"
 #include "EpubReaderFootnoteSelectActivity.h"
@@ -366,6 +367,42 @@ void EpubReaderActivity::openDictionaryWordSelect() {
                          [this](const ActivityResult&) { requestUpdate(); });
 }
 
+bool EpubReaderActivity::openPictureViewer(const size_t index) {
+  if (!section || index >= currentPagePictures.size()) return false;
+  auto page = section->loadPage(section->currentPage);
+  if (!page) return false;
+  // The targets describe the page last rendered; a turn queued since then has
+  // moved currentPage, so only open when the loaded element is that picture.
+  const PagePicture& target = currentPagePictures[index];
+  if (target.element >= page->elements.size() || page->elements[target.element]->getTag() != TAG_PageImage) {
+    return false;
+  }
+  const auto& image = static_cast<const PageImage&>(*page->elements[target.element]);
+  const ImageBlock& block = image.getImageBlock();
+  if (image.xPos != target.x || image.yPos != target.y || block.getWidth() != target.width ||
+      block.getHeight() != target.height) {
+    return false;
+  }
+  block.ensureExtracted();
+  auto viewer = makeUniqueNoThrow<EpubPictureViewerActivity>(renderer, mappedInput, block.getImagePath());
+  if (!viewer) {
+    LOG_ERR("ERS", "OOM: picture viewer");
+    return false;
+  }
+  pendingManualTurn = 0;
+  // The section stays loaded underneath, so returning re-renders this page
+  // without re-paginating. The page replaces a grayscale picture, so it comes
+  // back with a clearing refresh rather than a differential one.
+  startActivityForResult(std::move(viewer), [this](const ActivityResult&) {
+    {
+      RenderLock lock;
+      refreshPolicy.requestClear(AdaptiveRefreshPolicy::ClearSource::Image);
+    }
+    requestUpdate();
+  });
+  return true;
+}
+
 void EpubReaderActivity::openFootnoteSelect(const bool reopenMenuOnCancel) {
   if (!section || currentPageFootnotes.empty()) return;
   if (currentPageFootnotes.size() == 1) {
@@ -638,6 +675,22 @@ void EpubReaderActivity::loop() {
                                                       currentPageLinkMarginTop);
       if (link) {
         navigateToHref(link->href, true);
+        return;
+      }
+    }
+  }
+
+  // Picture taps open the picture full-screen; taps beside a picture reach the
+  // menu and page-turn zones below unchanged. Held taps keep their chapter skip.
+  if (!atEndOfBook && !currentPagePictures.empty() && SETTINGS.touchReaderControls && mappedInput.hasTouch()) {
+    int touchX = 0;
+    int touchY = 0;
+    if (mappedInput.wasScreenTapped(touchX, touchY) && gpio.lastTouchHeldMs() < ReaderUtils::SKIP_HOLD_MS) {
+      // Waits out a page render in progress: it republishes the targets.
+      RenderLock lock;
+      const int picture = page_picture::pictureAtPoint(currentPagePictures, touchX, touchY, currentPageLinkMarginLeft,
+                                                       currentPageLinkMarginTop);
+      if (picture >= 0 && openPictureViewer(static_cast<size_t>(picture))) {
         return;
       }
     }
@@ -1235,6 +1288,7 @@ void EpubReaderActivity::renderSourceNavigationError() {
 
 void EpubReaderActivity::renderBook() {
   currentPageLinks.clear();
+  currentPagePictures.clear();
   if (!epub) return;
   // Runs under the render task's RenderLock; catches every requestUpdate()
   // exit from the overlay while its deferred chrome refresh is still pending.
@@ -1561,10 +1615,12 @@ void EpubReaderActivity::renderBook() {
       currentPageVisibleOffset = prerender.visibleTextOffset;
       currentPageFootnotes = prerender.footnotes;
       currentPageLinks = prerender.links;
+      currentPagePictures = prerender.pictures;
     } else {
       currentPageVisibleOffset = p->visibleTextOffset;
       currentPageFootnotes = std::move(p->footnotes);
       currentPageLinks = std::move(p->links);
+      p->collectPictures(currentPagePictures);
     }
     currentPageLinkMarginLeft = orientedMarginLeft;
     currentPageLinkMarginTop = orientedMarginTop;
@@ -1881,6 +1937,7 @@ bool EpubReaderActivity::prerenderPage(const Page& page, const int spineIndex, c
   prerender.visibleTextOffset = page.visibleTextOffset;
   prerender.footnotes = page.footnotes;
   prerender.links = page.links;
+  page.collectPictures(prerender.pictures);
   const bool committed = prerender.slot.commit(key);
   report(committed ? (wantPlanes ? Outcome::BuiltWithPlanes : Outcome::Built) : Outcome::SkippedIneligible);
   LOG_DBG("ERS", "Prerender: page %d.%d built in %lums (planes: %d)", spineIndex, pageIndex, millis() - t0,
