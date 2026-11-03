@@ -335,6 +335,15 @@ void EpubReaderActivity::showBuildPopup(GfxRenderer& renderer) {
   buildPopupPending = false;
 }
 
+void EpubReaderActivity::pageTextMargins(int& left, int& top) const {
+  int right = 0;
+  int bottom = 0;
+  renderer.getOrientedViewableTRBL(&top, &right, &bottom, &left);
+  const uint8_t margin = SETTINGS.readerMargin(renderer.getScreenWidth() > renderer.getScreenHeight());
+  top += margin;
+  left += margin;
+}
+
 void EpubReaderActivity::openDictionaryWordSelect() {
   if (SETTINGS.dictionaryName[0] == '\0') {
     showDictionaryMessage = true;
@@ -346,16 +355,62 @@ void EpubReaderActivity::openDictionaryWordSelect() {
   auto page = section->loadPage(section->currentPage);
   if (!page) return;
 
-  int orientedMarginTop, orientedMarginRight, orientedMarginBottom, orientedMarginLeft;
-  renderer.getOrientedViewableTRBL(&orientedMarginTop, &orientedMarginRight, &orientedMarginBottom,
-                                   &orientedMarginLeft);
-  const uint8_t margin = SETTINGS.readerMargin(renderer.getScreenWidth() > renderer.getScreenHeight());
-  orientedMarginTop += margin;
-  orientedMarginLeft += margin;
+  int marginLeft = 0;
+  int marginTop = 0;
+  pageTextMargins(marginLeft, marginTop);
+  startActivityForResult(
+      std::make_unique<DictionaryWordSelectActivity>(renderer, mappedInput, std::move(page), marginLeft, marginTop),
+      [this](const ActivityResult&) { requestUpdate(); });
+}
 
-  startActivityForResult(std::make_unique<DictionaryWordSelectActivity>(renderer, mappedInput, std::move(page),
-                                                                        orientedMarginLeft, orientedMarginTop),
-                         [this](const ActivityResult&) { requestUpdate(); });
+bool EpubReaderActivity::handleWordHold() {
+  int x = 0;
+  int y = 0;
+  if (!section || !mappedInput.peekScreenLongPress(x, y)) return false;
+  const auto zone = ReaderUtils::touchZoneAt(renderer, x, y, ReaderUtils::isRtlBookLanguage(epub->getLanguage()));
+  const bool zoneHoldActions = ReaderUtils::touchZoneHoldActions();
+  if (ReaderTouchZones::zoneOwnsHold(zone, zoneHoldActions)) return false;
+
+  // The hit test runs on the reader's own page before anything is pushed, so
+  // a hold on blank space changes nothing on screen.
+  std::unique_ptr<Page> page;
+  std::vector<DictionaryPageWords::WordBox> words;
+  uint16_t rowCount = 0;
+  int hit = -1;
+  int marginLeft = 0;
+  int marginTop = 0;
+  {
+    RenderLock lock;  // the font cache and section file are shared with the render task
+    page = section->loadPage(section->currentPage);
+    if (!page) return false;
+    pageTextMargins(marginLeft, marginTop);
+    const int fontId = SETTINGS.getReaderFontId();
+    DictionaryPageWords::extract(renderer, *page, fontId, marginLeft, marginTop, words, rowCount);
+    hit = DictionaryPageWords::wordNear(words, x, y, renderer.getLineHeight(fontId));
+  }
+  switch (ReaderTouchZones::holdAction(zone, zoneHoldActions, hit >= 0, SETTINGS.dictionaryName[0] != '\0')) {
+    case ReaderTouchZones::HoldAction::None:
+      return false;
+    case ReaderTouchZones::HoldAction::NoDictionary:
+      mappedInput.suppressScreenContact();
+      automaticPageTurnActive = false;
+      showDictionaryMessage = true;
+      dictionaryMessageTime = millis();
+      requestUpdate();
+      return true;
+    case ReaderTouchZones::HoldAction::Lookup:
+      break;
+  }
+  mappedInput.suppressScreenContact();
+  automaticPageTurnActive = false;
+  auto lookup = makeUniqueNoThrow<DictionaryWordSelectActivity>(renderer, mappedInput, std::move(page), marginLeft,
+                                                                marginTop, std::move(words), rowCount, hit);
+  if (!lookup) {
+    LOG_ERR("ERA", "OOM: DictionaryWordSelectActivity");
+    return true;
+  }
+  startActivityForResult(std::move(lookup), [this](const ActivityResult&) { requestUpdate(); });
+  return true;
 }
 
 void EpubReaderActivity::openFootnoteSelect(const bool reopenMenuOnCancel) {
@@ -619,6 +674,13 @@ void EpubReaderActivity::loop() {
       default:
         break;
     }
+  }
+
+  // A press and hold on a word is its own gesture, taken while the finger is
+  // still down, so it sits ahead of the tap handlers below.
+  if (!atEndOfBook && !endOfBookMenuOpen && SETTINGS.touchReaderControls && mappedInput.hasTouch() &&
+      handleWordHold()) {
+    return;
   }
 
   // Link taps take priority over the reader-menu and page-turn zones.

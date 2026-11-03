@@ -25,12 +25,13 @@ The Dictionary setting only appears when at least one usable dictionary folder e
 
 ## Looking Up a Word
 
-Two ways to start a lookup while reading:
+Three ways to start a lookup while reading:
 
+- On a touch screen, **press and hold a word** on the page for about half a second. Its definition opens straight away; **Back** returns to the same page. A hold on blank space (margins, the gap between paragraphs, the empty end of a short line) does nothing, and the finger may land up to about one space outside the word. For Chinese, hold the **first character** of the word. If no dictionary is selected, the reader shows the usual "no dictionary" note. When a page-turn button hold (**Long-press Chapter Skip**, or rotating) is set and page turns use tap zones, a hold on those zones keeps that meaning; elsewhere, including the centre menu area, a hold on a word looks it up. Short taps are unchanged.
 - Open the reader menu (**Confirm**) and choose **Look Up**.
 - Or set **Settings → Controls → Long-press Menu** to "Dictionary", then hold **Confirm** (~0.4s) on the reading page.
 
-One word on the page becomes highlighted:
+The last two highlight one word on the page:
 
 1. Use **Left/Right** to move between words in reading order, and the side **Up/Down** buttons to jump between lines.
 2. Press **Confirm** to look up the highlighted word.
@@ -43,7 +44,7 @@ On the very first lookup with a dictionary (and again whenever the `.idx` or `.s
 1. **Direct match** — the word is found as-is (case-insensitive) in the dictionary index. Surrounding punctuation is ignored.
 2. **Synonyms** — on a miss, if the dictionary ships a `.syn` file, alternate spellings and irregular forms recorded there are resolved to their headword (e.g. `oxen` → `ox`, `colour` → `color`). This step is skipped if the `.sidx` sidecar could not be built (e.g. transient low memory during indexing); the dictionary otherwise stays usable, and the build is retried the next time it is opened.
 3. **Stemming** — still no match: common English word forms are retried automatically: possessives and plurals (`dogs` → `dog`, `stories` → `story`) and verb endings (`walked` → `walk`, `running` → `run`, `making` → `make`).
-4. **Not found** — a short popup appears and you return to word selection.
+4. **Not found** — a short popup appears and you return to word selection (or, after a press and hold, to the page).
 
 ## The Definition Screen
 

@@ -6,7 +6,6 @@
 #include <freertos/FreeRTOS.h>
 #include <freertos/task.h>
 
-#include <cctype>
 #include <climits>
 #include <cstdlib>
 
@@ -21,23 +20,6 @@ constexpr unsigned long POPUP_DURATION_MS = 1500;
 constexpr unsigned long WORD_REPEAT_START_MS = 500;
 constexpr unsigned long WORD_REPEAT_INTERVAL_MS = 500;
 
-// A token is selectable when it has an ASCII alphanumeric or a non-ASCII
-// codepoint outside U+2000-U+206F (dashes, bullets and other General
-// Punctuation that appear as standalone tokens are not words).
-bool isSelectableToken(const char* text) {
-  for (const uint8_t* p = reinterpret_cast<const uint8_t*>(text); *p != 0; p++) {
-    if (*p < 0x80) {
-      if (std::isalnum(*p)) return true;
-    } else if (*p == 0xE2 && (p[1] == 0x80 || p[1] == 0x81)) {
-      if (p[2] == 0) break;  // truncated sequence: skipping would step past the NUL
-      p += 2;                // skip the 3-byte General Punctuation codepoint
-    } else {
-      return true;
-    }
-  }
-  return false;
-}
-
 void indexBuildYield(void*) { vTaskDelay(1); }
 
 }  // namespace
@@ -46,11 +28,16 @@ void DictionaryWordSelectActivity::onEnter() {
   Activity::onEnter();
   fontId = SETTINGS.getReaderFontId();
   lineHeight = renderer.getLineHeight(fontId);
+  if (direct) {
+    // The reader's frame stays up; loop() starts the lookup.
+    directLookupPending = true;
+    return;
+  }
   // No null check: a failed allocation just disables the differential
   // fast path (drawHighlightWithSnapshot skips the read), keeping the
   // full-repaint path as the fallback.
   snapshot = makeUniqueNoThrow<uint8_t[]>(SNAPSHOT_CAPACITY);
-  extractWords();
+  DictionaryPageWords::extract(renderer, *page, fontId, marginLeft, marginTop, words, rowCount);
   // Start on the middle row's word nearest mid-screen instead of top-left:
   // any word on the page is then at most half a page of moves away.
   if (!words.empty()) {
@@ -58,126 +45,6 @@ void DictionaryWordSelectActivity::onEnter() {
     if (initial >= 0) selected = initial;
   }
   requestUpdate();
-}
-
-void DictionaryWordSelectActivity::extractWords() {
-  words.clear();
-  words.reserve(128);
-  rowCount = 0;
-
-  // Single walk: collect the selectable words while accumulating their text
-  // and styles (~2KB transient string, freed on return). Widths are measured
-  // afterwards: merging the page's codepoints into the SD font's persistent
-  // advance table first keeps getTextAdvanceX on the in-RAM path instead of
-  // loading glyphs from SD one overflow slot at a time.
-  std::string pageText;
-  pageText.reserve(2048);
-  uint8_t styleMask = 0;
-  uint16_t run = 0;
-
-  for (const auto& element : page->elements) {
-    if (element->getTag() != TAG_PageLine) continue;
-    const auto* line = static_cast<const PageLine*>(element.get());
-    const auto* block = line->getBlock();
-    if (!block || !block->valid()) continue;
-
-    bool rowHasWords = false;
-    ++run;  // A rendered line is a bounded run; never cross paragraph/line gaps.
-    const int ascender = renderer.getFontAscenderSize(fontId);
-    const int rubyShift = block->getRubyShift(ascender);
-    for (uint16_t i = 0; i < block->wordCount(); i++) {
-      const char* text = block->wordText(i);
-      bool hasCjk = false;
-      for (const char* p = text; *p;) {
-        uint32_t cp;
-        const size_t n = CjkDictionary::characterBytes(p, cp);
-        hasCjk = hasCjk || CjkDictionary::isCjk(cp);
-        p += n;
-      }
-      WordBox box;
-      box.x = static_cast<int16_t>(line->xPos + block->wordXpos(i) + marginLeft);
-      box.y = static_cast<int16_t>(line->yPos + marginTop + rubyShift);
-      box.style = block->wordStyle(i);
-      box.width = 0;
-      box.row = rowCount;
-      box.text = text;
-      if (hasCjk) {
-        // Punctuation can be glued to the same layout token as a Han character.
-        // Keep it out of the run without changing the displayed text.
-        for (const char* p = text; *p;) {
-          uint32_t cp;
-          const size_t n = CjkDictionary::characterBytes(p, cp);
-          if (CjkDictionary::isCjk(cp)) {
-            box.text = p;
-            box.cjkBytes = static_cast<uint8_t>(n);
-            box.run = run;
-            words.push_back(box);
-            rowHasWords = true;
-          } else {
-            ++run;
-          }
-          p += n;
-        }
-      } else {
-        ++run;
-        if (isSelectableToken(text)) {
-          words.push_back(box);
-          rowHasWords = true;
-        }
-      }
-
-      pageText.append(text);
-      pageText.push_back(' ');
-      styleMask |= static_cast<uint8_t>(1u << (static_cast<uint8_t>(box.style) & 0x03));
-    }
-    if (rowHasWords) rowCount++;
-  }
-
-  if (styleMask == 0) styleMask = 0x01;  // REGULAR
-  renderer.ensureSdCardFontReady(fontId, pageText.c_str(), styleMask);
-  size_t wordIndex = 0;
-  for (const auto& element : page->elements) {
-    if (element->getTag() != TAG_PageLine) continue;
-    const auto* block = static_cast<const PageLine*>(element.get())->getBlock();
-    if (!block || !block->valid()) continue;
-    for (uint16_t i = 0; i < block->wordCount(); ++i) {
-      const char* text = block->wordText(i);
-      if (wordIndex < words.size() && words[wordIndex].text == text && !words[wordIndex].cjkBytes) {
-        auto& word = words[wordIndex++];
-        word.width = static_cast<int16_t>(renderer.getTextAdvanceX(fontId, text, word.style));
-        continue;
-      }
-      int advance = 0;
-      for (const char* p = text; *p;) {
-        uint32_t cp;
-        const size_t n = CjkDictionary::characterBytes(p, cp);
-        char character[5] = {};
-        memcpy(character, p, n);
-        const int width = renderer.getTextAdvanceX(fontId, character, block->wordStyle(i));
-        if (wordIndex < words.size() && words[wordIndex].text == p) {
-          auto& word = words[wordIndex++];
-          word.x += advance;
-          word.width = static_cast<int16_t>(width);
-        }
-        advance += width;
-        p += n;
-      }
-    }
-  }
-}
-
-// Index of the word whose box (with finger-sized slop) contains the touch
-// point; -1 when the touch lands on no word. Boxes never overlap after the
-// slop grows them, at worst they touch, so first hit wins.
-int DictionaryWordSelectActivity::wordAt(const int x, const int y) const {
-  constexpr int SLOP = 4;  // matches the highlight box (+2) plus finger error
-  for (int i = 0; i < static_cast<int>(words.size()); i++) {
-    const WordBox& word = words[i];
-    if (x >= word.x - SLOP && x < word.x + word.width + SLOP && y >= word.y - SLOP && y < word.y + lineHeight + SLOP) {
-      return i;
-    }
-  }
-  return -1;
 }
 
 // Index of the word in `row` whose horizontal center is closest to centerX;
@@ -219,7 +86,7 @@ void DictionaryWordSelectActivity::performLookup() {
     dictNeedsIndex = dictOpenOk && dict.needsIndex();
   }
   popupMsg = dictNeedsIndex ? StrId::STR_DICT_INDEXING : StrId::STR_DICT_LOOKING_UP;
-  requestUpdateAndWait();  // paint the page + busy popup before blocking on SD
+  requestUpdateAndWait();  // paint the busy popup before blocking on SD
 
   bool ok = dictOpenOk;
   Dictionary::IndexResult indexResult = Dictionary::IndexResult::Ok;
@@ -231,19 +98,9 @@ void DictionaryWordSelectActivity::performLookup() {
   std::string definition;
   std::string headword;
   Dictionary::LookupResult result = Dictionary::LookupResult::NotFound;
-  char run[CjkDictionary::RUN_BYTES] = {};
+  char run[CjkDictionary::RUN_BYTES];
   uint8_t matchMask = 0;
-  if (words[selected].cjkBytes) {
-    size_t bytes = 0;
-    size_t characters = 0;
-    for (size_t i = selected; i < words.size() && characters < CjkDictionary::MAX_CHARACTERS; ++i) {
-      const auto& word = words[i];
-      if (!word.cjkBytes || word.run != words[selected].run) break;
-      memcpy(run + bytes, word.text, word.cjkBytes);
-      bytes += word.cjkBytes;
-      ++characters;
-    }
-  }
+  DictionaryPageWords::cjkRun(words, selected, run);
   const bool found = ok && (run[0] ? dict.lookupCjk(run, definition, headword, matchMask, &result)
                                    : dict.lookup(words[selected].text, definition, headword, &result));
 
@@ -252,7 +109,13 @@ void DictionaryWordSelectActivity::performLookup() {
     startActivityForResult(std::make_unique<DictionaryDefinitionActivity>(
                                renderer, mappedInput, std::move(headword), std::move(definition),
                                dict.definitionsAreHtml(), run[0] ? &dict : nullptr, run, matchMask),
-                           [this](const ActivityResult&) { requestUpdate(); });
+                           [this](const ActivityResult&) {
+                             if (direct) {
+                               finish();
+                             } else {
+                               requestUpdate();
+                             }
+                           });
     return;
   }
   // Name the failure: a genuine miss is "Not found"; a word that WAS found but
@@ -300,13 +163,23 @@ void DictionaryWordSelectActivity::performLookup() {
 }
 
 void DictionaryWordSelectActivity::loop() {
+  if (directLookupPending) {
+    directLookupPending = false;
+    performLookup();
+    return;
+  }
   if (popup == Popup::NotFound || popup == Popup::Error) {
     if (millis() - popupTime >= POPUP_DURATION_MS) {
+      if (direct) {
+        finish();
+        return;
+      }
       popup = Popup::None;
       requestUpdate();
     }
     return;
   }
+  if (direct) return;
 
   if (mappedInput.wasReleased(MappedInputManager::Button::Back)) {
     finish();
@@ -324,7 +197,7 @@ void DictionaryWordSelectActivity::loop() {
   int tx = 0;
   int ty = 0;
   if (mappedInput.wasScreenTouchDown(tx, ty)) {
-    const int hit = wordAt(tx, ty);
+    const int hit = DictionaryPageWords::wordAt(words, tx, ty, lineHeight);
     if (hit >= 0 && hit != selected) {
       selected = hit;
       requestUpdate();
@@ -332,7 +205,7 @@ void DictionaryWordSelectActivity::loop() {
     return;
   }
   if (mappedInput.wasScreenTapped(tx, ty)) {
-    const int hit = wordAt(tx, ty);
+    const int hit = DictionaryPageWords::wordAt(words, tx, ty, lineHeight);
     if (hit >= 0) {
       selected = hit;
       performLookup();
@@ -417,7 +290,31 @@ void DictionaryWordSelectActivity::drawHints() const {
   GUI.drawButtonHints(renderer, labels.btn1, labels.btn2, labels.btn3, labels.btn4);
 }
 
+// Same prewarm-scan-then-render pass the reader uses, so SD-card fonts hit
+// the in-RAM glyph cache during the real draw.
+void DictionaryWordSelectActivity::drawPage() {
+  renderer.clearScreen();
+  auto* fcm = renderer.getFontCacheManager();
+  auto scope = fcm->createPrewarmScope();
+  page->render(renderer, fontId, marginLeft, marginTop);
+  scope.endScanAndPrewarm();
+  page->render(renderer, fontId, marginLeft, marginTop);
+}
+
 void DictionaryWordSelectActivity::render(RenderLock&&) {
+  // Direct mode draws no picker: the busy popup goes straight over the
+  // reader's frame. A failure popup gets the page redrawn under it, with the
+  // word highlighted, so it does not land on top of the busy popup.
+  if (direct) {
+    if (popup == Popup::None) return;
+    if (popup != Popup::Busy) {
+      drawPage();
+      drawHighlightWithSnapshot();
+    }
+    GUI.drawPopup(renderer, I18N.get(popupMsg));
+    return;
+  }
+
   // Differential fast path: only the highlight moved and the framebuffer
   // still holds a clean page (no popup or sub-activity since the last full
   // repaint). Restore the pixels under the old highlight, draw the new one,
@@ -436,20 +333,14 @@ void DictionaryWordSelectActivity::render(RenderLock&&) {
     // Snapshot failed (oversize box) — fall through to a full repaint.
   }
 
-  renderer.clearScreen();
   if (words.empty()) {
+    renderer.clearScreen();
     ReaderUtils::drawState(renderer, mappedInput, tr(STR_DICTIONARY), tr(STR_DICT_NO_WORDS));
     renderer.displayBuffer();
     return;
   }
 
-  // Same prewarm-scan-then-render pass the reader uses, so SD-card fonts hit
-  // the in-RAM glyph cache during the real draw.
-  auto* fcm = renderer.getFontCacheManager();
-  auto scope = fcm->createPrewarmScope();
-  page->render(renderer, fontId, marginLeft, marginTop);
-  scope.endScanAndPrewarm();
-  page->render(renderer, fontId, marginLeft, marginTop);
+  drawPage();
 
   if (!words.empty()) {
     drawHighlightWithSnapshot();

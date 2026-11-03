@@ -6,6 +6,7 @@
 #include <memory>
 #include <vector>
 
+#include "DictionaryPageWords.h"
 #include "activities/Activity.h"
 #include "util/Dictionary.h"
 
@@ -13,8 +14,14 @@
 // in reading order, Up/Down jump rows, Confirm looks the word up and opens
 // DictionaryDefinitionActivity, Back returns to the reader. On touch devices a
 // touch-down moves the highlight and a tap on a word looks it up directly.
+//
+// Direct mode (press and hold in the reader) skips the picker: it looks up
+// the word the reader hit, draws only its popups over the reader's frame, and
+// finishes when the definition or a failure popup closes.
 class DictionaryWordSelectActivity final : public Activity {
  public:
+  using WordBox = DictionaryPageWords::WordBox;
+
   explicit DictionaryWordSelectActivity(GfxRenderer& renderer, MappedInputManager& mappedInput,
                                         std::unique_ptr<Page> page, int marginLeft, int marginTop)
       : Activity("DictionaryWordSelect", renderer, mappedInput),
@@ -22,37 +29,39 @@ class DictionaryWordSelectActivity final : public Activity {
         marginLeft(marginLeft),
         marginTop(marginTop) {}
 
+  // Direct mode: `words` were extracted from `page` and words[selected] is the
+  // word to look up.
+  DictionaryWordSelectActivity(GfxRenderer& renderer, MappedInputManager& mappedInput, std::unique_ptr<Page> page,
+                               int marginLeft, int marginTop, std::vector<WordBox>&& words, uint16_t rowCount,
+                               int selected)
+      : Activity("DictionaryWordSelect", renderer, mappedInput),
+        page(std::move(page)),
+        marginLeft(marginLeft),
+        marginTop(marginTop),
+        direct(true),
+        words(std::move(words)),
+        selected(selected),
+        rowCount(rowCount) {}
+
   void onEnter() override;
   void loop() override;
   void render(RenderLock&&) override;
 
  private:
-  // Text points into the owned Page. CJK boxes select one UTF-8 character;
-  // Latin boxes retain the original NUL-terminated token.
-  struct WordBox {
-    int16_t x;
-    int16_t y;
-    int16_t width;
-    uint16_t row;
-    const char* text;
-    EpdFontFamily::Style style;
-    uint8_t cjkBytes = 0;
-    uint16_t run = 0;
-  };
-
   enum class Popup : uint8_t { None, Busy, NotFound, Error };
 
-  void extractWords();
   int closestInRow(uint16_t row, int centerX) const;
-  int wordAt(int x, int y) const;
   void moveVertical(int direction);
   void performLookup();
+  void drawPage();
   bool drawHighlightWithSnapshot();
   void drawHints() const;
 
   std::unique_ptr<Page> page;
   const int marginLeft;
   const int marginTop;
+  const bool direct = false;
+  bool directLookupPending = false;
   int fontId = 0;
   int lineHeight = 0;
 

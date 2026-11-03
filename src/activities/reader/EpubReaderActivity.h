@@ -196,6 +196,12 @@ class EpubReaderActivity : public ReaderActivity {
   void activateMoreRow(int row);
   void openFootnoteSelect(bool reopenMenuOnCancel);
   void openDictionaryWordSelect();
+  // Press and hold on a word: look it up directly. True when the hold was
+  // taken (lookup or "no dictionary" note); false leaves the contact to the
+  // tap handlers.
+  bool handleWordHold();
+  // Margins the current page's text is drawn at.
+  void pageTextMargins(int& left, int& top) const;
   bool launchKOReaderSync();
   unsigned long confirmLongPressThreshold() const;
   void toggleAutoPageTurn(uint8_t selectedPageTurnOption);
