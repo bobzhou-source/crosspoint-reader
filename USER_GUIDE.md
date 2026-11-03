@@ -2,6 +2,8 @@
 
 Welcome to the **CrossPoint** firmware. This guide outlines the hardware controls, navigation, and reading features of the device.
 
+**What's new in rc9.3 (release candidate, not installed by this build):** tap an EPUB picture to view it full-screen; hold a word for about half a second to open its dictionary entry; optionally enable `image_clear_region` to clear just the previous pictures' area. Region clearing is off by default and still requires `clear_after_image: true`—the flash-free fast-picture card policy sets that to false, so adding the region key alone does not enable picture clears. Touch priority is word holds, link taps, picture taps, then the normal menu/page-turn zones; configured chapter-skip or rotation holds keep their zones.
+
 - [CrossPoint User Guide](#crosspoint-user-guide)
   - [1. Hardware Overview](#1-hardware-overview)
     - [Button Layout](#button-layout)
@@ -733,7 +735,9 @@ Original files must remain at their saved paths. Renaming/moving a source change
 
 Words on the current page can be looked up in an offline StarDict dictionary stored on the SD card. Copy a dictionary to the `/dictionaries/` folder, select it in **Settings → Reader → Dictionary**, then start a lookup by choosing **Look Up** in the **[Reader Menu](#5-reader-menu)** (or by holding **Confirm**, if the **Long-press Menu** setting in **[Controls Settings](#363-controls)** is set to "Dictionary"). Use **Left/Right** to highlight a word and press **Confirm** to show its definition.
 
-For Chinese novels, install the **CC-CEDICT Chinese-English** folder and select `cedict` in the Dictionary setting. In Look Up mode, tap the **first character** of a word (or move the highlight with the direction buttons and press Confirm). The reader checks up to **eight consecutive CJK characters** and opens the longest exact dictionary match. The definition begins with the matched Chinese headword, tone-mark pinyin and English glosses. Tap **Shorter / Longer** at the top of the definition, or press the side **Up / Down** buttons, to move between available matching lengths. Definition paging and Back work as before.
+On a touch screen you can also **press and hold a word** in an EPUB for about half a second: its definition opens directly, and **Back** returns to the same page. Holding blank space does nothing. If **Long-press Chapter Skip** (or rotate on hold) is set and page turns use tap zones, holding those zones still skips or rotates; the lookup takes holds everywhere else. TXT books do not have dictionary lookup.
+
+For Chinese novels, install the **CC-CEDICT Chinese-English** folder and select `cedict` in the Dictionary setting. In Look Up mode, tap the **first character** of a word (or move the highlight with the direction buttons and press Confirm); while reading, press and hold the first character. The reader checks up to **eight consecutive CJK characters** and opens the longest exact dictionary match. The definition begins with the matched Chinese headword, tone-mark pinyin and English glosses. Tap **Shorter / Longer** at the top of the definition, or press the side **Up / Down** buttons, to move between available matching lengths. Definition paging and Back work as before.
 
 Matching stops at punctuation, non-CJK text and the **end of the visible line**; it does not join a word split across two lines or pages. Choose a different layout/font size if that word is split. Both simplified and traditional headwords are indexed. English lookup keeps its existing exact-match, synonym and stemming behavior; select an English dictionary when reading English. No dictionary index is loaded into RAM. The first lookup creates the usual small on-card `.qidx` sidecar.
 
@@ -769,7 +773,7 @@ Available options include:
 - **Select Chapter** – Open the table of contents to jump to a specific chapter (see [Chapter Selection](#51-chapter-selection) below).
 - **Reading stats** – Active reading time, pages, sessions, average pace and estimated time left for this book; available in EPUB, TXT and XTC menus.
 - **Footnotes** – Navigate to the footnotes for the current section *(only shown in books that contain footnotes)*.
-- **Look Up** – Select a word on the current page and show its dictionary definition (see [docs/dictionary.md](docs/dictionary.md)). Requires a dictionary to be selected in **Settings → Reader → Dictionary**.
+- **Look Up** – Select a word on the current page and show its dictionary definition (see [docs/dictionary.md](docs/dictionary.md)). Requires a dictionary to be selected in **Settings → Reader → Dictionary**. On a touch screen, pressing and holding a word on the page looks it up without the menu.
 - **Reading Orientation** – Cycle through screen orientations without leaving the reader.
 - **Auto Turn (Pages Per Minute)** – Cycle through automatic page turn speed options for hands-free reading.
 - **Go to %** – Jump to a specific position in the book by percentage.

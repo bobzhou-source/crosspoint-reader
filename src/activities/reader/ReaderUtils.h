@@ -13,6 +13,7 @@
 #include <string_view>
 
 #include "MappedInputManager.h"
+#include "ReaderTouchZones.h"
 #include "activities/ActivityManager.h"
 #include "components/UITheme.h"
 #include "fontIds.h"
@@ -123,6 +124,25 @@ struct TouchPageTurn {
   unsigned long heldMs;
 };
 
+// Inverted Tap and RTL books each reverse the shared zones.
+inline ReaderTouchZones::Layout touchZoneLayout(const bool rtlBook) {
+  return {gestureAllowsTap(SETTINGS.pageTurnGesture), gestureAllowsTap(SETTINGS.previousPageGesture),
+          (SETTINGS.pageTurnGesture == CrossPointSettings::INVERTED_TAP ||
+           SETTINGS.previousPageGesture == CrossPointSettings::INVERTED_TAP) != rtlBook,
+          SETTINGS.showReaderMenu == CrossPointSettings::READER_MENU_TAP};
+}
+
+inline ReaderTouchZones::Zone touchZoneAt(const GfxRenderer& renderer, const int x, const int y, const bool rtlBook) {
+  return ReaderTouchZones::zoneAt(touchZoneLayout(rtlBook), x, y, renderer.getScreenWidth(),
+                                  renderer.getScreenHeight());
+}
+
+// A page-turn tap held past SKIP_HOLD_MS skips a chapter or rotates.
+inline bool touchZoneHoldActions() {
+  return SETTINGS.longPressButtonBehavior == CrossPointSettings::CHAPTER_SKIP ||
+         SETTINGS.longPressButtonBehavior == CrossPointSettings::ORIENTATION_CHANGE;
+}
+
 inline TouchPageTurn detectTouchPageTurn(const GfxRenderer& renderer, const MappedInputManager& input,
                                          const bool rtlBook = false) {
   TouchPageTurn result{false, false, 0};
@@ -140,9 +160,7 @@ inline TouchPageTurn detectTouchPageTurn(const GfxRenderer& renderer, const Mapp
     return result;
   }
 
-  const bool nextTaps = gestureAllowsTap(SETTINGS.pageTurnGesture);
-  const bool prevTaps = gestureAllowsTap(SETTINGS.previousPageGesture);
-  if (!nextTaps && !prevTaps) {
+  if (!gestureAllowsTap(SETTINGS.pageTurnGesture) && !gestureAllowsTap(SETTINGS.previousPageGesture)) {
     return result;
   }
 
@@ -152,23 +170,14 @@ inline TouchPageTurn detectTouchPageTurn(const GfxRenderer& renderer, const Mapp
     return result;
   }
 
-  const int width = renderer.getScreenWidth();
-  const int height = renderer.getScreenHeight();
   // The centered reader-menu tap target (isTouchMenuTap below) keeps priority
   // over the page-turn zones.
-  if (SETTINGS.showReaderMenu == CrossPointSettings::READER_MENU_TAP && x >= width / 3 && x < width - width / 3 &&
-      y >= height / 3 && y < height - height / 3) {
+  const auto zone = touchZoneAt(renderer, x, y, rtlBook);
+  if (zone != ReaderTouchZones::Zone::Prev && zone != ReaderTouchZones::Zone::Next) {
     return result;
   }
-
-  // Give the whole page to the sole tap-enabled direction. When both accept
-  // taps, split at the left third. RTL books and Inverted Tap each reverse
-  // the shared zones.
-  const bool inverted = (SETTINGS.pageTurnGesture == CrossPointSettings::INVERTED_TAP ||
-                         SETTINGS.previousPageGesture == CrossPointSettings::INVERTED_TAP) != rtlBook;
-  const bool nextZone = inverted ? x < (width * 2) / 3 : x >= width / 3;
-  result.next = nextTaps && (!prevTaps || nextZone);
-  result.prev = prevTaps && (!nextTaps || !nextZone);
+  result.next = zone == ReaderTouchZones::Zone::Next;
+  result.prev = zone == ReaderTouchZones::Zone::Prev;
   result.heldMs = gpio.lastTouchHeldMs();
   return result;
 }
