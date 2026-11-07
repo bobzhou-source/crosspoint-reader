@@ -1,0 +1,3 @@
+add_executable(PageTurnGestureMigrationTest PageTurnGestureMigrationTest.cpp)
+target_link_libraries(PageTurnGestureMigrationTest PRIVATE crosspoint_test_common GTest::gtest_main)
+gtest_discover_tests(PageTurnGestureMigrationTest)

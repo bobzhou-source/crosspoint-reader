@@ -10,6 +10,7 @@
 #include <string>
 
 #include "I18nKeys.h"
+#include "PageTurnGestureMigration.h"
 #include "ReaderFontSizes.h"
 #include "SettingsList.h"
 #include "fontIds.h"
@@ -113,6 +114,10 @@ void CrossPointSettings::toJson(JsonDocument& doc) const {
     doc["keyboardLayouts"] = keyboardLayouts;
   }
 
+  // Marks the page-turn gesture pair as post-migration, so a later explicit
+  // SWIPE_ONLY choice is not mistaken for the old default on the next load.
+  doc["pageTurnGestureVersion"] = page_turn_gesture::SCHEMA_VERSION;
+
   // X4 Pro only. Other boards still use the old gamma, so writing the version
   // key there would skip the remap if this file later landed on an X4 Pro.
   if (BoardConfig::isX4Pro()) {
@@ -200,6 +205,17 @@ bool CrossPointSettings::fromJson(JsonVariantConst doc) {
       previousPageGesture = pageTurnGesture;
       needsResave = true;
     }
+  }
+
+  // Touch page turns defaulted to SWIPE_ONLY and older files wrote that default
+  // out. Upgrade an untouched pair once so taps work out of the box; a file
+  // with the schema key keeps whatever the user chose, including SWIPE_ONLY.
+  const int gestureSchema = doc["pageTurnGestureVersion"] | 0;
+  if (page_turn_gesture::upgradeLegacyDefault(pageTurnGesture, previousPageGesture,
+                                              gestureSchema >= page_turn_gesture::SCHEMA_VERSION, SWIPE_ONLY,
+                                              TAP_AND_SWIPE) ||
+      gestureSchema < page_turn_gesture::SCHEMA_VERSION) {
+    needsResave = true;
   }
 
   if (doc["sleepTimeoutMinutes"].isNull() && !doc["sleepTimeout"].isNull()) {

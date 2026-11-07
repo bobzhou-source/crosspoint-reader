@@ -9,7 +9,7 @@
 // screen refresh. Finishes with MenuResult{action}; the frontlight toggles in place.
 class TxtReaderMenuActivity final : public UiListActivity {
  public:
-  enum class MenuAction { CONTENTS, GO_TO_PAGE, GO_TO_PERCENT, FRONTLIGHT, REFRESH_SCREEN, READING_STATS };
+  enum class MenuAction { CONTENTS, GO_TO_PAGE, GO_TO_PERCENT, FRONTLIGHT, REFRESH_SCREEN, READING_STATS, DICTIONARY };
 
   // Reading position shown above the entries.
   struct Status {
@@ -30,7 +30,7 @@ class TxtReaderMenuActivity final : public UiListActivity {
     MenuAction action;
     StrId labelId;
   };
-  static constexpr size_t MAX_MENU_ITEMS = 6;
+  static constexpr size_t MAX_MENU_ITEMS = 7;
   MenuItem menuItems[MAX_MENU_ITEMS]{};
   size_t menuItemCount = 0;
   freeink::ui::ListItem menuRowItems[MAX_MENU_ITEMS]{};

@@ -7,6 +7,7 @@
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
+#include <string>
 #include <vector>
 
 #include "util/CjkDictionary.h"
@@ -189,5 +190,120 @@ inline size_t cjkRun(const std::vector<WordBox>& words, const size_t index, char
 // rowCount counts the lines that have at least one target.
 void extract(GfxRenderer& renderer, const Page& page, int fontId, int marginLeft, int marginTop,
              std::vector<WordBox>& words, uint16_t& rowCount);
+
+// One laid-out TXT display line: its full UTF-8 text and the absolute
+// position the reader drew it at. TXT pages keep text as lines rather than
+// EPUB word blocks, so their lookup targets come from this description.
+struct LineText {
+  const char* text;
+  int x;
+  int y;
+  EpdFontFamily::Style style = EpdFontFamily::REGULAR;
+};
+
+// True for a run that separates words on a TXT line: ASCII space/tab, a
+// no-break space, or an ideographic space. `bytes` receives its UTF-8 length.
+inline bool isLineSeparator(const char* text, size_t& bytes) {
+  const auto* p = reinterpret_cast<const uint8_t*>(text);
+  if (p[0] == ' ' || p[0] == '\t') {
+    bytes = 1;
+    return true;
+  }
+  if (p[0] == 0xC2 && p[1] == 0xA0) {  // U+00A0 NO-BREAK SPACE
+    bytes = 2;
+    return true;
+  }
+  if (p[0] == 0xE3 && p[1] == 0x80 && p[2] == 0x80) {  // U+3000 IDEOGRAPHIC SPACE
+    bytes = 3;
+    return true;
+  }
+  return false;
+}
+
+// Appends every selectable word on `lines`, in reading order. Tokens are split
+// at line separators and copied into `storage`, which stays stable after this
+// call so WordBox::text can point into it. `advance(text, length)` returns the
+// width of a UTF-8 range and is applied to the line prefix before each token,
+// matching how the TXT reader draws the full line. rowCount counts the lines
+// that have at least one target.
+template <typename Advance>
+void extractFromLines(const LineText* lines, const size_t lineCount, std::vector<std::string>& storage,
+                      std::vector<WordBox>& words, uint16_t& rowCount, Advance&& advance) {
+  words.clear();
+  storage.clear();
+  rowCount = 0;
+
+  struct Span {
+    size_t line;
+    size_t offset;
+    size_t length;
+  };
+  std::vector<Span> spans;
+  spans.reserve(lineCount * 8);
+
+  // Pass 1: find the tokens and give each one stable storage. Boxes are built
+  // only after this vector stops growing, since std::string moves invalidate
+  // c_str() pointers (including short-string moves).
+  for (size_t line = 0; line < lineCount; ++line) {
+    const char* p = lines[line].text;
+    while (*p) {
+      size_t separatorBytes = 0;
+      if (isLineSeparator(p, separatorBytes)) {
+        p += separatorBytes;
+        continue;
+      }
+      const char* start = p;
+      uint32_t first;
+      CjkDictionary::characterBytes(p, first);
+      const bool firstCjk = CjkDictionary::isCjk(first);
+      const bool firstLatin = first < 0x80 && std::isalnum(static_cast<unsigned char>(first));
+      while (*p) {
+        size_t bytes = 0;
+        if (isLineSeparator(p, bytes)) break;
+        uint32_t cp;
+        const size_t n = CjkDictionary::characterBytes(p, cp);
+        // A Latin run inside a CJK sentence is its own selectable token.
+        // Punctuation is not a script boundary: it stays with the CJK span so
+        // appendToken() skips it and splits the lookup run there.
+        const bool latin = cp < 0x80 && std::isalnum(static_cast<unsigned char>(cp));
+        if (p != start && CjkDictionary::isCjk(cp) != firstCjk && (firstLatin || latin)) break;
+        p += n;
+      }
+      spans.push_back({line, static_cast<size_t>(start - lines[line].text), static_cast<size_t>(p - start)});
+      if (p == start) p += 1;  // malformed/empty codepoint: never spin
+    }
+  }
+
+  storage.reserve(spans.size());
+  for (const auto& span : spans) {
+    storage.emplace_back(lines[span.line].text + span.offset, span.length);
+  }
+
+  // Pass 2: place the tokens. A fresh run per token keeps CJK characters of
+  // one word together and never merges two words across a line separator.
+  size_t tokenIndex = 0;
+  for (size_t line = 0; line < lineCount; ++line) {
+    const auto& text = lines[line];
+    const uint16_t row = rowCount;
+    uint16_t run = 0;
+    bool rowHasWords = false;
+    while (tokenIndex < spans.size() && spans[tokenIndex].line == line) {
+      const auto& span = spans[tokenIndex];
+      const std::string& token = storage[tokenIndex++];
+      const int x = text.x + advance(text.text, span.offset);
+      uint16_t tokenRun = run++;
+      const size_t previous = words.size();
+      if (appendToken(words, token.c_str(), x, text.y, row, text.style, tokenRun)) {
+        size_t measureIndex = previous;
+        measureToken(words, measureIndex, token.c_str(), text.style,
+                     [&advance](const char* value, const EpdFontFamily::Style) {
+                       return advance(value, strlen(value));
+                     });
+        rowHasWords = true;
+      }
+    }
+    if (rowHasWords) ++rowCount;
+  }
+}
 
 }  // namespace DictionaryPageWords

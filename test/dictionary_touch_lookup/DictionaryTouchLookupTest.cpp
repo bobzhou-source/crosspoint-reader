@@ -7,6 +7,7 @@
 #include <algorithm>
 #include <chrono>
 #include <cstdlib>
+#include <cstring>
 #include <filesystem>
 #include <fstream>
 #include <string>
@@ -41,17 +42,55 @@ constexpr int LINE_HEIGHT = 30;
 constexpr int LINE_STEP = 36;  // line height plus leading
 
 // Fixed-pitch stand-in for the renderer: 10 px per ASCII byte, 24 px per
-// other character.
-int advance(const char* text, EpdFontFamily::Style) {
+// other character. The range form measures the non-NUL-terminated line
+// prefixes the TXT extractor walks.
+int advanceRange(const char* text, const size_t length) {
   int width = 0;
-  for (const char* p = text; *p;) {
+  for (size_t i = 0; i < length;) {
     uint32_t cp;
-    const size_t n = CjkDictionary::characterBytes(p, cp);
+    const size_t n = CjkDictionary::characterBytes(text + i, cp);
+    if (i + n > length) break;
     width += cp < 0x80 ? 10 : 24;
-    p += n;
+    i += n;
   }
   return width;
 }
+
+int advance(const char* text, EpdFontFamily::Style) { return advanceRange(text, strlen(text)); }
+
+// A TXT page: display lines with their draw positions. Pointers into `texts`
+// stay valid because the vector is complete before extraction starts.
+class TxtLines {
+ public:
+  TxtLines(std::vector<std::string> lines, const int x, const int y, const int lineStep = LINE_STEP)
+      : texts(std::move(lines)), lineHeight(LINE_HEIGHT) {
+    layout.reserve(texts.size());
+    for (size_t i = 0; i < texts.size(); ++i) {
+      layout.push_back({texts[i].c_str(), x, y + static_cast<int>(i) * lineStep, EpdFontFamily::REGULAR});
+    }
+    DictionaryPageWords::extractFromLines(layout.data(), layout.size(), storage, words, rowCount,
+                                          [](const char* text, const size_t length) {
+                                            return advanceRange(text, length);
+                                          });
+  }
+
+  int hold(const int x, const int y) const { return DictionaryPageWords::wordNear(words, x, y, lineHeight); }
+  std::string textAt(const int x, const int y) const {
+    const int hit = hold(x, y);
+    if (hit < 0) return "";
+    if (!words[hit].cjkBytes) return words[hit].text;
+    char run[CjkDictionary::RUN_BYTES];
+    DictionaryPageWords::cjkRun(words, hit, run);
+    return run;
+  }
+
+  std::vector<std::string> texts;
+  std::vector<DictionaryPageWords::LineText> layout;
+  std::vector<std::string> storage;
+  std::vector<WordBox> words;
+  uint16_t rowCount = 0;
+  int lineHeight;
+};
 
 // One laid-out line: tokens in order, separated by `gap` px, drawn the way
 // DictionaryPageWords::extract() places them (line position plus margins).
@@ -183,6 +222,63 @@ TEST(DictionaryHoldHitTest, CjkRunStopsAtTheLineEndAndAtEightCharacters) {
   EXPECT_EQ(page.textAt(1, LINE_STEP + 5), "\xE4\xBA\x8C");
 }
 
+// --- TXT display lines ------------------------------------------------------
+
+TEST(TxtWordExtraction, LatinWordsAreSplitAtSpacesWithPrefixWidths) {
+  // "Hello, well-known world" at (100, 50): 10 px per ASCII byte.
+  const TxtLines page({"Hello, well-known world"}, 100, 50);
+  ASSERT_EQ(page.words.size(), 3u);
+  EXPECT_EQ(page.words[0].x, 100);
+  EXPECT_EQ(page.words[1].x, 170);  // 60 px word + 10 px space
+  EXPECT_EQ(page.words[2].x, 280);  // another 100 px word + 10 px space
+  EXPECT_EQ(page.textAt(105, 60), "Hello,");
+  EXPECT_EQ(page.textAt(215, 60), "well-known");
+  EXPECT_EQ(page.textAt(285, 60), "world");
+  EXPECT_EQ(Dictionary::cleanWord("Hello,"), "hello");
+}
+
+TEST(TxtWordExtraction, CjkRunStartsAtTheHeldCharacterAndStopsAtPunctuation) {
+  // 系统，很好 with 24 px per CJK codepoint.
+  const TxtLines page({"\xE7\xB3\xBB\xE7\xBB\x9F\xEF\xBC\x8C\xE5\xBE\x88\xE5\xA5\xBD"}, 20, 40);
+  ASSERT_EQ(page.words.size(), 4u);
+  EXPECT_EQ(page.words[0].x, 20);
+  EXPECT_EQ(page.words[1].x, 44);
+  EXPECT_EQ(page.words[2].x, 92);                              // after the comma's 24 px
+  EXPECT_EQ(page.textAt(30, 50), "\xE7\xB3\xBB\xE7\xBB\x9F");  // 系 → 系统
+  EXPECT_EQ(page.textAt(50, 50), "\xE7\xBB\x9F");              // 统 → 统
+  EXPECT_EQ(page.textAt(95, 50), "\xE5\xBE\x88\xE5\xA5\xBD");  // 很 → 很好
+}
+
+TEST(TxtWordExtraction, CjkWordsSeparatedBySpacesNeverJoin) {
+  // Two separate layout tokens on one line must not share a CJK run.
+  const TxtLines page({"\xE4\xB8\xAD\xE6\x96\x87 \xE5\xBE\x88\xE5\xA5\xBD"}, 0, 0);  // 中文 很好
+  ASSERT_EQ(page.words.size(), 4u);
+  EXPECT_EQ(page.textAt(1, 5), "\xE4\xB8\xAD\xE6\x96\x87");  // 中文
+  EXPECT_EQ(page.textAt(59, 5), "\xE5\xBE\x88\xE5\xA5\xBD");  // 很好 starts after 48 px + 10 px space
+}
+
+TEST(TxtWordExtraction, LatinRunsInsideCjkStaySelectable) {
+  // 中文abc很好: script changes split the token, so the Latin run keeps its
+  // own box and neither CJK run absorbs it.
+  const TxtLines page({"\xE4\xB8\xAD\xE6\x96\x87" "abc" "\xE5\xBE\x88\xE5\xA5\xBD"}, 0, 0);
+  ASSERT_EQ(page.words.size(), 5u);
+  EXPECT_EQ(page.words[2].x, 48);                            // abc starts after 中文
+  EXPECT_EQ(page.textAt(1, 5), "\xE4\xB8\xAD\xE6\x96\x87");  // 中文
+  EXPECT_EQ(page.textAt(55, 5), "abc");
+  EXPECT_EQ(page.textAt(80, 5), "\xE5\xBE\x88\xE5\xA5\xBD");  // 很 → 很好
+  EXPECT_EQ(page.textAt(105, 5), "\xE5\xA5\xBD");              // 好 → 好
+}
+
+TEST(TxtWordExtraction, LinesKeepTheirRowAndVerticalSpacing) {
+  // A blank display line still advances y; rows count only word-bearing lines.
+  const TxtLines page({"first line", "", "third"}, 10, 20);
+  EXPECT_EQ(page.rowCount, 2u);
+  EXPECT_EQ(page.words[0].row, 0u);
+  EXPECT_EQ(page.words[2].row, 1u);
+  EXPECT_EQ(page.textAt(15, 20 + 2 * LINE_STEP + 5), "third");
+  EXPECT_EQ(page.hold(15, 20 + LINE_STEP + 5), -1);  // the blank line
+}
+
 // --- Lookup against a real StarDict fixture --------------------------------
 
 void be32(std::ostream& out, const uint32_t value) {
@@ -235,6 +331,19 @@ class HoldLookup : public ::testing::Test {
     return found ? headword + "=" + definition : "not found";
   }
 
+  std::string lookUpTxt(const TxtLines& page, const int x, const int y) {
+    const int hit = page.hold(x, y);
+    if (hit < 0) return "";
+    char run[CjkDictionary::RUN_BYTES];
+    DictionaryPageWords::cjkRun(page.words, hit, run);
+    std::string definition;
+    std::string headword;
+    uint8_t mask = 0;
+    const bool found = run[0] ? dict.lookupCjk(run, definition, headword, mask)
+                              : dict.lookup(page.words[hit].text, definition, headword);
+    return found ? headword + "=" + definition : "not found";
+  }
+
   std::filesystem::path dir;
   Dictionary dict;
 };
@@ -250,6 +359,19 @@ TEST_F(HoldLookup, CjkHoldFindsTheLongestMatchFromTheHeldCharacter) {
   EXPECT_EQ(lookUp(page, 5, 5), "\xE7\xB3\xBB\xE7\xBB\x9F=system");               // 系 → 系统
   EXPECT_EQ(lookUp(page, 30, 5), "\xE7\xBB\x9F=to unite");                        // 统 → 统
   EXPECT_EQ(lookUp(page, 52, 5), "not found");                                    // 很 is not in the fixture
+}
+
+TEST_F(HoldLookup, TxtLatinHoldUsesTheDisplayLineWord) {
+  const TxtLines page({"Hello, well-known world"}, 100, 50);
+  EXPECT_EQ(lookUpTxt(page, 105, 60), "hello=a greeting");
+  EXPECT_EQ(lookUpTxt(page, 215, 60), "well-known=widely known");
+}
+
+TEST_F(HoldLookup, TxtCjkHoldFindsTheLongestMatchFromTheHeldCharacter) {
+  const TxtLines page({"\xE7\xB3\xBB\xE7\xBB\x9F\xE5\xBE\x88"}, 0, 0);  // 系统很
+  EXPECT_EQ(lookUpTxt(page, 5, 5), "\xE7\xB3\xBB\xE7\xBB\x9F=system");  // 系 → 系统
+  EXPECT_EQ(lookUpTxt(page, 30, 5), "\xE7\xBB\x9F=to unite");           // 统 → 统
+  EXPECT_EQ(lookUpTxt(page, 52, 5), "not found");                       // 很 is not in the fixture
 }
 
 // --- Who owns the hold ------------------------------------------------------
@@ -293,6 +415,23 @@ TEST(ReaderTouchZonesTest, ZonesSplitAtTheLeftThirdAndFlipWhenInverted) {
   EXPECT_EQ(ReaderTouchZones::zoneAt(inverted, 400, 10, 480, 800), Zone::Prev);
   const Layout swipeOnly{false, false, false, true};
   EXPECT_EQ(ReaderTouchZones::zoneAt(swipeOnly, 10, 10, 480, 800), Zone::None);
+}
+
+TEST(ReaderTouchZonesTest, TapAndSwipeTurnsOnEitherSideWithoutStealingTheCenter) {
+  // The default layout: both directions accept taps and the centre third is
+  // the reader-menu target.
+  const Layout layout{true, true, false, true};
+  EXPECT_EQ(ReaderTouchZones::zoneAt(layout, 10, 10, 480, 800), Zone::Prev);
+  EXPECT_EQ(ReaderTouchZones::zoneAt(layout, 470, 10, 480, 800), Zone::Next);
+  EXPECT_EQ(ReaderTouchZones::zoneAt(layout, 240, 400, 480, 800), Zone::Menu);
+  // Outside the centre band the sides still turn, even at mid-screen x.
+  EXPECT_EQ(ReaderTouchZones::zoneAt(layout, 240, 10, 480, 800), Zone::Next);
+  EXPECT_EQ(ReaderTouchZones::zoneAt(layout, 10, 400, 480, 800), Zone::Prev);
+  // An RTL or inverted page swaps only the side meaning; the centre stays.
+  const Layout inverted{true, true, true, true};
+  EXPECT_EQ(ReaderTouchZones::zoneAt(inverted, 10, 10, 480, 800), Zone::Next);
+  EXPECT_EQ(ReaderTouchZones::zoneAt(inverted, 470, 10, 480, 800), Zone::Prev);
+  EXPECT_EQ(ReaderTouchZones::zoneAt(inverted, 240, 400, 480, 800), Zone::Menu);
 }
 
 TEST(ReaderTouchZonesTest, ConfiguredZoneHoldsKeepTheHold) {

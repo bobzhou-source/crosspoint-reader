@@ -24,6 +24,7 @@ TxtReaderMenuActivity::TxtReaderMenuActivity(GfxRenderer& renderer, MappedInputM
   add(MenuAction::READING_STATS, StrId::STR_READING_STATS);
   add(MenuAction::GO_TO_PAGE, StrId::STR_GO_TO_PAGE);
   add(MenuAction::GO_TO_PERCENT, StrId::STR_GO_TO_PERCENT);
+  add(MenuAction::DICTIONARY, StrId::STR_DICTIONARY);
   if (Frontlight.present()) {
     add(MenuAction::FRONTLIGHT, StrId::STR_FRONTLIGHT);
   }
