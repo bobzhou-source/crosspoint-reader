@@ -54,6 +54,12 @@ SHARE_SHORTCUT_NAME = "Send to Reader"
 MAX_FIRMWARE_BYTES = 64 * 1024 * 1024
 MAX_EPUB_BYTES = 256 * 1024 * 1024
 MAX_BOOK_CARD_PATH_BYTES = 255
+# Offline StarDict folders live in /dictionaries/<name>/ (DictionaryRegistry);
+# the reader keeps a hidden /.dictionaries root too.
+DICTIONARIES_DIR = Path("dictionaries")
+HIDDEN_DICTIONARIES_DIR = Path(".dictionaries")
+# Lookup sidecars the reader builds next to <stem>.idx / <stem>.syn.
+DICTIONARY_SIDECARS = {".idx": ".qidx", ".syn": ".sidx"}
 
 
 @dataclass(frozen=True)
@@ -77,12 +83,17 @@ def default_books_dir() -> Path:
     return Path.home() / "papyrix" / "books"
 
 
+def default_dictionaries_dir() -> Path:
+    """The Mac StarDict folders (cedict, english) mirrored to /dictionaries."""
+    return Path.home() / "papyrix" / "dictionaries"
+
+
 def default_shelves() -> dict[str, Path]:
     """Existing Mac shelf sources for the automatic card copy, keyed by card shelf.
 
     A converted-novel shelf is only usable once it has a manifest, and a local
-    book shelf only once it exists, so a Mac without either syncs just the cloud
-    Inbox instead of failing.
+    book shelf or dictionary folder only once it exists, so a Mac without either
+    syncs just the cloud Inbox instead of failing.
     """
     shelves: dict[str, Path] = {}
     novels_dir = default_novels_dir()
@@ -91,6 +102,9 @@ def default_shelves() -> dict[str, Path]:
     books_dir = default_books_dir()
     if books_dir.is_dir():
         shelves["books"] = books_dir
+    dictionaries_dir = default_dictionaries_dir()
+    if dictionaries_dir.is_dir():
+        shelves["dictionaries"] = dictionaries_dir
     return shelves
 
 
@@ -536,7 +550,8 @@ def card_status(config: dict) -> tuple[dict, bool]:
 
 
 def sync_card(cache: Cache, config: dict, *, volume: CardVolume | None = None, novels_dir: Path | None = None,
-              books_dir: Path | None = None, only_ids: set[str] | None = None, crossfire=None) -> dict:
+              books_dir: Path | None = None, dictionaries_dir: Path | None = None,
+              only_ids: set[str] | None = None, crossfire=None) -> dict:
     volume = volume or resolve_card(config["volume_uuid"])
     if volume.volume_uuid != _canonical_uuid(config["volume_uuid"]):
         raise ReaderError("Resolved card UUID does not match the configured card; no card files were changed")
@@ -544,6 +559,7 @@ def sync_card(cache: Cache, config: dict, *, volume: CardVolume | None = None, n
         raise ReaderError("Configured card mount is not a normal directory; no card files were changed")
     novel_plan = _plan_novels(volume, Path(novels_dir)) if novels_dir is not None else None
     book_plan = _plan_books(volume, Path(books_dir)) if books_dir is not None else None
+    dictionary_plan = _plan_dictionaries(Path(dictionaries_dir)) if dictionaries_dir is not None else None
     annotations_dir = Path(config["annotations_dir"]).expanduser()
     if annotations_dir.exists() and (annotations_dir.is_symlink() or not annotations_dir.is_dir()):
         raise ReaderError(f"Annotation output must be a normal directory: {annotations_dir}")
@@ -593,6 +609,8 @@ def sync_card(cache: Cache, config: dict, *, volume: CardVolume | None = None, n
         _save_ledger(cache, volume.volume_uuid, ledger)
     novel_result = _deliver_shelf(volume, novel_plan) if novel_plan is not None else None
     book_result = _deliver_shelf(volume, book_plan) if book_plan is not None else None
+    dictionary_result = (_deliver_dictionaries(volume, dictionary_plan)
+                         if dictionary_plan is not None else None)
     (_, annotation_count, annotation_path, annotation_updated,
      _, native_path, native_updated, crossfire_result) = _annotation_import(volume, config, crossfire)
     result = {
@@ -620,7 +638,105 @@ def sync_card(cache: Cache, config: dict, *, volume: CardVolume | None = None, n
         result["novels"] = novel_result
     if book_result is not None:
         result["books"]["shelf"] = book_result
+    if dictionary_result is not None:
+        result["dictionaries"] = dictionary_result
     return result
+
+
+def _plan_dictionaries(source: Path) -> dict:
+    """List the Mac StarDict folders the reader would accept; reads only.
+
+    A folder qualifies like DictionaryRegistry::findStem does on the device:
+    exactly one `<stem>.idx` beside `<stem>.dict` or `<stem>.dict.dz`. Hidden
+    files (`._*` AppleDouble, `.DS_Store`) and reader-built sidecars stay home.
+    """
+    root = Path(source).expanduser()
+    if root.is_symlink() or not root.is_dir():
+        raise ReaderError(f"Dictionary source folder not found: {root}")
+    root = root.resolve()
+    folders: list[tuple[str, list[Path]]] = []
+    errors: list[str] = []
+    for folder in sorted(root.iterdir()):
+        if folder.name.startswith(".") or not folder.is_dir():
+            continue
+        if folder.is_symlink():
+            errors.append(f"{folder.name}: dictionary folder is a symlink; not followed")
+            continue
+        files = sorted(path for path in folder.iterdir()
+                       if not path.name.startswith(".") and path.suffix not in DICTIONARY_SIDECARS.values()
+                       and not path.is_symlink() and path.is_file())
+        stems = {path.name[:-len(".idx")] for path in files if path.name.endswith(".idx")}
+        names = {path.name for path in files}
+        if len(stems) != 1:
+            errors.append(f"{folder.name}: expected one .idx file, found {len(stems)}")
+            continue
+        stem = next(iter(stems))
+        if f"{stem}.dict" not in names and f"{stem}.dict.dz" not in names:
+            errors.append(f"{folder.name}: {stem}.idx has no {stem}.dict or {stem}.dict.dz")
+            continue
+        folders.append((folder.name, files))
+    return {"source": str(root), "folders": folders, "errors": errors}
+
+
+def _same_dictionary_copy(source: Path, destination: Path) -> bool:
+    try:
+        local, card_copy = source.stat(), destination.lstat()
+    except FileNotFoundError:
+        return False
+    # Copies carry the Mac mtime; FAT stores it at 2-second resolution.
+    return (stat.S_ISREG(card_copy.st_mode) and local.st_size == card_copy.st_size
+            and abs(local.st_mtime - card_copy.st_mtime) <= 2)
+
+
+def _deliver_dictionaries(volume: CardVolume, plan: dict) -> dict:
+    """Copy each dictionary file that is missing or changed on the card, verified by read-back.
+
+    Card files the Mac folder does not have are left alone. A changed `.idx` or
+    `.syn` drops its lookup sidecar, which the reader judges stale by size
+    alone, so the next lookup rebuilds it against the new file.
+    """
+    copied: list[str] = []
+    unchanged: list[str] = []
+    errors: list[str] = list(plan["errors"])
+    for name, files in plan["folders"]:
+        target = volume.root / DICTIONARIES_DIR / name
+        hidden = volume.root / HIDDEN_DICTIONARIES_DIR / name
+        if not target.exists() and hidden.is_dir():
+            target = hidden  # keep the card's hidden copy current instead of listing the dictionary twice
+        if _path_has_symlink(volume.root, target) or (target.exists() and not target.is_dir()):
+            errors.append(f"{name}: card folder is not a normal directory: {target}")
+            continue
+        for path in files:
+            destination = target / path.name
+            if _same_dictionary_copy(path, destination):
+                unchanged.append(str(destination))
+                continue
+            try:
+                expected = file_sha256(path)
+                _copy_replace_atomic(path, destination)
+                readback = file_sha256(destination)
+            except (ReaderError, OSError) as exc:
+                errors.append(f"{name}/{path.name}: {exc}")
+                continue
+            if readback != expected:
+                try:
+                    destination.unlink()
+                    removed = "; the bad copy was removed"
+                except OSError as exc:
+                    removed = f"; could not remove the bad copy: {exc}"
+                errors.append(f"{name}/{path.name}: card readback does not match the Mac file{removed}")
+                continue
+            sidecar = DICTIONARY_SIDECARS.get(path.suffix)
+            try:
+                if sidecar is not None:
+                    destination.with_suffix(sidecar).unlink(missing_ok=True)
+                local = path.stat()
+                os.utime(destination, (local.st_atime, local.st_mtime))
+            except OSError as exc:
+                errors.append(f"{name}/{path.name}: copied, but {exc}")
+            copied.append(str(destination))
+    return {"source": plan["source"], "copied": len(copied), "unchanged": len(unchanged),
+            "copied_paths": copied, "errors": errors}
 
 
 def _path_has_symlink(root: Path, path: Path) -> bool:

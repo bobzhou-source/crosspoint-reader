@@ -488,7 +488,8 @@ class CardBooksTest(unittest.TestCase):
 
     def test_the_default_shelves_only_include_existing_sources(self):
         with patch.object(card_module, "default_novels_dir", return_value=self.root / "novels"), \
-             patch.object(card_module, "default_books_dir", return_value=self.root / "books"):
+             patch.object(card_module, "default_books_dir", return_value=self.root / "books"), \
+             patch.object(card_module, "default_dictionaries_dir", return_value=self.root / "dictionaries"):
             self.assertEqual(card_module.default_shelves(), {})
             (self.root / "books").mkdir()
             self.assertEqual(card_module.default_shelves(), {"books": self.root / "books"})
@@ -497,6 +498,8 @@ class CardBooksTest(unittest.TestCase):
             (self.root / "novels" / ".novels-manifest.json").write_text('{"version": 1, "entries": {}}')
             self.assertEqual(card_module.default_shelves(),
                              {"novels": self.root / "novels", "books": self.root / "books"})
+            (self.root / "dictionaries").mkdir()
+            self.assertEqual(card_module.default_shelves()["dictionaries"], self.root / "dictionaries")
 
     def test_cli_parses_the_books_option(self):
         args = cli.parser().parse_args(["card", "sync", "--books", str(self.shelf)])
@@ -510,15 +513,92 @@ class CardBooksTest(unittest.TestCase):
             calls.append(options)
             return {"books": {}}
 
-        with patch.object(card_module, "default_shelves", lambda: {"novels": Path("/novels"), "books": Path("/books")}), \
+        with patch.object(card_module, "default_shelves",
+                          lambda: {"novels": Path("/novels"), "books": Path("/books"), "dictionaries": Path("/dicts")}), \
                 patch.object(card_module, "load_config", lambda path: self.config), \
                 patch.object(card_module, "sync_card", recorded), \
                 patch("sys.stdout", new_callable=io.StringIO):
             self.assertEqual(cli.main(["--cache-dir", str(self.cache.root), "card", "sync"]), 0)
             self.assertEqual(cli.main(["--cache-dir", str(self.cache.root), "card", "sync",
-                                       "--books", str(self.shelf)]), 0)
-        self.assertEqual((calls[0]["novels_dir"], calls[0]["books_dir"]), (Path("/novels"), Path("/books")))
-        self.assertEqual((calls[1]["novels_dir"], calls[1]["books_dir"]), (Path("/novels"), self.shelf))
+                                       "--books", str(self.shelf), "--dictionaries", str(self.root)]), 0)
+        self.assertEqual((calls[0]["novels_dir"], calls[0]["books_dir"], calls[0]["dictionaries_dir"]),
+                         (Path("/novels"), Path("/books"), Path("/dicts")))
+        self.assertEqual((calls[1]["novels_dir"], calls[1]["books_dir"], calls[1]["dictionaries_dir"]),
+                         (Path("/novels"), self.shelf, self.root))
+
+
+class CardDictionariesTest(unittest.TestCase):
+    def setUp(self):
+        self.temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temporary.cleanup)
+        self.root = Path(self.temporary.name)
+        self.card = self.root / "card"
+        self.card.mkdir()
+        self.source = self.root / "dictionaries"
+        english = self.source / "english"
+        english.mkdir(parents=True)
+        for name, data in (("english.idx", b"idx"), ("english.dict", b"dict"), ("english.syn", b"syn"),
+                           ("english.ifo", b"ifo"), ("LICENSE.txt", b"license"), ("._english.idx", b"apple"),
+                           (".DS_Store", b"finder")):
+            (english / name).write_bytes(data)
+        cedict = self.source / "cedict"
+        cedict.mkdir()
+        (cedict / "cedict.idx").write_bytes(b"cidx")
+        (cedict / "cedict.dict.dz").write_bytes(b"cdz")
+        (self.source / "broken").mkdir()
+        (self.source / "broken" / "broken.idx").write_bytes(b"no dict")
+        self.volume = CardVolume(self.card, "disk9s1", UUID)
+        self.cache = Cache(self.root / "cache")
+        self.config = CardTest.config(self, self.root)
+
+    def sync(self):
+        return sync_card(self.cache, self.config, volume=self.volume, dictionaries_dir=self.source)["dictionaries"]
+
+    def files(self):
+        return sorted(path.relative_to(self.card).as_posix() for path in self.card.rglob("*")
+                      if path.is_file() and path.parts[len(self.card.parts)] == "dictionaries")
+
+    def test_copies_missing_dictionaries_then_leaves_them_alone(self):
+        result = self.sync()
+        self.assertEqual((result["copied"], result["unchanged"]), (7, 0))
+        self.assertEqual(len(result["errors"]), 1)
+        self.assertIn("broken", result["errors"][0])
+        self.assertEqual(self.files(), [
+            "dictionaries/cedict/cedict.dict.dz", "dictionaries/cedict/cedict.idx",
+            "dictionaries/english/LICENSE.txt", "dictionaries/english/english.dict",
+            "dictionaries/english/english.idx", "dictionaries/english/english.ifo",
+            "dictionaries/english/english.syn"])
+        self.assertEqual((self.card / "dictionaries/english/english.idx").read_bytes(), b"idx")
+        again = self.sync()
+        self.assertEqual((again["copied"], again["unchanged"]), (0, 7))
+
+    def test_a_changed_index_is_replaced_and_its_stale_sidecar_dropped(self):
+        self.sync()
+        card_english = self.card / "dictionaries/english"
+        (card_english / "english.qidx").write_bytes(b"old samples")
+        (card_english / "english.sidx").write_bytes(b"syn samples")
+        (card_english / "notes.txt").write_bytes(b"robert's file")
+        source_idx = self.source / "english/english.idx"
+        source_idx.write_bytes(b"IDX")  # same size, new bytes and mtime
+        os.utime(source_idx, (source_idx.stat().st_atime, source_idx.stat().st_mtime + 60))
+        result = self.sync()
+        self.assertEqual((result["copied"], result["copied_paths"]), (1, [str(card_english / "english.idx")]))
+        self.assertEqual((card_english / "english.idx").read_bytes(), b"IDX")
+        self.assertFalse((card_english / "english.qidx").exists())
+        self.assertTrue((card_english / "english.sidx").exists())
+        self.assertEqual((card_english / "notes.txt").read_bytes(), b"robert's file")
+
+    def test_a_hidden_card_copy_is_updated_in_place(self):
+        (self.card / ".dictionaries/cedict").mkdir(parents=True)
+        self.sync()
+        self.assertEqual((self.card / ".dictionaries/cedict/cedict.idx").read_bytes(), b"cidx")
+        self.assertFalse((self.card / "dictionaries/cedict").exists())
+        self.assertTrue((self.card / "dictionaries/english/english.idx").is_file())
+
+    def test_a_missing_source_writes_nothing(self):
+        with self.assertRaisesRegex(ReaderError, "Dictionary source folder not found"):
+            sync_card(self.cache, self.config, volume=self.volume, dictionaries_dir=self.root / "nope")
+        self.assertEqual(list(self.card.iterdir()), [])
 
 
 if __name__ == "__main__":

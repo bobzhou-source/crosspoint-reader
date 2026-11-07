@@ -171,6 +171,8 @@ def parser() -> argparse.ArgumentParser:
                            help="copy the EPUBs converted by `novels convert` into /books/Novels (default: ~/papyrix/novels-epub when it has a manifest)")
     card_sync.add_argument("--books", type=Path, metavar="DIR",
                            help="copy the EPUBs of one local shelf folder into /books/Books (default: ~/papyrix/books when it exists)")
+    card_sync.add_argument("--dictionaries", type=Path, metavar="DIR",
+                           help="mirror each StarDict folder in DIR to /dictionaries/<name> when missing or changed (default: ~/papyrix/dictionaries when it exists)")
     card_sync.add_argument("--crossfire", action="store_true",
                            help="after importing annotations, build a Cross-Fire card in /books/Inbox")
     card_status = card_actions.add_parser("status", help="Report whether the exact configured card is mounted; read-only")
@@ -518,9 +520,11 @@ def card_command(args, cache: Cache) -> int:
             cache, config,
             novels_dir=args.novels if args.novels is not None else shelves.get("novels"),
             books_dir=args.books if args.books is not None else shelves.get("books"),
+            dictionaries_dir=args.dictionaries if args.dictionaries is not None else shelves.get("dictionaries"),
             crossfire=True if args.crossfire else None)
         failures = [*result.get("novels", {}).get("errors", []),
-                    *result.get("books", {}).get("shelf", {}).get("errors", [])]
+                    *result.get("books", {}).get("shelf", {}).get("errors", []),
+                    *result.get("dictionaries", {}).get("errors", [])]
         emit(result)
         return 2 if failures else 0
     if args.card_operation == "autosync":
@@ -529,6 +533,7 @@ def card_command(args, cache: Cache) -> int:
             cache, config, batch=args.batch, passes=args.passes, log=card_autosync.RunLog(args.log),
             notify=None if args.no_notify else card_autosync.macos_notification,
             novels_dir=shelves.get("novels"), books_dir=shelves.get("books"),
+            dictionaries_dir=shelves.get("dictionaries"),
             crossfire=True if args.crossfire else None)
         emit(result)
         return 2 if result["status"] in {"error", "rate_limited"} else 0

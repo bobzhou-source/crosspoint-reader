@@ -25,6 +25,16 @@ Definitions contain tone-mark pinyin and English glosses. Simplified and traditi
 
 Behavioral tests: `python3 -m pytest companion/tests/test_cedict.py`. Production C++ longest-prefix/UTF-8-ordering tests are registered under `test/cjk_dictionary`; its executable optionally accepts an extensionless generated dictionary path to validate every index entry with the actual firmware comparator.
 
+## English offline dictionary
+
+`python3 companion/scripts/build_english_dict.py OUTPUT/english` downloads [Open English WordNet 2025](https://en-word.net/) (CC BY 4.0, WNDB format), WordNet 3.0 (its irregular-inflection `.exc` lists only) and the CMU Pronouncing Dictionary (only to attest regular inflections), then writes `english.ifo`, `english.idx`, `english.dict` and `english.syn` (`sametypesequence=m`). Pass `--oewn`, `--wordnet30` and `--cmudict` with local copies of those archives to build offline. `scripts/english_function_words.txt` supplies articles, pronouns, prepositions, conjunctions, modals and contractions, which WordNet omits.
+
+Each definition is plain text, one line per item: a `(noun)`/`(verb)`/… label, then numbered senses `1. gloss: "example" [= synonyms]`, at most ten per part of speech, ordered by SemCor frequency. The definition screen collapses blank lines and strips leading spaces, so the format uses neither. Irregular forms from the WordNet exception lists go to `.syn` (`went → go`, `children → child`, `is → be`), as do regular forms the firmware stemmer cannot undo (`studied → study`, `happier → happy`). A form that is also a headword (`saw`, `left`, `better`) or that belongs to several lemmas (`does` → do, doe) opens with `Form of: …` and carries each lemma's entry, because an exact `.idx` hit always wins over `.syn`.
+
+`python3 companion/scripts/verify_stardict.py FOLDER [WORDS…] [--expect WORD=LEMMA …]` mirrors the firmware lookup (`cleanWord`, sidecar bisection, `.syn`, stem variants) and checks order, spans, `.ifo` counts, every headword and every synonym. It works for `cedict` too. Tests: `python3 -m pytest companion/tests/test_english_dict.py`.
+
+`card sync` (and `card autosync`) mirror every StarDict folder in `~/papyrix/dictionaries/` (override: `card sync --dictionaries DIR`) to `/dictionaries/<name>/` on the card, copying only missing or changed files (size and modification time) and checking each copy by SHA-256 read-back. A changed `.idx`/`.syn` drops its `.qidx`/`.sidx` sidecar so the reader rebuilds it. A folder the card already keeps under `/.dictionaries/` is updated there. Card files the Mac folder lacks are never removed.
+
 ## Fetch, convert, inspect, send
 
 ```sh

@@ -1,0 +1,253 @@
+# Function words, pronouns and contractions that WordNet leaves out.
+# Format: headword|label|sense || sense ...   (prepended before any WordNet senses)
+the|article|used before a noun to refer to a particular person or thing already known or about to be identified: "the book on the table" || used before a singular noun to refer to a whole class: "the tiger is a big cat" || used before an adjective to refer to a group of people: "the rich"
+a|article|one; any one (used before a singular noun that is not specific): "a book" || per; for each: "twice a day"
+an|article|form of "a" used before a vowel sound: "an apple", "an hour"
+of|preposition|belonging to or part of: "the roof of the house" || made from or containing: "a cup of tea" || about; concerning: "stories of the war" || indicating a quantity or part: "some of them"
+to|preposition|in the direction of; toward: "walk to school" || as far as; until: "from Monday to Friday" || used to show who receives something: "give it to me"
+to|particle|used before a verb to form the infinitive: "I want to go"
+and|conjunction|used to join words, phrases or clauses: "bread and butter" || then; afterward: "he came and sat down"
+or|conjunction|used to link alternatives: "tea or coffee" || otherwise: "hurry, or you will be late"
+but|conjunction|used to introduce something contrasting with what has been said: "poor but happy"
+but|preposition|except: "everyone but me"
+nor|conjunction|and not; used after "neither" or a negative: "neither here nor there"
+if|conjunction|on the condition that; in case: "if it rains, we will stay home" || whether: "ask if he is coming"
+than|conjunction|used to introduce the second part of a comparison: "taller than his brother"
+as|conjunction|while; when: "as I was leaving" || because; since: "as it was late, we went home" || in the way that: "do as I say"
+as|preposition|in the role or function of: "she works as a teacher" || to the same degree: "as tall as you"
+that|determiner|used to point to someone or something farther away or already mentioned: "that man over there"
+that|pronoun|the one mentioned or understood: "that is mine" || who or which (introducing a clause): "the book that I read"
+that|conjunction|introduces a clause stating a fact, wish or result: "she said that she was tired"
+this|determiner|used to point to someone or something near or just mentioned: "this book"
+this|pronoun|the thing or person near or just mentioned: "this is my house"
+these|determiner|plural of "this": "these books"
+these|pronoun|the people or things near or just mentioned: "these are mine"
+those|determiner|plural of "that": "those days"
+those|pronoun|the people or things farther away or already mentioned: "those were the days"
+which|pronoun|what one or ones (asking for a choice): "which is yours?" || introduces a clause giving more information about a thing: "the car, which was red"
+who|pronoun|what or which person or people: "who is there?" || introduces a clause about a person: "the man who called"
+whom|pronoun|object form of "who": "to whom it may concern"
+whose|pronoun|belonging to which person: "whose bag is this?" || of whom or of which: "the girl whose bike was stolen"
+what|pronoun|asking for information about something: "what is your name?" || the thing or things that: "I saw what happened"
+what|determiner|which (asking about a choice): "what time is it?" || used for emphasis: "what a day!"
+whatever|pronoun|anything or everything that: "do whatever you like" || no matter what: "whatever happens, stay calm"
+whoever|pronoun|any person who; no matter who: "whoever wins gets a prize"
+whichever|pronoun|any one that; no matter which: "take whichever you prefer"
+I|pronoun|the speaker or writer, referring to himself or herself: "I am here"
+me|pronoun|object form of "I": "give it to me"
+my|determiner|belonging to me: "my book"
+mine|pronoun|the one or ones belonging to me: "that pen is mine"
+myself|pronoun|reflexive or emphatic form of "I" and "me": "I hurt myself"; "I did it myself"
+you|pronoun|the person or people being spoken or written to: "you look tired" || anyone; people in general: "you never know"
+your|determiner|belonging to you: "your coat"
+yours|pronoun|the one or ones belonging to you: "is this yours?"
+yourself|pronoun|reflexive or emphatic form of "you" (one person)
+yourselves|pronoun|reflexive or emphatic form of "you" (more than one person)
+he|pronoun|a male person or animal already mentioned: "he is my brother"
+him|pronoun|object form of "he": "I saw him"
+his|determiner|belonging to him: "his car"
+his|pronoun|the one or ones belonging to him: "the choice was his"
+himself|pronoun|reflexive or emphatic form of "he" and "him"
+she|pronoun|a female person or animal already mentioned: "she is my sister"
+her|pronoun|object form of "she": "I called her"
+her|determiner|belonging to her: "her house"
+hers|pronoun|the one or ones belonging to her: "the idea was hers"
+herself|pronoun|reflexive or emphatic form of "she" and "her"
+it|pronoun|a thing, animal or situation already mentioned: "it is raining"; "where is it?"
+its|determiner|belonging to it: "the dog wagged its tail"
+itself|pronoun|reflexive or emphatic form of "it"
+we|pronoun|the speaker together with one or more others: "we are ready"
+us|pronoun|object form of "we": "join us"
+our|determiner|belonging to us: "our home"
+ours|pronoun|the one or ones belonging to us: "the victory is ours"
+ourselves|pronoun|reflexive or emphatic form of "we" and "us"
+they|pronoun|the people, animals or things already mentioned: "they left early" || people in general: "they say it will rain" || a single person whose gender is unknown or not specified
+them|pronoun|object form of "they": "I told them"
+their|determiner|belonging to them: "their house"
+theirs|pronoun|the one or ones belonging to them: "the choice is theirs"
+themselves|pronoun|reflexive or emphatic form of "they" and "them"
+themself|pronoun|reflexive form of singular "they"
+oneself|pronoun|reflexive form of "one": "to enjoy oneself"
+someone|pronoun|some person not named or known: "someone is at the door"
+somebody|pronoun|someone
+something|pronoun|a thing not named or known: "I heard something"
+anyone|pronoun|any person at all: "has anyone seen my keys?"
+anybody|pronoun|anyone
+anything|pronoun|any thing at all: "I can't see anything"
+everyone|pronoun|every person; all people: "everyone was there"
+everybody|pronoun|everyone
+everything|pronoun|all things; the whole: "everything is ready"
+nobody|pronoun|no person; not anyone: "nobody came"
+nothing|pronoun|not anything; no thing: "there is nothing here"
+none|pronoun|not any; not one: "none of them came"
+with|preposition|accompanied by; together with: "come with me" || having; possessing: "a girl with red hair" || using: "cut it with a knife"
+without|preposition|not having; lacking: "coffee without sugar" || not accompanied by: "he left without me"
+from|preposition|indicating the starting point or source: "a letter from home"; "from nine to five" || indicating separation or removal: "take it from him"
+by|preposition|next to; beside: "by the window" || through the action of: "a book by Dickens" || not later than: "by Friday" || using; through: "by car"
+at|preposition|indicating a place or position: "at home" || indicating a time: "at noon" || toward: "look at me"
+in|preposition|inside; within: "in the box" || during: "in June" || using a language or manner: "in English"
+on|preposition|supported by or touching a surface: "on the table" || about; concerning: "a book on history" || indicating a day or date: "on Monday"
+into|preposition|to the inside of: "go into the house" || to a different state: "turn water into ice"
+onto|preposition|to a position on: "jump onto the bed"
+upon|preposition|on (more formal): "upon the hill" || immediately after: "upon arrival"
+for|preposition|intended to be given to or used by: "a gift for you" || in support of: "vote for her" || for the duration of: "for two hours" || because of: "famous for its wine"
+for|conjunction|because (literary): "he wept, for he was sad"
+about|preposition|on the subject of; concerning: "a film about war" || around: "walk about the town"
+above|preposition|higher than; over: "above the clouds" || more than: "above average"
+across|preposition|from one side to the other of: "walk across the road"
+after|preposition|later than: "after lunch" || behind; following: "run after the bus"
+against|preposition|in opposition to: "against the war" || touching and leaning on: "against the wall"
+along|preposition|moving in a line beside or on: "walk along the river"
+among|preposition|surrounded by; in the middle of: "among friends" || shared between: "divide it among them"
+amongst|preposition|among
+amid|preposition|in the middle of; during: "amid the noise"
+around|preposition|on every side of; surrounding: "around the house" || approximately: "around ten o'clock"
+before|preposition|earlier than: "before dinner" || in front of: "before the judge"
+behind|preposition|at the back of: "behind the door"
+below|preposition|lower than; under: "below the surface"
+beneath|preposition|under; below: "beneath the trees"
+beside|preposition|next to: "sit beside me"
+besides|preposition|in addition to; apart from: "besides him, no one came"
+between|preposition|in the space or time separating two things: "between the houses"; "between two and three"
+beyond|preposition|on the far side of: "beyond the hills" || outside the range of: "beyond belief"
+despite|preposition|without being affected by; in spite of: "despite the rain"
+during|preposition|throughout or at some point in: "during the night"
+except|preposition|not including; other than: "everyone except him"
+inside|preposition|within: "inside the box"
+near|preposition|close to: "near the station"
+off|preposition|away from; down from: "fall off the roof"
+out|preposition|through to the outside of: "look out the window"
+outside|preposition|beyond the limits of: "outside the city"
+over|preposition|above: "over the door" || across: "jump over the wall" || more than: "over a million"
+past|preposition|beyond in time or place: "half past nine"; "walk past the shop"
+since|preposition|from a past time until now: "since Monday"
+since|conjunction|from the time when: "since we met" || because: "since you asked"
+through|preposition|moving in one side and out of the other: "through the tunnel" || by means of: "through hard work"
+throughout|preposition|in every part of; during the whole of: "throughout the year"
+till|preposition|until
+toward|preposition|in the direction of: "walk toward the door" || in relation to: "his attitude toward work"
+towards|preposition|toward
+under|preposition|below; beneath: "under the table" || less than: "under ten dollars" || governed by: "under the law"
+underneath|preposition|directly below: "underneath the bed"
+until|preposition|up to the time of: "wait until Friday"
+until|conjunction|up to the time that: "wait until he arrives"
+unto|preposition|to (old-fashioned)
+up|preposition|toward a higher place on: "climb up the hill" || along: "walk up the street"
+via|preposition|by way of; through: "fly to Rome via Paris"
+within|preposition|inside: "within the walls" || not beyond: "within an hour"
+although|conjunction|in spite of the fact that: "although it was late, we stayed"
+though|conjunction|although: "though he tried, he failed"
+because|conjunction|for the reason that: "I stayed because it was raining"
+unless|conjunction|except if: "you will fail unless you study"
+whereas|conjunction|while on the contrary: "he is tall, whereas she is short"
+whether|conjunction|used to introduce two alternatives or a question: "I don't know whether he will come"
+while|conjunction|during the time that: "while I was out" || although; whereas: "while I like it, I can't afford it"
+whilst|conjunction|while
+whenever|conjunction|at whatever time; every time that: "come whenever you like"
+wherever|conjunction|in or to whatever place: "sit wherever you like"
+once|conjunction|as soon as: "once you arrive, call me"
+so|conjunction|and for this reason; therefore: "it was cold, so I left" || in order that: "speak up so we can hear"
+yet|conjunction|but at the same time; nevertheless: "simple yet effective"
+either|determiner|one or the other of two: "either road"
+either|conjunction|used before the first of two alternatives: "either you or me"
+neither|determiner|not one nor the other of two: "neither answer is right"
+neither|conjunction|used before the first of two negative alternatives: "neither here nor there"
+both|determiner|the two; the one and the other: "both hands"
+each|determiner|every one of two or more, considered separately: "each child got a gift"
+every|determiner|each without exception: "every day"
+all|determiner|the whole amount or number of: "all the books"
+any|determiner|one, some or every, no matter which: "any book will do" || even a small amount of: "do you have any money?"
+some|determiner|an unspecified amount or number of: "some water"; "some people" || a certain, not named: "some man called"
+no|determiner|not any: "no money" || not a: "he is no fool"
+few|determiner|not many: "few people came" || (a few) a small number of: "a few days"
+many|determiner|a large number of: "many people"
+much|determiner|a large amount of: "much time"
+more|determiner|a greater amount or number of: "more money"
+most|determiner|the greatest amount or number of: "most people"
+less|determiner|a smaller amount of: "less time"
+least|determiner|the smallest amount of: "the least effort"
+several|determiner|more than two but not many: "several days"
+such|determiner|of the kind mentioned: "such people" || so great: "such a mess"
+own|determiner|belonging to oneself: "my own room"
+another|determiner|one more; an additional: "another cup" || a different: "another day"
+other|determiner|different or additional: "the other side"; "other people"
+can|modal verb|to be able to: "she can swim" || to be allowed to: "you can go now" || used to express possibility: "it can be cold here"
+could|modal verb|past form of "can": "I could swim at five" || used to express possibility or polite requests: "it could rain"; "could you help me?"
+may|modal verb|used to express possibility: "it may rain" || used to give or ask permission: "may I come in?"
+might|modal verb|used to express a weaker possibility: "he might be late" || past form of "may"
+must|modal verb|to be obliged or required to: "you must stop" || used to express strong likelihood: "it must be late"
+shall|modal verb|used to express the future with "I" and "we": "I shall return" || used in offers and suggestions: "shall we go?"
+should|modal verb|used to express duty or advice: "you should rest" || used to express probability: "it should arrive today"
+will|modal verb|used to express the future: "it will rain" || used to express willingness or requests: "will you help?"
+would|modal verb|past form of "will": "he said he would come" || used for conditions and polite requests: "I would go if I could"; "would you help?"
+ought|modal verb|used to express duty or correctness (followed by "to"): "you ought to apologize"
+not|adverb|used to make a word, phrase or sentence negative: "I am not tired"
+n't|contraction|not (attached to a verb): "isn't", "don't"
+yes|interjection|used to give an affirmative answer
+oh|interjection|expressing surprise, pain, understanding or emphasis
+hello|interjection|used as a greeting
+ah|interjection|expressing surprise, pleasure or understanding
+here|adverb|in, at or to this place: "come here"
+there|adverb|in, at or to that place: "put it there"
+there|pronoun|used to introduce a sentence saying something exists: "there is a problem"
+how|adverb|in what way: "how did you do it?" || to what degree: "how old are you?"
+why|adverb|for what reason: "why did you go?"
+when|adverb|at what time: "when did it happen?"
+when|conjunction|at the time that: "call me when you arrive"
+where|adverb|in or to what place: "where are you?"
+where|conjunction|in or to the place in which: "stay where you are"
+I'm|contraction|I am
+I've|contraction|I have
+I'll|contraction|I will; I shall
+I'd|contraction|I would; I had
+you're|contraction|you are
+you've|contraction|you have
+you'll|contraction|you will
+you'd|contraction|you would; you had
+he's|contraction|he is; he has
+he'll|contraction|he will
+he'd|contraction|he would; he had
+she's|contraction|she is; she has
+she'll|contraction|she will
+she'd|contraction|she would; she had
+it's|contraction|it is; it has
+it'll|contraction|it will
+we're|contraction|we are
+we've|contraction|we have
+we'll|contraction|we will
+we'd|contraction|we would; we had
+they're|contraction|they are
+they've|contraction|they have
+they'll|contraction|they will
+they'd|contraction|they would; they had
+that's|contraction|that is; that has
+there's|contraction|there is; there has
+here's|contraction|here is
+what's|contraction|what is; what has
+who's|contraction|who is; who has
+where's|contraction|where is; where has
+how's|contraction|how is; how has
+let's|contraction|let us
+isn't|contraction|is not
+aren't|contraction|are not
+wasn't|contraction|was not
+weren't|contraction|were not
+don't|contraction|do not
+doesn't|contraction|does not
+didn't|contraction|did not
+haven't|contraction|have not
+hasn't|contraction|has not
+hadn't|contraction|had not
+won't|contraction|will not
+wouldn't|contraction|would not
+can't|contraction|cannot
+cannot|modal verb|can not; to be unable to
+couldn't|contraction|could not
+shouldn't|contraction|should not
+mustn't|contraction|must not
+mightn't|contraction|might not
+needn't|contraction|need not
+shan't|contraction|shall not
+ain't|contraction|am not; is not; are not; has not; have not (informal)
+y'all|contraction|you all (informal, chiefly Southern US)
+o'clock|adverb|used after a number from one to twelve to give the time: "five o'clock"
