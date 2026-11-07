@@ -194,6 +194,22 @@ The site route and card route use the same `/books/Inbox/<basename(source_path)>
 
 Use exactly one annotation uploader per deployment. If the card's `/.crosspoint/reader-sync.json` has direct device sync enabled, the firmware uploads annotations; do not also run `cloud sync --annotations-in` against that card. A pre-existing `Sync website.command` is for the companion-managed upload path, not a second uploader for a direct-sync card.
 
+### Enrich books: sharpest-passage front cards and Cross-Fire
+
+```sh
+# One-page "Sharpest Passages in This Book" card at the front of a real EPUB.
+reader-send hooks ./Grey-Eminence.epub --dry-run
+reader-send hooks ./Grey-Eminence.epub -o ./grey-hooked.epub
+
+# Pair the card's annotations with replies from the local Substack archive.
+reader-send crossfire --dry-run
+reader-send card sync --crossfire      # or: card autosync --crossfire
+```
+
+`hooks` reads the EPUB spine, skips covers, title pages, indexes, copyright, bibliographies and similar apparatus, and scores body paragraphs/sentences for claim density, contrast markers and aphoristic punch. It selects four or five self-contained passages from different chapters, adds an `id` anchor to each source paragraph (never overwriting an existing id), and inserts `reader-hooks-sharpest.xhtml` at spine position 0 with one tappable link per passage pointing at `chapter.xhtml#anchor`, so the reader jumps straight into the argument. The card carries a `reader-hooks:sharpest:v1` marker; a rerun replaces the same card and produces byte-identical output instead of duplicating it. In-place writes keep a `<book>.pre-hooks.epub` backup unless `--no-backup` is given. Books without enough strong prose are refused rather than padded.
+
+`crossfire` reads the imported native annotations (highlight, question, review-later), tokenizes the highlight plus note, and searches the local archive at `~/substack-corpus` (Markdown) and `~/substack-neighbors/posts` (JSONL). The archive is chunked into paragraph-sized passages and kept in a persistent SQLite FTS5 index whose rows are refreshed only for changed files by path+mtime+size signature; the first build over the full archive takes a few minutes and several hundred MB under `~/.cache/reader-send/crossfire.sqlite3`, later runs only re-sign files. Without FTS5 the same query uses an in-memory BM25 index over pre-filtered posts. Each annotation gets two or three sharp, non-duplicate passages from preferably distinct authors, plus the original author, essay title, date, URL and excerpt, in a single `Cross-Fire: Marginalia & Replies` EPUB written to `books/Inbox/`. The filename is the content hash, so rebuilds that change nothing write nothing; `card sync --crossfire` reports the result under `annotations.crossfire`, and a retrieval failure never blocks delivery of the books themselves.
+
 ### Automatic delivery when the card is plugged in
 
 ```sh

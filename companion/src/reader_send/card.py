@@ -421,15 +421,32 @@ def _annotation_markdown(native_records: list[dict], volume_uuid: str) -> tuple[
     return ("\n".join(lines) + "\n").encode("utf-8"), len(mapped)
 
 
-def _annotation_import(volume: CardVolume, config: dict) -> tuple[bytes | None, int, Path | None, bool, bytes | None, Path | None, bool]:
+def _run_crossfire(volume: CardVolume, native_records: list[dict], options) -> dict:
+    """Content enrichment must never break book delivery, so failures become a status value."""
+    from . import crossfire as crossfire_module
+
+    settings = dict(options) if isinstance(options, dict) else {}
+    try:
+        return crossfire_module.write_card(volume.root / BOOK_INBOX, native_records,
+                                           corpus=settings.get("corpus", crossfire_module.DEFAULT_CORPUS),
+                                           neighbors=settings.get("neighbors", crossfire_module.DEFAULT_NEIGHBORS),
+                                           replies=settings.get("replies", crossfire_module.DEFAULT_REPLIES),
+                                           db=settings.get("db", crossfire_module.DEFAULT_DB),
+                                           limit=settings.get("limit", crossfire_module.DEFAULT_CANDIDATES),
+                                           dry_run=bool(settings.get("dry_run", False)))
+    except (ReaderError, OSError, ValueError) as exc:
+        return {"status": "error", "error": str(exc), "written": False}
+
+
+def _annotation_import(volume: CardVolume, config: dict, crossfire=None) -> tuple[bytes | None, int, Path | None, bool, bytes | None, Path | None, bool, dict | None]:
     # The cloud NDJSON export is owned by `cloud sync --annotations-out`; never
     # rewrite it from card sync, which could replace unrelated downloaded data.
     source = volume.root / ANNOTATION_STORE
     if not source.is_dir() or not any(source.rglob("*.json")):
-        return None, 0, None, False, None, None, False
+        return None, 0, None, False, None, None, False, None
     native_records = load_annotations(source)
     if not native_records:
-        return None, 0, None, False, None, None, False
+        return None, 0, None, False, None, None, False, None
     markdown, count = _annotation_markdown(native_records, config["volume_uuid"])
     annotation_uuid = config["volume_uuid"].lower()
     destination = Path(config["annotations_dir"]).expanduser() / f"reading-inbox-{annotation_uuid}.md"
@@ -462,8 +479,9 @@ def _annotation_import(volume: CardVolume, config: dict) -> tuple[bytes | None, 
         atomic_write(destination, markdown, overwrite=True)
     if current_native != native_bytes:
         atomic_write(native_destination, native_bytes, overwrite=True)
+    crossfire_result = _run_crossfire(volume, native_records, crossfire) if crossfire else None
     return (markdown, count, destination, current_markdown != markdown,
-            native_bytes, native_destination, current_native != native_bytes)
+            native_bytes, native_destination, current_native != native_bytes, crossfire_result)
 
 
 def card_status(config: dict) -> tuple[dict, bool]:
@@ -483,7 +501,7 @@ def card_status(config: dict) -> tuple[dict, bool]:
 
 
 def sync_card(cache: Cache, config: dict, *, volume: CardVolume | None = None, novels_dir: Path | None = None,
-              only_ids: set[str] | None = None) -> dict:
+              only_ids: set[str] | None = None, crossfire=None) -> dict:
     volume = volume or resolve_card(config["volume_uuid"])
     if volume.volume_uuid != _canonical_uuid(config["volume_uuid"]):
         raise ReaderError("Resolved card UUID does not match the configured card; no card files were changed")
@@ -539,7 +557,7 @@ def sync_card(cache: Cache, config: dict, *, volume: CardVolume | None = None, n
         _save_ledger(cache, volume.volume_uuid, ledger)
     novel_result = _deliver_novels(volume, novel_plan) if novel_plan is not None else None
     (_, annotation_count, annotation_path, annotation_updated,
-     _, native_path, native_updated) = _annotation_import(volume, config)
+     _, native_path, native_updated, crossfire_result) = _annotation_import(volume, config, crossfire)
     result = {
         "card": {"volume_uuid": volume.volume_uuid, "mount": str(volume.root), "device": volume.device},
         "books": {
@@ -559,6 +577,8 @@ def sync_card(cache: Cache, config: dict, *, volume: CardVolume | None = None, n
             "native_updated": native_updated,
         },
     }
+    if crossfire_result is not None:
+        result["annotations"]["crossfire"] = crossfire_result
     if novel_result is not None:
         result["novels"] = novel_result
     return result

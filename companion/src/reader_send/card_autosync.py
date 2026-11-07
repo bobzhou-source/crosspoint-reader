@@ -154,6 +154,7 @@ def autosync(
     batch: int = DEFAULT_BATCH,
     passes: int = DEFAULT_PASSES,
     wait: Callable[[float], None] = time.sleep,
+    crossfire=None,
 ) -> dict:
     log = log or RunLog(None)
     if type(batch) is not int or not 1 <= batch <= MAX_BATCH:
@@ -174,12 +175,14 @@ def autosync(
         log("another autosync run holds the lock; exiting")
         return {"status": "busy"}
     try:
-        return _run(cache, config, volume, client_factory, key_provider, notify, log, batch, passes, wait)
+        return _run(cache, config, volume, client_factory, key_provider, notify, log, batch, passes, wait,
+                    crossfire)
     finally:
         lock.close()
 
 
-def _run(cache, config, volume, client_factory, key_provider, notify, log, batch, passes, wait) -> dict:
+def _run(cache, config, volume, client_factory, key_provider, notify, log, batch, passes, wait,
+         crossfire=None) -> dict:
     expected = config["volume_uuid"]
     log(f"reader card {expected} mounted at {volume.root}; starting delivery")
 
@@ -209,7 +212,8 @@ def _run(cache, config, volume, client_factory, key_provider, notify, log, batch
                 break
             result["passes"] = number
             try:
-                outcome = _pass(cache, config, volume, client, batch, log, result["acked"])
+                outcome = _pass(cache, config, volume, client, batch, log, result["acked"],
+                                crossfire)
             except ReaderError as exc:
                 if is_rate_limited(exc):
                     result["status"] = "rate_limited"
@@ -244,7 +248,8 @@ def _run(cache, config, volume, client_factory, key_provider, notify, log, batch
     if card_result is None:
         # Cloud unavailable or nothing to deliver: the card's annotations are still imported.
         try:
-            card_result = card.sync_card(cache, config, volume=volume, only_ids=set())
+            card_result = card.sync_card(cache, config, volume=volume, only_ids=set(),
+                                         crossfire=crossfire)
         except (ReaderError, OSError) as exc:
             result["status"] = "error" if result["status"] == "ok" else result["status"]
             result["errors"].append(str(exc))
@@ -266,7 +271,7 @@ def _run(cache, config, volume, client_factory, key_provider, notify, log, batch
 
 
 def _pass(cache: Cache, config: dict, volume: card.CardVolume, client: CloudClient, batch: int, log,
-          acked: list) -> dict:
+          acked: list, crossfire=None) -> dict:
     requests = client.requests
     items = client.items(ready_only=True)
     # Everything this pass sends must fit the per-minute allowance, so plan it first: books already in the
@@ -294,7 +299,9 @@ def _pass(cache: Cache, config: dict, volume: card.CardVolume, client: CloudClie
     wanted.sort(key=lambda item: item["sha256"] not in cached)  # stable: cached books first, server order kept
     log(f"{len(items)} ready on server; pulled {len(pulled['pulled'])}, {len(pulled['already_cached'])} already cached, "
         f"{pulled['deferred']} deferred")
-    card_result = card.sync_card(cache, config, volume=volume, only_ids={record["id"] for record in by_sha.values()})
+    card_result = card.sync_card(cache, config, volume=volume,
+                                 only_ids={record["id"] for record in by_sha.values()},
+                                 crossfire=crossfire)
     ack_budget = budget - len(pulled["pulled"]) - len(pulled["released"])
     ledger = card._load_ledger(cache, volume.volume_uuid)
     unverified, fresh_proofs = [], {}
