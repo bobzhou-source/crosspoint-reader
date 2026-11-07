@@ -61,7 +61,7 @@ std::string findInboxBreakBook() {
     if (!SETTINGS.showHiddenFiles && nameBuffer[0] == '.') {
       continue;
     }
-    if (!FsHelpers::hasEpubExtension(nameBuffer.get())) {
+    if (!FsHelpers::hasEpubExtension(std::string_view{nameBuffer.get()})) {
       continue;
     }
     std::string path = inboxPathFor(nameBuffer.get());
