@@ -4,6 +4,8 @@ Welcome to the **CrossPoint** firmware. This guide outlines the hardware control
 
 **What's new in rc9.3 (release candidate, not installed by this build):** tap an EPUB picture to view it full-screen; hold a word for about half a second to open its dictionary entry; optionally enable `image_clear_region` to clear just the previous pictures' area. Region clearing is off by default and still requires `clear_after_image: true`—the flash-free fast-picture card policy sets that to false, so adding the region key alone does not enable picture clears. Touch priority is word holds, link taps, picture taps, then the normal menu/page-turn zones; configured chapter-skip or rotation holds keep their zones.
 
+**What's new in rc10 (release candidate, not installed by this build):** the reader turns pages on a tap by default on touch devices (left third back, the rest forward, centre third opens the menu); TXT books get press-and-hold and menu dictionary lookup like EPUBs; Home, the sleep screen and Reading stats show your reading streak and pages read today; **Surprise me** opens one unread book with a single press; **Quick Break** hops to an unread Inbox item and **Back to &lt;book&gt;** returns you; a status-bar countdown (`2p to break`) marks the next natural stopping point in long chapters.
+
 - [CrossPoint User Guide](#crosspoint-user-guide)
   - [1. Hardware Overview](#1-hardware-overview)
     - [Button Layout](#button-layout)
@@ -132,6 +134,8 @@ The Home screen is the main entry point to the firmware. From here you can navig
 
 On classic Home layouts, touching a different cover or menu row highlights it once. Keeping your finger down does not repeatedly refresh the same highlight. Releasing opens the target even when it was already selected; cancelling the touch leaves the highlight without opening it.
 
+When the clock is set and you have read recently, the Home header's right label shows a quiet habit line: `12-day streak · 34 pages today` (or just the streak, or just today's pages, when only one applies). It is read once when Home opens and is hidden when the clock is unset or there is nothing to show. On the list Home layout the last menu row, **Surprise me**, opens one unread book straight at its first page or saved position. It prefers unread short reads in `/books/Inbox`, then in-progress short Inbox reads, then unread Library books, then in-progress long Inbox items and in-progress Library books; finished books are never offered. When nothing is eligible Home shows `Nothing unread to open` and stays where it is. The cover-grid Home shows the habit line in its header band; **Surprise me** is reached from the Inbox or the Library there.
+
 ### 3.2 Reading Mode
 
 See [Reading Mode](#4-reading-mode) below for more information.
@@ -149,7 +153,7 @@ The Browse Files screen acts as a file and folder browser. The full path to the 
 
 The Library indexes up to 4,096 supported books on the SD card and shows their titles and authors without requiring you to remember their folders. Its three tabs provide different views. An arrow beside the active tab shows the sort direction:
 
-- **Recent** pins the ten books you opened most recently above books sorted by file modification time, newest first. Reverse the direction for oldest first without the pinned overlay. Hold a book for Open, Remove from recents (when pinned), Delete, or Rebuild.
+- **Recent** pins the ten books you opened most recently above books sorted by file modification time, newest first. Reverse the direction for oldest first without the pinned overlay. Hold a book for Open, Surprise me, Remove from recents (when pinned), Delete, or Rebuild. **Surprise me** opens one unread book instead of the held one; when nothing unread remains the shelf says `Nothing unread to open` and stays usable.
 - **Title** groups books by the first letter of the title. Up sorts A-Z and down sorts Z-A. Titles beginning with numbers or punctuation appear under `#`; letters from non-English scripts, including Hebrew, have their own groups.
 - **Author** groups books by author. Up sorts A-Z and down sorts Z-A.
 
@@ -602,6 +606,8 @@ The **Sleep Screen** setting controls what is displayed when the device goes to 
 
 With **Night mode** on, the built-in logo is dark even if **Light** is selected, and **None** is black. The entering-sleep popup keeps the current page's polarity, and Quick resume retains the page. Custom images, covers and transparent overlays keep their own colors and the explicitly selected cover filter; night mode does not automatically invert user artwork. Wake keeps the retained image until useful content is ready.
 
+The built-in logo screens and **Quick resume** also carry a small, understated note meant to pull you back into the book: `Press any key to keep reading`, your habit line (streak and pages today, when the clock is set), and the title of the book still open. Quick resume draws it as plain text right-aligned beside the moon icon, over the retained page, and adds the book's saved percentage to the title (`<title> · 66%`); the logo screens draw the same lines, with the title alone, centered under the logo. Covers, custom images and transparent overlays are never annotated.
+
 #### Cover settings
 
 When using **Cover** or **Cover + Custom**, two additional settings apply:
@@ -670,6 +676,8 @@ The role of the side buttons can be swapped in the **[Controls Settings](#363-co
 
 If the **Short Power Button Click** setting is set to "Page Turn", you can also turn to the next page by briefly pressing the Power button.
 
+On a touchscreen with **Touch reader controls** on, **Next page** and **Previous page** (Settings → Controls) default to **Tap & swipe**: tap the left third of the page for the previous page and anywhere in the right two thirds for the next page, or swipe; the centre third still opens the Reader Menu. EPUB and TXT books share the same zones. A press-and-hold on a word, an inline link tap and an inline picture tap are handled before page turning, and a tap that ends a hold never turns the page. Settings files written by older firmware that still hold the old untouched **Swipe only** pair are upgraded to **Tap & swipe** once; after that the firmware records a `pageTurnGestureVersion` marker in `settings.json`, so choosing **Swipe only** again in Settings is kept. A file that deliberately chose **Swipe only** for both directions before the upgrade cannot be told apart from the old default and is upgraded once too; set it back in Settings if you prefer swipes.
+
 ### Chapter Navigation
 
 * **Next Chapter:** Press and **hold** the **Right** (or **Side Down**) button briefly, then release.
@@ -737,7 +745,7 @@ Original files must remain at their saved paths. Renaming/moving a source change
 
 Words on the current page can be looked up in an offline StarDict dictionary stored on the SD card. Copy a dictionary to the `/dictionaries/` folder, select it in **Settings → Reader → Dictionary**, then start a lookup by choosing **Look Up** in the **[Reader Menu](#5-reader-menu)** (or by holding **Confirm**, if the **Long-press Menu** setting in **[Controls Settings](#363-controls)** is set to "Dictionary"). Use **Left/Right** to highlight a word and press **Confirm** to show its definition.
 
-On a touch screen you can also **press and hold a word** in an EPUB for about half a second: its definition opens directly, and **Back** returns to the same page. Holding blank space does nothing. If **Long-press Chapter Skip** (or rotate on hold) is set and page turns use tap zones, holding those zones still skips or rotates; the lookup takes holds everywhere else. TXT books do not have dictionary lookup.
+On a touch screen you can also **press and hold a word** in an EPUB or TXT book for about half a second: its definition opens directly, and **Back** returns to the same page. Holding blank space does nothing. If **Long-press Chapter Skip** (or rotate on hold) is set and page turns use tap zones, holding those zones still skips or rotates; the lookup takes holds everywhere else. In TXT books the **Dictionary** entry of the Reader Menu opens the same word picker as EPUB's **Look Up**: Latin text is split at spaces and tabs (including no-break and ideographic spaces), a Latin run is separated from adjacent Chinese text, and punctuation stays attached to the Chinese word it follows. In the picker the highlight follows your finger from the first moment of contact and while you drag; releasing on a word looks it up. The buttons behave as before. With no dictionary selected, a hold or the menu entry shows a short `No dictionary selected` note.
 
 For Chinese novels, install the **CC-CEDICT Chinese-English** folder and select `cedict` in the Dictionary setting. In Look Up mode, tap the **first character** of a word (or move the highlight with the direction buttons and press Confirm); while reading, press and hold the first character. The reader checks up to **eight consecutive CJK characters** and opens the longest exact dictionary match. The definition begins with the matched Chinese headword, tone-mark pinyin and English glosses. Tap **Shorter / Longer** at the top of the definition, or press the side **Up / Down** buttons, to move between available matching lengths. Definition paging and Back work as before.
 
@@ -777,6 +785,7 @@ Available options include:
 - **Quick Break / Back to &lt;book&gt;** – Leave this book for one unread item from `/books/Inbox` and come straight back when it ends (see [Quick Break and chapter countdown](#54-quick-break-and-chapter-countdown)).
 - **Footnotes** – Navigate to the footnotes for the current section *(only shown in books that contain footnotes)*.
 - **Look Up** – Select a word on the current page and show its dictionary definition (see [docs/dictionary.md](docs/dictionary.md)). Requires a dictionary to be selected in **Settings → Reader → Dictionary**. On a touch screen, pressing and holding a word on the page looks it up without the menu.
+- **Dictionary** (TXT books) – The same word picker as **Look Up**, opened from the TXT Reader Menu; see [Offline Dictionary](#offline-dictionary).
 - **Reading Orientation** – Cycle through screen orientations without leaving the reader.
 - **Auto Turn (Pages Per Minute)** – Cycle through automatic page turn speed options for hands-free reading.
 - **Go to %** – Jump to a specific position in the book by percentage.
@@ -815,6 +824,8 @@ Open **Reader menu → Reading stats** for the current book, or **Settings → S
 Time starts after the first page has rendered. Only the foreground, awake reader earns time, and credit stops five minutes after the last button or touch input. Another input resumes credit without backfilling the idle interval. Opening menus, dictionaries or the light panel pauses credit. Returning to the reader continues the same session; reopening a book or waking into it starts a new session. Automatic benchmark fixtures do not contribute.
 
 Pages count completed changes of displayed page, in either direction; a chapter/percentage jump counts as one displayed-page change, not every skipped page. Progress advanced sums forward movement in hundredths of a percent (EPUB content-position estimate, TXT byte-position estimate, XTC page position). It is not a count of characters read; rereading and jumps can exceed 100%. Average pace uses active time per page change. Time left uses active time divided by forward progress and is unavailable until at least one minute and some forward progress have been recorded. It is an estimate, especially after jumps, rereading or layout changes.
+
+The overview also shows **Current streak** and **Best streak** in days, above Today. A day counts toward a streak only when it recorded real reading; today may still be empty without ending a streak that stopped yesterday. Streaks come from the same 30-day daily record as the other windows (no extra file), so the best streak is the longest run within the last 30 days, and with the clock unset the rows say `Set the clock first`.
 
 First/last dates and daily buckets use the configured local clock. If it is unavailable or unset, book totals still accumulate, dates show `--`, and the overview asks you to set the clock; undated time is not retroactively assigned to a day. Renaming or moving a book starts a separate record because identity is its full SD path.
 
@@ -1017,6 +1028,7 @@ Open **Home → Reading inbox** to return to saved annotations across all books.
 
 - Save a **Quote**, **Question**, or **Review later** annotation in an EPUB-based reader to add an item. The inbox reads the existing native annotations; it does not copy them into another library or invent a separate source identity.
 - Rows show the source title, original filename and chapter, annotation kind, and progress at capture. Select a row to open its original document at the saved chapter/XPath and visible-text offset, rather than resuming the book's most recent page. Converted Markdown, FB2, and HTML use their original paths, not a temporary EPUB filename. Return accuracy assumes the source content has not been changed; pagination can change with font settings.
+- **Surprise me** sits under **Refresh inbox** and **Export all inbox entries**. It makes the same pick as Home's **Surprise me** (an unread short read from `/books/Inbox` first, then other unread or in-progress items, then Library books) and says `Nothing unread to open` when there is none. Unlike a row, it never asks which item.
 - There are still at most **128 annotations per book**. The inbox retains only **32 lightweight previews at a time** (about 10 KiB), with **Previous 32 items** / **Next 32 items** for additional pages. Items follow the SD annotation-directory order and native IDs, not an assumed chronological order. **Refresh inbox** rescans from the first page; entering or explicitly changing pages also scans the store. Ordinary row navigation and rendering do not scan files or parse JSON.
 - An empty inbox says there are no saved items. A missing source stays listed, but opening it reports the missing original path; restoring the file at that path allows return again. A corrupt/unreadable native record reports a load error instead of presenting a silently incomplete inbox.
 
