@@ -23,6 +23,10 @@ class SleepActivity final : public Activity {
   void renderLastScreenSleepScreen() const;
   void renderTransparentCustomSleepScreen() const;
   void renderBlankSleepScreen() const;
+  // Live bait: keeps the reader's habit and the "keep reading" cue on the frame
+  // they walk past. bandTop is the moon band's top edge (Quick Resume only).
+  void drawLiveBait(int bandTop, int pageWidth) const;
+  void drawHabitLines(int centerY) const;
 
   bool fromTimeout = false;
 };

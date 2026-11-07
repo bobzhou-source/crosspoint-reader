@@ -23,8 +23,10 @@ constexpr int16_t COVER_CELL_INSET = 6;
 CoverGridHomeUi::CoverGridHomeUi(GfxRenderer& renderer)
     : UiAppHost(renderer), coverCache(renderer), renderer(renderer) {}
 
-void CoverGridHomeUi::begin(const std::vector<RecentBook>& recent, bool opds, bool continuing) {
+void CoverGridHomeUi::begin(const std::vector<RecentBook>& recent, bool opds, bool continuing,
+                            const char* status) {
   books = &recent;
+  headerStatus = status ? status : "";
   hasOpds = opds;
   hasContinueReading = continuing;
   if (!recent.empty()) coverCache.begin();
@@ -131,7 +133,8 @@ void CoverGridHomeUi::drawHeaderBand() {
   // pushed screen's header: the battery/clock hold one position across the
   // whole UI, and the grid is widened to meet them (see the hInset above).
   const ThemeMetrics& metrics = UITheme::getInstance().getMetrics();
-  GUI.drawHeader(renderer, Rect{0, metrics.topPadding, renderer.getScreenWidth(), metrics.batteryBarHeight}, nullptr);
+  GUI.drawHeader(renderer, Rect{0, metrics.topPadding, renderer.getScreenWidth(), metrics.batteryBarHeight},
+                 nullptr, headerStatus.empty() ? nullptr : headerStatus.c_str(), false);
 }
 
 void CoverGridHomeUi::drawEmpty(UiScreen& screen) {

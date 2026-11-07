@@ -37,6 +37,12 @@ struct Summary {
   Day days[30];
   Top top[TOP_COUNT];
 };
+struct Habit {
+  uint32_t currentStreakDays = 0;
+  uint32_t bestStreakDays = 0;
+  uint32_t todayPagesRead = 0;
+  uint32_t todayMinutesRead = 0;
+};
 uint32_t civilDay(int year, unsigned month, unsigned day);
 void formatDay(uint32_t day, char* out, size_t size);
 uint64_t bookId(const char* path);
@@ -56,6 +62,7 @@ class Accumulator {
   bool active() const { return running; }
   Totals recent(uint32_t day, unsigned count) const;
   void updateTop();
+  Habit habit(uint32_t today) const;
 
  private:
   bool running = false;

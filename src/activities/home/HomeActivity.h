@@ -24,6 +24,10 @@ class HomeActivity final : public Activity {
   bool hasContinueReading = false;
   bool coverRendered = false;      // Track if cover has been rendered once
   bool coverBufferStored = false;  // Track if cover buffer is stored
+  const char* notice = nullptr;    // one-shot text drawn by the next render
+  // Habit line, snapshotted in onEnter: the render task must not touch the stats
+  // accumulator (it may need to read the card on first use).
+  char habitText[64] = {};
   uint8_t* coverBuffer = nullptr;  // HomeActivity's own buffer for cover image
   size_t coverBufferSize = 0;      // Bytes allocated to coverBuffer
   // Logical rect last passed to drawRecentBookCover. The cover snapshot only
@@ -57,6 +61,10 @@ class HomeActivity final : public Activity {
     if (item == HomeMenuItem::FILE_TRANSFER) return i;
     ++i;
     if (item == HomeMenuItem::SETTINGS_MENU) return i;
+    ++i;
+    // The deal-mode entry is the last row and only exists on the list home;
+    // the cover-grid home reaches it through its own tab strip.
+    if (item == HomeMenuItem::HOME_SURPRISE) return i;
     return 0;
   }
 
@@ -68,10 +76,12 @@ class HomeActivity final : public Activity {
     if (idx == i++) return coverGridUi ? HomeMenuItem::READING_INBOX : HomeMenuItem::FILE_BROWSER;
     if (hasOpdsUrl && idx == i++) return HomeMenuItem::OPDS_BROWSER;
     if (idx == i++) return HomeMenuItem::FILE_TRANSFER;
-    if (idx == i) return HomeMenuItem::SETTINGS_MENU;
+    if (idx == i++) return HomeMenuItem::SETTINGS_MENU;
+    if (!coverGridUi && idx == i) return HomeMenuItem::HOME_SURPRISE;
     return HomeMenuItem::NONE;
   }
   void onSelectBook(const std::string& path);
+  void onSurpriseMe();
   void onFileBrowserOpen();
   void onLibraryOpen();
   void onReadingInboxOpen();

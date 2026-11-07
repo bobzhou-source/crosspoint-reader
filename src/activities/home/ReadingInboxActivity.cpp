@@ -11,6 +11,7 @@
 #include "activities/reader/ReaderActivity.h"
 #include "components/UITheme.h"
 #include "util/AnnotationExport.h"
+#include "util/SurpriseMeSource.h"
 
 namespace fui = freeink::ui;
 
@@ -80,7 +81,7 @@ void ReadingInboxActivity::reload() {
 
 int ReadingInboxActivity::listCount() const {
   if (!loaded) return 1;  // Refresh remains available after a failed scan.
-  return static_cast<int>(2 + count + (pageStart > 0 ? 1 : 0) + (pageStart + count < total ? 1 : 0));
+  return static_cast<int>(3 + count + (pageStart > 0 ? 1 : 0) + (pageStart + count < total ? 1 : 0));
 }
 
 const char* ReadingInboxActivity::headerTitle() const { return tr(STR_READING_INBOX); }
@@ -98,7 +99,12 @@ void ReadingInboxActivity::provideRow(void* context, const uint16_t index, fui::
     item.subtitle = tr(STR_READING_INBOX_LOCAL);
     return;
   }
-  const size_t rowIndex = index - 2;
+  if (index == 2) {
+    // Deal mode: one press opens an unread item and never asks which one.
+    item.label = tr(STR_SURPRISE_ME);
+    return;
+  }
+  const size_t rowIndex = index - 3;
   if (rowIndex < self.count) {
     const auto& row = self.rows[rowIndex];
     item.label = row.title;
@@ -156,11 +162,13 @@ void ReadingInboxActivity::activateIndex(const int index) {
     requestUpdate();
   } else if (index == 1) {
     exportInbox();
-  } else if (static_cast<size_t>(index - 2) < count) {
-    openEntry(static_cast<size_t>(index - 2));
+  } else if (index == 2) {
+    openSurprise();
+  } else if (static_cast<size_t>(index - 3) < count) {
+    openEntry(static_cast<size_t>(index - 3));
   } else {
     RenderLock lock;
-    if (pageStart > 0 && static_cast<size_t>(index - 2) == count) pageStart -= PAGE_SIZE;
+    if (pageStart > 0 && static_cast<size_t>(index - 3) == count) pageStart -= PAGE_SIZE;
     else pageStart += PAGE_SIZE;
     reload();
     requestUpdate();
@@ -186,6 +194,22 @@ void ReadingInboxActivity::openEntry(const size_t index) {
   auto reader = ReaderActivity::create(renderer, mappedInput, entry->sourcePath, false);
   if (!reader || !reader->openAnnotation(*entry)) {
     showMessage(StrId::STR_READING_INBOX_OPEN_FAILED, entry->sourcePath.c_str());
+    return;
+  }
+  activityManager.replaceActivity(std::move(reader));
+}
+
+void ReadingInboxActivity::openSurprise() {
+  std::string path;
+  if (!surprise::findBook(path)) {
+    showMessage(StrId::STR_SURPRISE_NONE);
+    return;
+  }
+  // A never-started item opens on its first page, so this is already the fastest
+  // path from decision fatigue to text: no picker, no menu, no confirmation.
+  auto reader = ReaderActivity::create(renderer, mappedInput, path, false);
+  if (!reader) {
+    showMessage(StrId::STR_READING_INBOX_OPEN_FAILED, path.c_str());
     return;
   }
   activityManager.replaceActivity(std::move(reader));

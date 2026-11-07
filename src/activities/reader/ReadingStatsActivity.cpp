@@ -21,7 +21,7 @@ void total(const reading_stats::Totals& totals, char* out, size_t size) {
 }
 }  // namespace
 void ReadingStatsActivity::add(const char* label, const char* value) {
-  if (count >= 14) return;
+  if (count >= MAX_ROWS) return;
   snprintf(labels[count], sizeof(labels[count]), "%s", label);
   snprintf(values[count], sizeof(values[count]), "%s", value);
   rows[count].label = labels[count];
@@ -62,6 +62,15 @@ void ReadingStatsActivity::onEnter() {
     add(tr(STR_STATS_OVERVIEW), "");
   } else {
     const uint32_t day = reading_stats::today();
+    if (day) {
+      const reading_stats::Habit habit = stats.habit(day);
+      snprintf(value, sizeof(value), tr(STR_STATS_DAYS), static_cast<unsigned>(habit.currentStreakDays));
+      add(tr(STR_STATS_CURRENT_STREAK), value);
+      snprintf(value, sizeof(value), tr(STR_STATS_DAYS), static_cast<unsigned>(habit.bestStreakDays));
+      add(tr(STR_STATS_BEST_STREAK), value);
+    } else {
+      add(tr(STR_STATS_CURRENT_STREAK), tr(STR_STATS_SET_CLOCK));
+    }
     total(stats.recent(day, 1), value, sizeof(value));
     add(tr(STR_STATS_TODAY), day ? value : tr(STR_STATS_SET_CLOCK));
     total(stats.recent(day, 7), value, sizeof(value));

@@ -116,6 +116,8 @@ class LibraryListActivity final : public UiTabListActivity {
   // Shared tail of row activation and the options menu's Open entry.
   void openBookByPath(const std::string& path);
   void resetAfterRebuild();
+  // Deal mode: open one unread item from the Inbox or the shelf, or say why not.
+  void openSurprise();
   // Recent-row long-press menu: open / remove from recents / delete / rebuild.
   void showRecentBookOptions(int entry);
   void promptRemoveRecentBook(const std::string& path, const std::string& title);

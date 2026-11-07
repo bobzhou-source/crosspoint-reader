@@ -24,11 +24,14 @@
 
 #include "CrossPointSettings.h"
 #include "CrossPointState.h"
+#include "RecentBooksStore.h"
 #include "activities/reader/ReaderUtils.h"
 #include "components/UITheme.h"
 #include "fontIds.h"
 #include "images/Logo120.h"
 #include "images/MoonIcon.h"
+#include "util/BookProgress.h"
+#include "util/HabitBadge.h"
 #include "util/NightMode.h"
 
 namespace {
@@ -620,6 +623,7 @@ void SleepActivity::renderDefaultSleepScreen() const {
   renderer.drawImage(Logo120, (pageWidth - 120) / 2, (pageHeight - 120) / 2, 120, 120);
   renderer.drawCenteredText(UI_10_FONT_ID, pageHeight / 2 + 70, tr(STR_CROSSPOINT), true, EpdFontFamily::BOLD);
   renderer.drawCenteredText(SMALL_FONT_ID, pageHeight / 2 + 95, tr(STR_SLEEPING));
+  drawHabitLines(pageHeight / 2 + 120);
 
   renderer.displayBuffer(HalDisplay::HALF_REFRESH);
 }
@@ -867,12 +871,61 @@ void SleepActivity::renderCoverSleepScreen() const {
   return (this->*renderNoCoverSleepScreen)();
 }
 
+void SleepActivity::drawLiveBait(const int bandTop, const int pageWidth) const {
+  char habit[64];
+  const char* badge = habitBadge(habit, sizeof(habit));
+  // The hook line names the book still open and how far in it is — the thing
+  // that makes a reader pick the device back up.
+  char hook[160];
+  const char* title = nullptr;
+  const auto& books = RECENT_BOOKS.getBooks();
+  if (!books.empty()) title = books.front().title.c_str();
+  const int progress = APP_STATE.openEpubPath.empty() ? -1 : loadBookProgress(APP_STATE.openEpubPath);
+  if (title && progress >= 0)
+    snprintf(hook, sizeof(hook), tr(STR_SLEEP_HOOK_PROGRESS), title, progress);
+  else if (title)
+    snprintf(hook, sizeof(hook), "%s", title);
+  const int inset = 8;
+  const int lineHeight = renderer.getLineHeight(SMALL_FONT_ID);
+  const int right = pageWidth - inset;
+  const int width = pageWidth - MOONICON_WIDTH - 2 * inset;
+  // Bottom-up in the moon band: the call to action, the habit it protects, and
+  // the book still waiting. The reader sees all three from across the desk.
+  int y = bandTop + MOONICON_HEIGHT - lineHeight;
+  const auto line = [&](const char* text) {
+    if (!text || !*text) return;
+    // Titles are arbitrary length; truncating keeps one row on the page edge.
+    const std::string cut = renderer.truncatedText(SMALL_FONT_ID, text, width);
+    renderer.drawText(SMALL_FONT_ID, right - renderer.getTextWidth(SMALL_FONT_ID, cut.c_str()), y, cut.c_str());
+    y -= lineHeight;
+  };
+  line(tr(STR_SLEEP_KEEP_READING));
+  line(badge);
+  line(title ? hook : nullptr);
+}
+
+void SleepActivity::drawHabitLines(const int centerY) const {
+  const int lineHeight = renderer.getLineHeight(SMALL_FONT_ID);
+  renderer.drawCenteredText(SMALL_FONT_ID, centerY, tr(STR_SLEEP_KEEP_READING));
+  char habit[64];
+  if (const char* badge = habitBadge(habit, sizeof(habit)))
+    renderer.drawCenteredText(SMALL_FONT_ID, centerY + lineHeight + 4, badge);
+  const auto& books = RECENT_BOOKS.getBooks();
+  if (books.empty()) return;
+  const std::string title =
+      renderer.truncatedText(SMALL_FONT_ID, books.front().title.c_str(), renderer.getScreenWidth() - 32);
+  renderer.drawCenteredText(SMALL_FONT_ID, centerY + 2 * (lineHeight + 4), title.c_str());
+}
+
 void SleepActivity::renderLastScreenSleepScreen() const {
   const auto pageHeight = renderer.getScreenHeight();
-  renderer.drawImage(MoonIcon, 0, pageHeight - MOONICON_HEIGHT, MOONICON_WIDTH, MOONICON_HEIGHT);
-  // Only the moon differs from the displayed frame, so a differential FAST
-  // update adds it without the flashing clean pass (which sweeps the panel
-  // through the inverse — a full white flash on a night-mode page).
+  const auto pageWidth = renderer.getScreenWidth();
+  const int moonTop = pageHeight - MOONICON_HEIGHT;
+  renderer.drawImage(MoonIcon, 0, moonTop, MOONICON_WIDTH, MOONICON_HEIGHT);
+  drawLiveBait(moonTop, pageWidth);
+  // Only the moon and the bait differ from the displayed frame, so a
+  // differential FAST update adds them without the flashing clean pass (which
+  // sweeps the panel through the inverse — a full white flash on a night page).
   if (gpio.deviceIsX3()) {
     renderer.displayGrayscaleBase(HalDisplay::FAST_REFRESH);
   } else {
