@@ -774,6 +774,7 @@ Available options include:
 
 - **Select Chapter** – Open the table of contents to jump to a specific chapter (see [Chapter Selection](#51-chapter-selection) below).
 - **Reading stats** – Active reading time, pages, sessions, average pace and estimated time left for this book; available in EPUB, TXT and XTC menus.
+- **Quick Break / Back to &lt;book&gt;** – Leave this book for one unread item from `/books/Inbox` and come straight back when it ends (see [Quick Break and chapter countdown](#54-quick-break-and-chapter-countdown)).
 - **Footnotes** – Navigate to the footnotes for the current section *(only shown in books that contain footnotes)*.
 - **Look Up** – Select a word on the current page and show its dictionary definition (see [docs/dictionary.md](docs/dictionary.md)). Requires a dictionary to be selected in **Settings → Reader → Dictionary**. On a touch screen, pressing and holding a word on the page looks it up without the menu.
 - **Reading Orientation** – Cycle through screen orientations without leaving the reader.
@@ -822,6 +823,16 @@ Statistics live privately under `/.crosspoint/reading-stats/`: one small book re
 There are no statistics writes on individual page turns. Dirty totals are checkpointed every three minutes and on covering/leaving the reader, including sleep. Continuous active reading therefore makes at most **20 periodic checkpoints / 40 logical record commits per hour**, plus lifecycle checkpoints (two record commits each). Filesystem metadata and SD-controller physical writes are additional, not measured by that count. An interrupted save can lose up to the checkpoint interval; book and summary records are independently recoverable, so their latest totals can differ by one checkpoint after interruption. A failed save is logged and retried at the next checkpoint rather than every loop.
 
 When a benchmark session is recording, every flush that reaches an open book (periodic checkpoint, cover/suspend, leaving the reader, direct call) is written as one `stats_flush` row whose span is the whole call, so the SD cost of a checkpoint can be placed against the turn it landed near. The row changes nothing about when or how statistics are saved; with no session it costs one inlined check. Details in the event table below.
+
+### 5.4 Quick Break and chapter countdown
+
+A long chapter is easier to finish when the chapter itself is broken into checkpoints.
+
+**Quick Break** appears near the top of the Reader Menu in EPUB and TXT books that live outside `/books/Inbox`, and only when that folder holds an unread EPUB. Selecting it records the current book as the return target and opens the unread item in the Inbox folder. The source book's page, chapter and position are unchanged: they are the same progress the reader already saves, so the return lands on the paragraph the break was taken at.
+
+While the break item is open, the menu row reads **Back to &lt;book&gt;**, and the end-of-book screen starts with the same row. Reaching the last page of the item and turning past it also returns to the book, so a break needs no second decision. A break covers one item at a time: while one is open there is no second Quick Break, and returning clears it. If the source book has been deleted or the card was swapped, the row is not shown and the reader stays in the item rather than opening a dead path. Quick Break never touches the network.
+
+The countdown appears in the status bar's title lane as `Np to break` or, at the chapter end, `Np left`, only when the next checkpoint is **1-3 pages** away. Checkpoints are the next natural sub-section — a page that opens on a heading, a scene break or a horizontal rule — the next **six-page** interval when a chapter has no markers nearby, and the chapter end. Chapters of **six pages or fewer** get no countdown, nothing is shown while the reader stands on a checkpoint, and the line is skipped when the status bar has no text lane. In TXT files the chapter boundaries come from the heading index, so a book without headings is treated as one long chapter and uses the six-page cadence.
 
 ## 6. Current Limitations & Roadmap
 

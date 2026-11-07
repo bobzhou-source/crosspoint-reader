@@ -14,6 +14,11 @@ class CrossPointState : public PersistableStore<CrossPointState> {
   static constexpr uint8_t SLEEP_RECENT_COUNT = 16;
 
   std::string openEpubPath;
+  // Active "Quick Break": the book and title to return to when the Inbox item the
+  // break opened reaches its end. Empty path means no break is open, so a normal
+  // reader session never consults the Inbox.
+  std::string boomerangReturnPath;
+  std::string boomerangReturnTitle;
   uint16_t recentSleepImages[SLEEP_RECENT_COUNT] = {};
   uint8_t recentSleepPos = 0;
   uint8_t recentSleepFill = 0;

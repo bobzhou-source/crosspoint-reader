@@ -13,7 +13,7 @@ class MappedInputManager;
 // MAX_SUGGESTIONS sibling books once per reader session, followed by Home.
 class EndOfBookOptions : private UiAppHost {
  public:
-  enum class Action { None, Redraw, OpenBook, GoHome, LastPage };
+  enum class Action { None, Redraw, OpenBook, GoHome, LastPage, BackToBook };
 
   static constexpr size_t MAX_SUGGESTIONS = 3;
 
@@ -22,8 +22,9 @@ class EndOfBookOptions : private UiAppHost {
   // Scans the book's folder for suggestions; no-op when already loaded. Call ONLY from
   // the reader's render() (the render task, serialized by RenderLock) — the loaded flag
   // is the release/acquire publication point that lets the main task read the finished
-  // list safely.
-  void loadOnce(const std::string& currentBookPath);
+  // list safely. `backToTitle` adds a leading "Back to <title>" row: the Quick Break
+  // this book was opened from, so leaving early does not need the menu.
+  void loadOnce(const std::string& currentBookPath, const std::string& backToTitle);
 
   // True when the end menu (including Home-only) owns touch/confirm/back input.
   bool menuActive() const;
@@ -62,14 +63,20 @@ class EndOfBookOptions : private UiAppHost {
   // buildListScreen(): names.size() is capped at MAX_SUGGESTIONS and never
   // changes afterward, so a fixed-capacity array avoids any heap allocation
   // for the row list, both at load time and every subsequent repaint.
-  static constexpr size_t MAX_ROWS = MAX_SUGGESTIONS + 1;  // + the trailing "Home" row
+  static constexpr size_t MAX_ROWS = MAX_SUGGESTIONS + 2;  // + "Back to ..." and Home
   std::string rowLabels[MAX_ROWS];
   freeink::ui::ListItem rowItems[MAX_ROWS]{};
   size_t rowCount = 0;
+  // Leading Quick Break return row: its label and whether it exists.
+  std::string backToLabel;
+  bool hasBackRow = false;
+  // Row index of the first suggested book (the back row shifts the list by one).
+  int nameRowOffset() const { return hasBackRow ? 1 : 0; }
   void buildRowItems();
 
   // Row index dispatched by onRowEvent during the current route() call; -1 otherwise.
   int tappedRow = -1;
 
   std::string fullPath(size_t index) const;
+  Action actionForRow(int row, std::string* openPath) const;
 };

@@ -8,6 +8,7 @@
 #include <atomic>
 #include <memory>
 #include <optional>
+#include <string>
 #include <vector>
 
 #include "BookmarkEntry.h"
@@ -141,6 +142,19 @@ class EpubReaderActivity : public ReaderActivity {
   int lastSavedSpineIndex = -1;
   int lastSavedPage = -1;
   int lastSavedPageCount = -1;
+
+  // Micro-checkpoint countdown for the page on screen ("2p to break"), computed
+  // when the page is rendered and drawn in the status bar's title lane.
+  std::string pacingHint;
+  void updatePacingHint();
+  void scanPacingMarkers();
+  // Page classification for the current section: 0 = not scanned, 1 = scanned and
+  // plain, 2 = opens a sub-section (heading / scene break / horizontal rule).
+  std::vector<uint8_t> pacingScan;
+  std::vector<uint16_t> pacingMarkers;
+  // The section pacingScan belongs to; a new section (a new chapter, or a reflow)
+  // invalidates every classification.
+  const Section* pacingScanSection = nullptr;
 
   static constexpr int BUILD_PAGES_PER_CHUNK = 8;
   static constexpr int BACKGROUND_BUILD_PAGES_PER_TICK = 2;

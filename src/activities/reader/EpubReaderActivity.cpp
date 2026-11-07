@@ -47,6 +47,7 @@
 #include "ReaderFontSizes.h"
 #include "ReaderToolbarUi.h"
 #include "ReaderUtils.h"
+#include "ReadingPacing.h"
 #include "ReadingStatsActivity.h"
 #include "RecentBooksStore.h"
 #include "SdCardFontSystem.h"
@@ -315,7 +316,8 @@ void EpubReaderActivity::openReaderMenu() {
   startActivityForResult(
       std::make_unique<EpubReaderMenuActivity>(renderer, mappedInput, epub->getTitle(), position.displayPage(),
                                                position.totalPages, bookProgressPercent, SETTINGS.orientation,
-                                               !currentPageFootnotes.empty(), !cachedBookmarks.empty()),
+                                               !currentPageFootnotes.empty(), !cachedBookmarks.empty(),
+                                               boomerangRow()),
       [this](const ActivityResult& result) {
         const auto& menu = std::get<MenuResult>(result.data);
 
@@ -577,6 +579,9 @@ void EpubReaderActivity::loop() {
 
   const bool atEndOfBook = currentSpineIndex > 0 && currentSpineIndex >= epub->getSpineItemsCount();
   clearEndOfBookOptionsIfNeeded();
+  // A break item already at its end (restored there, or a one-page item) goes back
+  // to the book instead of offering end-of-book options.
+  if (handleBoomerangEndOfBook()) return;
 
   if (SETTINGS.removeReadBooksFromRecents) {
     if (atEndOfBook && !recentsEntryRemoved) {
@@ -993,6 +998,19 @@ void EpubReaderActivity::onReaderMenuConfirm(EpubReaderMenuActivity::MenuAction 
   };
 
   switch (action) {
+    case EpubReaderMenuActivity::MenuAction::QUICK_BREAK: {
+      // While a break is open this row reads "Back to <book>"; otherwise it opens the
+      // Inbox item the menu resolved. Progress for this page is already on the card,
+      // so neither direction needs an extra save.
+      if (returnFromBoomerang()) {
+        return;
+      }
+      if (startBoomerangBreak()) {
+        return;
+      }
+      requestUpdate();
+      break;
+    }
     case EpubReaderMenuActivity::MenuAction::READING_STATS: {
       if (auto activity = makeUniqueNoThrow<ReadingStatsActivity>(renderer, mappedInput, true)) {
         startActivityForResult(std::move(activity), nullptr);
@@ -1283,6 +1301,12 @@ bool EpubReaderActivity::pageTurn(bool isForwardTurn) {
       lastPageTurnTime = millis();
       return true;
     } else {
+      // Advancing past the last page of the Inbox item a Quick Break opened
+      // boomerangs straight back into the book instead of showing end-of-book.
+      if (boomerangBreakActive() && isInboxBook() && returnFromBoomerang()) {
+        lastPageTurnTime = millis();
+        return true;
+      }
       currentSpineIndex = epub->getSpineItemsCount();
       lastPageTurnTime = millis();
       return true;
@@ -1699,6 +1723,10 @@ void EpubReaderActivity::renderBook() {
     // stored-BW slot. Release the old page snapshot before renderContents()
     // needs that slot, then snapshot the newly rendered page below.
     discardOverlayPage();
+
+    // Recomputed per rendered page; the status bar appended in renderContents
+    // reads it. A page turn costs at most one lookahead page classification.
+    updatePacingHint();
 
     const auto start = millis();
     renderContents(std::move(p), orientedMarginTop, orientedMarginRight, orientedMarginBottom, orientedMarginLeft,
@@ -2341,6 +2369,95 @@ void EpubReaderActivity::renderContents(std::unique_ptr<Page> page, const int or
   }
 }
 
+namespace {
+
+// A page that opens a new sub-section is a natural place to stop: it carries a
+// horizontal rule (a real <hr> scene break), or its first text line is a heading.
+// h1..h6 are laid out bold and, under the book's style, centred; a user alignment
+// override drops the centring, so bold is checked first.
+bool pageOpensSubsection(const Page& page) {
+  for (const auto& element : page.elements) {
+    if (element->getTag() == TAG_PageHorizontalRule) {
+      return true;
+    }
+  }
+  for (const auto& element : page.elements) {
+    if (element->getTag() != TAG_PageLine) {
+      continue;
+    }
+    const auto& line = static_cast<const PageLine&>(*element);
+    const TextBlock* block = line.getBlock();
+    if (block == nullptr || block->wordCount() == 0) {
+      continue;
+    }
+    if ((static_cast<uint8_t>(block->wordStyle(0)) & static_cast<uint8_t>(EpdFontFamily::BOLD)) != 0) {
+      return true;
+    }
+    const BlockStyle& style = block->getBlockStyle();
+    return style.textAlignDefined && style.alignment == CssTextAlign::Center;
+  }
+  return false;
+}
+
+}  // namespace
+
+void EpubReaderActivity::scanPacingMarkers() {
+  if (pacingScanSection != section.get()) {
+    pacingScanSection = section.get();
+    pacingScan.clear();
+    pacingMarkers.clear();
+  }
+  const int available = section->pageCount;
+  if (available <= 0) {
+    return;
+  }
+  if (pacingScan.size() < static_cast<size_t>(available)) {
+    pacingScan.resize(static_cast<size_t>(available), 0);
+  }
+  // Look ahead one micro-goal's worth of pages and classify only the pages not seen
+  // before: a page turn therefore costs at most one extra page load.
+  const int from = section->currentPage + 1;
+  const int to = std::min(available - 1, from + reading_pacing::kMicroBreakIntervalPages - 1);
+  for (int page = from; page <= to; page++) {
+    if (pacingScan[page] != 0) {
+      continue;
+    }
+    auto loaded = section->loadPage(static_cast<uint16_t>(page));
+    if (!loaded) {
+      // Not laid out yet (a chapter still building): classify it on a later turn.
+      continue;
+    }
+    pacingScan[page] = 1;
+    if (pageOpensSubsection(*loaded)) {
+      pacingScan[page] = 2;
+      pacingMarkers.push_back(static_cast<uint16_t>(page));
+    }
+  }
+}
+
+void EpubReaderActivity::updatePacingHint() {
+  pacingHint.clear();
+  if (!section || section->pageCount == 0) {
+    return;
+  }
+  // Nothing to draw on: skip the lookahead page loads entirely.
+  if (!SETTINGS.statusBarSpec().textLaneVisible(true)) {
+    return;
+  }
+  const int pageCount = section->estimatedTotalPages();
+  const int currentPage = section->currentPage;
+  if (!reading_pacing::isLongChapter(0, pageCount - 1)) {
+    return;
+  }
+  scanPacingMarkers();
+  const auto checkpoint = reading_pacing::nextCheckpoint(currentPage, 0, pageCount - 1, pacingMarkers.data(),
+                                                         pacingMarkers.size());
+  char buffer[24];
+  if (reading_pacing::formatCountdown(checkpoint, buffer, sizeof(buffer)) > 0) {
+    pacingHint = buffer;
+  }
+}
+
 void EpubReaderActivity::renderStatusBar() const {
   const int currentPage = section ? section->currentPage + 1 : 1;
   const float pageCount = section ? section->estimatedTotalPages() : 1;
@@ -2361,6 +2478,13 @@ void EpubReaderActivity::renderStatusBar() const {
     title = currentChapterTitle();
   } else if (sb.titleMode == CrossPointSettings::STATUS_BAR_TITLE::BOOK_TITLE) {
     title = epub ? epub->getTitle() : "";
+  }
+
+  // The micro-checkpoint countdown rides in the title lane, ahead of the chapter or
+  // book title so it survives the lane's truncation. It is the one bit of the
+  // status bar that changes the goal, not the position.
+  if (!pacingHint.empty() && sb.textLaneVisible(true)) {
+    title = title.empty() ? pacingHint : pacingHint + "  " + title;
   }
 
   GUI.drawStatusBar(renderer, bookProgress, currentPage, pageCount, title, 0, textYOffset, true, currentPageBookmarked,
@@ -2971,7 +3095,8 @@ void EpubReaderActivity::applyReaderTextSettings() {
 // two entries that have their own tool (chapters -> Contents, text -> Text).
 void EpubReaderActivity::buildMoreActions() {
   using MA = EpubReaderMenuActivity::MenuAction;
-  EpubReaderMenuActivity::buildMenuItems(moreItems, !currentPageFootnotes.empty(), !cachedBookmarks.empty());
+  EpubReaderMenuActivity::buildMenuItems(moreItems, !currentPageFootnotes.empty(), !cachedBookmarks.empty(),
+                                         boomerangRow());
   moreItems.erase(std::remove_if(moreItems.begin(), moreItems.end(),
                                  [](const auto& item) {
                                    return item.action == MA::SELECT_CHAPTER || item.action == MA::TEXT_SETTINGS;
@@ -2980,7 +3105,10 @@ void EpubReaderActivity::buildMoreActions() {
 }
 
 std::string EpubReaderActivity::moreRowName(int row) const {
-  return row >= 0 && row < static_cast<int>(moreItems.size()) ? I18N.get(moreItems[row].labelId) : "";
+  if (row < 0 || row >= static_cast<int>(moreItems.size())) return "";
+  // The Quick Break row carries its own label ("Quick Break" / "Back to <book>").
+  const auto& item = moreItems[row];
+  return item.label.empty() ? std::string(I18N.get(item.labelId)) : item.label;
 }
 
 std::string EpubReaderActivity::moreRowValue(int row) const {

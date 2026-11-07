@@ -30,12 +30,16 @@ std::string displayName(const std::string& filename) {
 
 EndOfBookOptions::EndOfBookOptions(GfxRenderer& renderer) : UiAppHost(renderer), renderer(renderer) {}
 
-void EndOfBookOptions::loadOnce(const std::string& currentBookPath) {
+void EndOfBookOptions::loadOnce(const std::string& currentBookPath, const std::string& backToTitle) {
   if (isLoaded.load(std::memory_order_acquire)) {
     return;
   }
   folder = FsHelpers::extractFolderPath(currentBookPath);
   names = NextBookFinder::findNextBooks(currentBookPath, MAX_SUGGESTIONS);
+  hasBackRow = !backToTitle.empty();
+  if (hasBackRow) {
+    backToLabel = std::string(tr(STR_BACK_TO)) + " " + backToTitle;
+  }
   selector.store(0, std::memory_order_relaxed);
   // One-time app setup on the render task, including the Home-only case.
   resetUi();
@@ -51,6 +55,14 @@ void EndOfBookOptions::loadOnce(const std::string& currentBookPath) {
 // once here since names never changes after loadOnce() completes.
 void EndOfBookOptions::buildRowItems() {
   rowCount = 0;
+  if (hasBackRow && rowCount < MAX_ROWS) {
+    rowLabels[rowCount] = backToLabel;
+    fui::ListItem item;
+    item.label = rowLabels[rowCount].c_str();
+    item.actionValue = static_cast<int16_t>(rowCount);
+    rowItems[rowCount] = item;
+    rowCount++;
+  }
   for (const auto& name : names) {
     if (rowCount >= MAX_ROWS) break;
     rowLabels[rowCount] = displayName(name);
@@ -84,12 +96,31 @@ std::string EndOfBookOptions::fullPath(const size_t index) const {
 
 void EndOfBookOptions::onRowEvent(const fui::ActionEvent& event, void* user) {
   auto* self = static_cast<EndOfBookOptions*>(user);
-  if (event.value < 0 || event.value > static_cast<int16_t>(self->names.size())) return;
+  if (event.value < 0 || static_cast<size_t>(event.value) >= self->rowCount) return;
   self->selector.store(event.value, std::memory_order_relaxed);
   // The tapped row leaves this screen (open book or home); a lingering flash
   // would gray an unrelated element on the next render.
   self->app.clearTapFlash();
   self->tappedRow = event.value;
+}
+
+// Row index -> the action that row performs. Rows are [Back to ...] [suggestions...]
+// [Home]; the leading Quick Break row shifts the suggestions by one.
+EndOfBookOptions::Action EndOfBookOptions::actionForRow(const int row, std::string* openPath) const {
+  if (row < 0) {
+    return Action::None;
+  }
+  if (hasBackRow && row == 0) {
+    return Action::BackToBook;
+  }
+  const int nameIndex = row - nameRowOffset();
+  if (nameIndex >= 0 && nameIndex < static_cast<int>(names.size())) {
+    if (openPath) {
+      *openPath = fullPath(static_cast<size_t>(nameIndex));
+    }
+    return Action::OpenBook;
+  }
+  return Action::GoHome;  // "Home" row
 }
 
 EndOfBookOptions::Action EndOfBookOptions::handleMenuInput(const MappedInputManager& input, std::string* openPath) {
@@ -101,13 +132,7 @@ EndOfBookOptions::Action EndOfBookOptions::handleMenuInput(const MappedInputMana
   // app.on(ACTION_ROW, ...)), which sets tappedRow, so it flags this as always false.
   // cppcheck-suppress knownConditionTrueFalse
   if (route && tappedRow >= 0) {
-    if (tappedRow < static_cast<int>(names.size())) {
-      if (openPath) {
-        *openPath = fullPath(tappedRow);
-      }
-      return Action::OpenBook;
-    }
-    return Action::GoHome;  // "Home" row tapped
+    return actionForRow(tappedRow, openPath);
   }
 
   // Wrapped titles and folder lines can outgrow a landscape page. Vertical
@@ -131,13 +156,7 @@ EndOfBookOptions::Action EndOfBookOptions::handleMenuInput(const MappedInputMana
 
   const int selectedIndex = selector.load(std::memory_order_relaxed);
   if (input.wasReleased(MappedInputManager::Button::Confirm)) {
-    if (selectedIndex < static_cast<int>(names.size())) {
-      if (openPath) {
-        *openPath = fullPath(selectedIndex);
-      }
-      return Action::OpenBook;
-    }
-    return Action::GoHome;  // "Home" entry selected
+    return actionForRow(selectedIndex, openPath);
   }
 
   // Short-press Back returns to the last page; a long press falls through to the
@@ -156,14 +175,14 @@ EndOfBookOptions::Action EndOfBookOptions::handleMenuInput(const MappedInputMana
   const auto triggered = [&](const MappedInputManager::Button button) {
     return usePress ? input.wasPressed(button) : input.wasReleased(button);
   };
-  const int itemCount = static_cast<int>(names.size()) + 1;  // + "Home" entry
+  const int itemCount = nameRowOffset() + static_cast<int>(names.size()) + 1;  // + "Home" entry
   if (triggered(MappedInputManager::Button::NavPrevious)) {
-    if (names.empty()) return Action::LastPage;
+    if (itemCount <= 1) return Action::LastPage;
     selector.store(ButtonNavigator::previousIndex(selectedIndex, itemCount), std::memory_order_relaxed);
     return Action::Redraw;
   }
   if (triggered(MappedInputManager::Button::NavNext)) {
-    if (names.empty()) return Action::GoHome;
+    if (itemCount <= 1) return Action::GoHome;
     selector.store(ButtonNavigator::nextIndex(selectedIndex, itemCount), std::memory_order_relaxed);
     return Action::Redraw;
   }

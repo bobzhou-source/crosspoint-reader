@@ -10,6 +10,8 @@
 
 #include <algorithm>
 
+#include "Boomerang.h"
+#include "BoomerangInbox.h"
 #include "CrossPointSettings.h"
 #include "CrossPointState.h"
 #include "EpubReaderActivity.h"
@@ -187,6 +189,14 @@ bool ReaderActivity::handleEndOfBookMenu(const bool suppressConfirmRelease) {
 
   std::string openPath;
   switch (endOfBookOptions->handleMenuInput(mappedInput, &openPath)) {
+    case EndOfBookOptions::Action::BackToBook:
+      // Back to the book the break was taken from. A vanished target leaves the
+      // user here rather than on a dead screen, so fall back to the last page.
+      if (!returnFromBoomerang()) {
+        onReturnFromEndOfBook();
+        requestUpdate();
+      }
+      return true;
     case EndOfBookOptions::Action::OpenBook:
       activityManager.goToReader(openPath);
       return true;
@@ -220,6 +230,90 @@ bool ReaderActivity::handleEndOfBookPageTurn(const bool prevTriggered, const boo
     requestUpdate();
   }
   return true;
+}
+
+bool ReaderActivity::boomerangBreakActive() const { return !APP_STATE.boomerangReturnPath.empty(); }
+
+bool ReaderActivity::isInboxBook() const { return boomerang::isInboxBookPath(bookPath); }
+
+std::string ReaderActivity::boomerangReturnTitle() const {
+  // No title once the break is over, or when this already is the source book: the
+  // menu then has no "Back to ..." row to offer.
+  return std::string(
+      boomerang::returnLabel(bookPath, APP_STATE.boomerangReturnPath, APP_STATE.boomerangReturnTitle));
+}
+
+bool ReaderActivity::startBoomerangBreak() {
+  // Only a non-Inbox book with no break already open may start one; the row says
+  // the same, and the scan below is what proves an item is waiting.
+  if (boomerang::planBreakRow(bookPath, APP_STATE.boomerangReturnPath, isInboxBook(), true) !=
+      boomerang::BreakRowKind::QuickBreak) {
+    return false;
+  }
+  const std::string breakBook = findInboxBreakBook();
+  if (breakBook.empty()) {
+    return false;
+  }
+  // The source page/offset is already in progress.bin: every reader saves it as it
+  // renders, so reopening the book lands on the paragraph the break was taken at.
+  APP_STATE.boomerangReturnPath = bookPath;
+  APP_STATE.boomerangReturnTitle = getBookTitle();
+  APP_STATE.saveToFile();
+  LOG_DBG("BRM", "Quick break from %s into %s", bookPath.c_str(), breakBook.c_str());
+  activityManager.goToReader(breakBook);
+  return true;
+}
+
+bool ReaderActivity::returnFromBoomerang() {
+  const std::string target = APP_STATE.boomerangReturnPath;
+  const auto plan = boomerang::planReturn(bookPath, target, !target.empty() && Storage.exists(target.c_str()));
+  if (plan == boomerang::ReturnPlan::Nothing) {
+    return false;
+  }
+  // Every resolved case ends the break; only a live target navigates. Reopening the
+  // source by hand must not navigate onto itself.
+  APP_STATE.boomerangReturnPath.clear();
+  APP_STATE.boomerangReturnTitle.clear();
+  APP_STATE.saveToFile();
+  if (plan == boomerang::ReturnPlan::SelfBook) {
+    LOG_DBG("BRM", "Break ended on its own book");
+    return false;
+  }
+  if (plan == boomerang::ReturnPlan::BookGone) {
+    LOG_ERR("BRM", "Boomerang target is gone: %s", target.c_str());
+    return false;
+  }
+  LOG_DBG("BRM", "Boomerang back to %s", target.c_str());
+  activityManager.goToReader(target);
+  return true;
+}
+
+bool ReaderActivity::handleBoomerangEndOfBook() {
+  // Only the Inbox item the break opened boomerangs; any other book (including the
+  // source itself) keeps the normal end-of-book screen.
+  if (!isAtEndOfBook() || !boomerangBreakActive() || !isInboxBook()) {
+    return false;
+  }
+  return returnFromBoomerang();
+}
+
+boomerang::Row ReaderActivity::boomerangRow() {
+  boomerang::Row row;
+  const std::string breakPath = APP_STATE.boomerangReturnPath;
+  // The Inbox is probed only when the row could point that way: a Quick Break row
+  // that can do nothing is worse than none.
+  const bool hasItem = breakPath.empty() && !isInboxBook() && !findInboxBreakBook().empty();
+  switch (boomerang::planBreakRow(bookPath, breakPath, isInboxBook(), hasItem)) {
+    case boomerang::BreakRowKind::BackToBook:
+      row.backToTitle = boomerangReturnTitle();
+      break;
+    case boomerang::BreakRowKind::QuickBreak:
+      row.quickBreak = true;
+      break;
+    case boomerang::BreakRowKind::None:
+      break;
+  }
+  return row;
 }
 
 void ReaderActivity::configureBenchmark(const uint8_t phase, const uint8_t turns, uint8_t& completedTurns) {
@@ -368,6 +462,7 @@ void ReaderActivity::loop() {
   if (benchmarkLoop()) return;
   rememberBookOnceRendered();
   clearEndOfBookOptionsIfNeeded();
+  if (handleBoomerangEndOfBook()) return;
   if (handleEndOfBookMenu()) return;
   if (handleFormatInput()) return;
   if (handleBackNavigation()) return;
@@ -409,7 +504,7 @@ void ReaderActivity::render(RenderLock&&) {
     }
     renderer.clearScreen();
     if (endOfBookOptions) {
-      endOfBookOptions->loadOnce(bookPath);
+      endOfBookOptions->loadOnce(bookPath, boomerangReturnTitle());
       // Release-publish AFTER loadOnce() so the main task's acquire load can't
       // observe an object whose names/selector are still being populated.
       endOfBookOptionsReady.store(true, std::memory_order_release);

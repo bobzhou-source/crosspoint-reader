@@ -24,6 +24,7 @@
 #include "ReaderTouchZones.h"
 #include "ReaderUtils.h"
 #include "ReaderWordPage.h"
+#include "ReadingPacing.h"
 #include "TxtReaderChapterSelectionActivity.h"
 #include "TxtReaderMenuActivity.h"
 #include "TxtReaderPageSelectionActivity.h"
@@ -540,6 +541,8 @@ void TxtReaderActivity::renderBook() {
   displayedOffset = currentOffset;
   displayedNextOffset = nextOffset;
 
+  updatePacingHint();
+
   renderer.clearScreen();
   renderPage(renderer);
   markPageRendered(0, static_cast<uint32_t>(displayedPageNumber() - 1),
@@ -753,10 +756,57 @@ int TxtReaderActivity::indexPercent() const {
   return static_cast<int>(static_cast<uint64_t>(pageIndex.frontier()) * 100 / fileSize);
 }
 
+void TxtReaderActivity::updatePacingHint() {
+  pacingHint.clear();
+  if (!txt || !initialized || atEndOfBook) {
+    return;
+  }
+  // Nothing to draw on: skip the heading walk entirely.
+  if (!SETTINGS.statusBarSpec().textLaneVisible(true)) {
+    return;
+  }
+  // While the sweep is still running the page count is an estimate that keeps
+  // growing, so a countdown now would jump; the status bar already marks that
+  // state with "~".
+  if (!pageIndex.complete()) {
+    return;
+  }
+  const int pageCount = displayedPageCount();
+  const int currentPage = displayedPageNumber() - 1;
+
+  // Chapter span from the heading index: the last heading at or before this page
+  // and the heading after it. No headings means the whole book is one chapter.
+  int startPage = 0;
+  int endPage = pageCount - 1;
+  for (const uint32_t offset : pageIndex.chapters()) {
+    const int page = static_cast<int>(pageIndex.pageContaining(offset));
+    if (page <= currentPage) {
+      startPage = std::max(startPage, page);
+    } else {
+      endPage = page - 1;
+      break;
+    }
+  }
+  if (!reading_pacing::isLongChapter(startPage, endPage)) {
+    return;
+  }
+
+  const auto checkpoint = reading_pacing::nextCheckpoint(currentPage, startPage, endPage, nullptr, 0);
+  char buffer[24];
+  if (reading_pacing::formatCountdown(checkpoint, buffer, sizeof(buffer)) > 0) {
+    pacingHint = buffer;
+  }
+}
+
 void TxtReaderActivity::renderStatusBar() const {
   std::string title;
   if (SETTINGS.statusBarSpec().showsTitle()) {
     title = txt->getTitle();
+  }
+  // The micro-checkpoint countdown rides in the title lane, ahead of the book title
+  // so it survives the lane's truncation.
+  if (!pacingHint.empty() && SETTINGS.statusBarSpec().textLaneVisible(true)) {
+    title = title.empty() ? pacingHint : pacingHint + "  " + title;
   }
   // While indexing, the page count is an estimate and carries the "~" marker.
   GUI.drawStatusBar(renderer, bookProgressPercent(), displayedPageNumber(), displayedPageCount(), title,
@@ -788,12 +838,21 @@ void TxtReaderActivity::openMenu() {
     status.indexPercent = indexPercent();
   }
   startActivityForResult(
-      std::make_unique<TxtReaderMenuActivity>(renderer, mappedInput, getBookTitle(), status),
+      std::make_unique<TxtReaderMenuActivity>(renderer, mappedInput, getBookTitle(), status, boomerangRow()),
       [this](const ActivityResult& result) {
         if (result.isCancelled) {
           return;
         }
         switch (static_cast<TxtReaderMenuActivity::MenuAction>(std::get<MenuResult>(result.data).action)) {
+          case TxtReaderMenuActivity::MenuAction::QUICK_BREAK: {
+            // While a break is open this row reads "Back to <book>"; otherwise it
+            // opens one unread Inbox item. Progress for this page is saved by
+            // renderBook(), so neither direction needs an extra write.
+            if (returnFromBoomerang() || startBoomerangBreak()) {
+              return;
+            }
+            break;
+          }
           case TxtReaderMenuActivity::MenuAction::CONTENTS:
             openContents();
             break;

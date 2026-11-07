@@ -18,14 +18,15 @@ namespace fui = freeink::ui;
 EpubReaderMenuActivity::EpubReaderMenuActivity(GfxRenderer& renderer, MappedInputManager& mappedInput,
                                                const std::string& title, const int currentPage, const int totalPages,
                                                const int bookProgressPercent, const uint8_t currentOrientation,
-                                               const bool hasFootnotes, const bool hasBookmarks)
+                                               const bool hasFootnotes, const bool hasBookmarks,
+                                               const boomerang::Row& breakRow)
     : UiListActivity("EpubReaderMenu", renderer, mappedInput),
       title(title),
       pendingOrientation(currentOrientation),
       currentPage(currentPage),
       totalPages(totalPages),
       bookProgressPercent(bookProgressPercent) {
-  buildMenuItems(menuItems, hasFootnotes, hasBookmarks);
+  buildMenuItems(menuItems, hasFootnotes, hasBookmarks, breakRow);
   buildMenuRowItems();
 }
 
@@ -35,15 +36,25 @@ EpubReaderMenuActivity::EpubReaderMenuActivity(GfxRenderer& renderer, MappedInpu
 void EpubReaderMenuActivity::buildMenuRowItems() {
   for (size_t i = 0; i < menuItems.size() && i < MAX_MENU_ITEMS; i++) {
     fui::ListItem item;
-    item.label = I18N.get(menuItems[i].labelId);
+    // The Quick Break row carries its own label ("Back to <book>"); the std::string
+    // lives in menuItems, which is not mutated after construction.
+    item.label = menuItems[i].label.empty() ? I18N.get(menuItems[i].labelId) : menuItems[i].label.c_str();
     item.actionValue = static_cast<int16_t>(i);
     menuRowItems[i] = item;
   }
 }
 
-void EpubReaderMenuActivity::buildMenuItems(std::vector<MenuItem>& items, bool hasFootnotes, bool hasBookmarks) {
+void EpubReaderMenuActivity::buildMenuItems(std::vector<MenuItem>& items, bool hasFootnotes, bool hasBookmarks,
+                                            const boomerang::Row& breakRow) {
   items.clear();
   items.reserve(MAX_MENU_ITEMS);
+  if (!breakRow.backToTitle.empty()) {
+    // A Quick Break opened this book: the way back is the first thing wanted.
+    items.push_back({MenuAction::QUICK_BREAK, StrId::STR_BACK_TO,
+                     std::string(tr(STR_BACK_TO)) + " " + breakRow.backToTitle});
+  } else if (breakRow.quickBreak) {
+    items.push_back({MenuAction::QUICK_BREAK, StrId::STR_QUICK_BREAK, {}});
+  }
   items.push_back({MenuAction::SELECT_CHAPTER, StrId::STR_SELECT_CHAPTER});
   items.push_back({MenuAction::READING_STATS, StrId::STR_READING_STATS});
   if (hasFootnotes) {
