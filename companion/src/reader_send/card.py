@@ -18,6 +18,7 @@ from .cache import Cache
 from .cloud_annotations import load_annotations, map_annotation
 from .common import ReaderError, atomic_write, bounded_read
 from . import novels
+from .book_hooks import BACKUP_SUFFIX
 
 CONFIG_VERSION = 1
 CONFIG_KEYS = {
@@ -28,6 +29,7 @@ CONFIG_KEYS = {
     "firmware_sha256",
     "launchers_dir",
 }
+OPTIONAL_CONFIG_KEYS = {"inbox_cleanup"}
 FIRMWARE_NAME = "reader-workbench-rollback-reviewed.bin"
 FIRMWARE_CONFIG = Path(".crosspoint/reader-sync.json")
 FIRMWARE_CONFIG_VERSION = 1
@@ -42,6 +44,7 @@ DEVICE_KEY_ACCOUNT = "b"
 LIBRARY_DIRTY = Path(".crosspoint/library.dirty")
 BOOK_INBOX = Path("books/Inbox")
 NOVELS_DIR = Path("books/Novels")
+BOOKS_DIR = Path("books/Books")
 ANNOTATION_STORE = Path(".crosspoint/annotations")
 ANNOTATION_NATIVE_FORMAT = "reader-workbench-native-v1"
 CLOUD_ANNOTATIONS_NAME = "cloud-annotations.ndjson"
@@ -50,7 +53,7 @@ CARD_LEDGER_VERSION = 1
 SHARE_SHORTCUT_NAME = "Send to Reader"
 MAX_FIRMWARE_BYTES = 64 * 1024 * 1024
 MAX_EPUB_BYTES = 256 * 1024 * 1024
-MAX_NOVEL_CARD_PATH_BYTES = 255
+MAX_BOOK_CARD_PATH_BYTES = 255
 
 
 @dataclass(frozen=True)
@@ -62,6 +65,33 @@ class CardVolume:
 
 def default_config_path() -> Path:
     return Path.home() / "Library/Application Support/reader-send/card.json"
+
+
+def default_novels_dir() -> Path:
+    """Where `novels convert` puts the Drive collection on this Mac."""
+    return Path.home() / "papyrix" / "novels-epub"
+
+
+def default_books_dir() -> Path:
+    """The Mac shelf whose EPUBs are delivered to /books/Books."""
+    return Path.home() / "papyrix" / "books"
+
+
+def default_shelves() -> dict[str, Path]:
+    """Existing Mac shelf sources for the automatic card copy, keyed by card shelf.
+
+    A converted-novel shelf is only usable once it has a manifest, and a local
+    book shelf only once it exists, so a Mac without either syncs just the cloud
+    Inbox instead of failing.
+    """
+    shelves: dict[str, Path] = {}
+    novels_dir = default_novels_dir()
+    if (novels_dir / novels.MANIFEST_NAME).is_file():
+        shelves["novels"] = novels_dir
+    books_dir = default_books_dir()
+    if books_dir.is_dir():
+        shelves["books"] = books_dir
+    return shelves
 
 
 def _canonical_uuid(value: str) -> str:
@@ -170,8 +200,11 @@ def load_config(path: Path | None = None) -> dict:
         value = json.loads(bounded_read(path, 64 * 1024))
     except (OSError, ValueError, TypeError, UnicodeError) as exc:
         raise ReaderError(f"Card configuration is invalid: {path}: {exc}") from None
-    if not isinstance(value, dict) or set(value) != CONFIG_KEYS or value.get("version") != CONFIG_VERSION:
+    if (not isinstance(value, dict) or set(value) - OPTIONAL_CONFIG_KEYS != CONFIG_KEYS
+            or value.get("version") != CONFIG_VERSION):
         raise ReaderError(f"Card configuration has an unsupported schema: {path}")
+    if type(value.get("inbox_cleanup", False)) is not bool:
+        raise ReaderError(f"Card configuration inbox_cleanup must be true or false: {path}")
     return {
         "version": CONFIG_VERSION,
         "volume_uuid": _canonical_uuid(value["volume_uuid"]),
@@ -179,6 +212,8 @@ def load_config(path: Path | None = None) -> dict:
         "firmware_path": str(value["firmware_path"]),
         "firmware_sha256": _expected_sha(value["firmware_sha256"]),
         "launchers_dir": str(value["launchers_dir"]),
+        # Optional opt-in: card autosync applies the Inbox auto-delete plan only when true.
+        **({"inbox_cleanup": value["inbox_cleanup"]} if "inbox_cleanup" in value else {}),
     }
 
 
@@ -421,15 +456,32 @@ def _annotation_markdown(native_records: list[dict], volume_uuid: str) -> tuple[
     return ("\n".join(lines) + "\n").encode("utf-8"), len(mapped)
 
 
-def _annotation_import(volume: CardVolume, config: dict) -> tuple[bytes | None, int, Path | None, bool, bytes | None, Path | None, bool]:
+def _run_crossfire(volume: CardVolume, native_records: list[dict], options) -> dict:
+    """Content enrichment must never break book delivery, so failures become a status value."""
+    from . import crossfire as crossfire_module
+
+    settings = dict(options) if isinstance(options, dict) else {}
+    try:
+        return crossfire_module.write_card(volume.root / BOOK_INBOX, native_records,
+                                           corpus=settings.get("corpus", crossfire_module.DEFAULT_CORPUS),
+                                           neighbors=settings.get("neighbors", crossfire_module.DEFAULT_NEIGHBORS),
+                                           replies=settings.get("replies", crossfire_module.DEFAULT_REPLIES),
+                                           db=settings.get("db", crossfire_module.DEFAULT_DB),
+                                           limit=settings.get("limit", crossfire_module.DEFAULT_CANDIDATES),
+                                           dry_run=bool(settings.get("dry_run", False)))
+    except (ReaderError, OSError, ValueError) as exc:
+        return {"status": "error", "error": str(exc), "written": False}
+
+
+def _annotation_import(volume: CardVolume, config: dict, crossfire=None) -> tuple[bytes | None, int, Path | None, bool, bytes | None, Path | None, bool, dict | None]:
     # The cloud NDJSON export is owned by `cloud sync --annotations-out`; never
     # rewrite it from card sync, which could replace unrelated downloaded data.
     source = volume.root / ANNOTATION_STORE
     if not source.is_dir() or not any(source.rglob("*.json")):
-        return None, 0, None, False, None, None, False
+        return None, 0, None, False, None, None, False, None
     native_records = load_annotations(source)
     if not native_records:
-        return None, 0, None, False, None, None, False
+        return None, 0, None, False, None, None, False, None
     markdown, count = _annotation_markdown(native_records, config["volume_uuid"])
     annotation_uuid = config["volume_uuid"].lower()
     destination = Path(config["annotations_dir"]).expanduser() / f"reading-inbox-{annotation_uuid}.md"
@@ -462,8 +514,9 @@ def _annotation_import(volume: CardVolume, config: dict) -> tuple[bytes | None, 
         atomic_write(destination, markdown, overwrite=True)
     if current_native != native_bytes:
         atomic_write(native_destination, native_bytes, overwrite=True)
+    crossfire_result = _run_crossfire(volume, native_records, crossfire) if crossfire else None
     return (markdown, count, destination, current_markdown != markdown,
-            native_bytes, native_destination, current_native != native_bytes)
+            native_bytes, native_destination, current_native != native_bytes, crossfire_result)
 
 
 def card_status(config: dict) -> tuple[dict, bool]:
@@ -483,13 +536,14 @@ def card_status(config: dict) -> tuple[dict, bool]:
 
 
 def sync_card(cache: Cache, config: dict, *, volume: CardVolume | None = None, novels_dir: Path | None = None,
-              only_ids: set[str] | None = None) -> dict:
+              books_dir: Path | None = None, only_ids: set[str] | None = None, crossfire=None) -> dict:
     volume = volume or resolve_card(config["volume_uuid"])
     if volume.volume_uuid != _canonical_uuid(config["volume_uuid"]):
         raise ReaderError("Resolved card UUID does not match the configured card; no card files were changed")
     if volume.root.is_symlink() or not volume.root.is_dir():
         raise ReaderError("Configured card mount is not a normal directory; no card files were changed")
     novel_plan = _plan_novels(volume, Path(novels_dir)) if novels_dir is not None else None
+    book_plan = _plan_books(volume, Path(books_dir)) if books_dir is not None else None
     annotations_dir = Path(config["annotations_dir"]).expanduser()
     if annotations_dir.exists() and (annotations_dir.is_symlink() or not annotations_dir.is_dir()):
         raise ReaderError(f"Annotation output must be a normal directory: {annotations_dir}")
@@ -537,9 +591,10 @@ def sync_card(cache: Cache, config: dict, *, volume: CardVolume | None = None, n
             refreshed = True
     if pending or refreshed:
         _save_ledger(cache, volume.volume_uuid, ledger)
-    novel_result = _deliver_novels(volume, novel_plan) if novel_plan is not None else None
+    novel_result = _deliver_shelf(volume, novel_plan) if novel_plan is not None else None
+    book_result = _deliver_shelf(volume, book_plan) if book_plan is not None else None
     (_, annotation_count, annotation_path, annotation_updated,
-     _, native_path, native_updated) = _annotation_import(volume, config)
+     _, native_path, native_updated, crossfire_result) = _annotation_import(volume, config, crossfire)
     result = {
         "card": {"volume_uuid": volume.volume_uuid, "mount": str(volume.root), "device": volume.device},
         "books": {
@@ -559,8 +614,12 @@ def sync_card(cache: Cache, config: dict, *, volume: CardVolume | None = None, n
             "native_updated": native_updated,
         },
     }
+    if crossfire_result is not None:
+        result["annotations"]["crossfire"] = crossfire_result
     if novel_result is not None:
         result["novels"] = novel_result
+    if book_result is not None:
+        result["books"]["shelf"] = book_result
     return result
 
 
@@ -573,25 +632,29 @@ def _path_has_symlink(root: Path, path: Path) -> bool:
     return False
 
 
-def _plan_novels(volume: CardVolume, novels_dir: Path) -> dict:
-    """Validate converted novels against their manifest and the card; reads only, writes nothing."""
-    items, errors = novels.deliverable_outputs(novels_dir)
-    root = volume.root / NOVELS_DIR
+def _plan_shelf(volume: CardVolume, items: list[dict], shelf: Path, errors: list[str]) -> dict:
+    """Validate hashed shelf items against the card; reads only, writes nothing.
+
+    Shared by `/books/Novels` and `/books/Books`: an existing identical copy is
+    already delivered and left alone, a name that holds different bytes falls
+    back to `<stem>-<sha256[:8]>.epub`, and nothing is ever overwritten.
+    """
+    root = volume.root / shelf
     if _path_has_symlink(volume.root, root) or (root.exists() and not root.is_dir()):
-        raise ReaderError(f"Card novels folder is not a normal directory: {root}")
+        raise ReaderError(f"Card {shelf} folder is not a normal directory: {root}")
     planned: list[tuple[dict, Path]] = []
     unchanged: list[str] = []
     claimed: set[Path] = set()
     for item in items:
         relative = Path(item["rel"])
         if relative.is_absolute() or ".." in relative.parts or not relative.name:
-            errors.append(f"{item['rel']}: unsafe path in the novel manifest")
+            errors.append(f"{item['rel']}: unsafe path")
             continue
         if item["size"] > MAX_EPUB_BYTES:
             errors.append(f"{item['rel']}: EPUB exceeds the {MAX_EPUB_BYTES // (1024 * 1024)} MiB safety limit")
             continue
-        if len((NOVELS_DIR / relative).as_posix().encode("utf-8")) > MAX_NOVEL_CARD_PATH_BYTES:
-            errors.append(f"{item['rel']}: card path is longer than the reader's {MAX_NOVEL_CARD_PATH_BYTES}-byte limit")
+        if len((shelf / relative).as_posix().encode("utf-8")) > MAX_BOOK_CARD_PATH_BYTES:
+            errors.append(f"{item['rel']}: card path is longer than the reader's {MAX_BOOK_CARD_PATH_BYTES}-byte limit")
             continue
         candidates = [root / relative, root / relative.with_name(f"{relative.stem}-{item['sha256'][:8]}.epub")]
         if _path_has_symlink(volume.root, candidates[0].parent):
@@ -609,11 +672,63 @@ def _plan_novels(volume: CardVolume, novels_dir: Path) -> dict:
             continue
         claimed.add(free)
         planned.append((item, free))
-    return {"source": str(novels_dir), "directory": root, "planned": planned, "unchanged": unchanged, "errors": errors}
+    return {"directory": root, "planned": planned, "unchanged": unchanged, "errors": errors}
 
 
-def _deliver_novels(volume: CardVolume, plan: dict) -> dict:
-    """Copy planned novels without overwriting, reading every copy back against the manifest hash."""
+def _plan_novels(volume: CardVolume, novels_dir: Path) -> dict:
+    """Validate converted novels against their manifest and the card; reads only, writes nothing."""
+    items, errors = novels.deliverable_outputs(novels_dir)
+    return {"source": str(novels_dir), **_plan_shelf(volume, items, NOVELS_DIR, errors)}
+
+
+def local_book_items(books_dir: Path) -> tuple[list[dict], list[str]]:
+    """Every EPUB below the Mac book shelf, hashed, plus problems for the rest.
+
+    Symlinks are reported, not followed, and one copy of identical bytes is
+    enough: a shelf that keeps two names for the same book does not put the same
+    book on the card twice. `<book>.pre-hooks.epub` files are the originals that
+    `reader-send hooks` keeps beside a book it enriched; they are never
+    delivered, or the card would hold the book twice.
+    """
+    root = Path(books_dir).expanduser().resolve()
+    if not root.is_dir():
+        raise ReaderError(f"Local book shelf not found: {root}")
+    items: list[dict] = []
+    errors: list[str] = []
+    seen: dict[str, str] = {}
+    for path in sorted(root.rglob("*")):
+        rel = path.relative_to(root).as_posix()
+        if path.name.lower().endswith(BACKUP_SUFFIX):
+            continue
+        if path.is_symlink():
+            errors.append(f"{rel}: symlink is not copied")
+            continue
+        if not path.is_file() or path.suffix.lower() != ".epub":
+            continue
+        try:
+            size = path.stat().st_size
+            if size > MAX_EPUB_BYTES:
+                errors.append(f"{rel}: EPUB exceeds the {MAX_EPUB_BYTES // (1024 * 1024)} MiB safety limit")
+                continue
+            sha = file_sha256(path, MAX_EPUB_BYTES)
+        except (OSError, ReaderError) as exc:
+            errors.append(f"{rel}: cannot read the book: {exc}")
+            continue
+        if sha in seen:
+            continue
+        seen[sha] = rel
+        items.append({"rel": rel, "path": path, "sha256": sha, "size": size})
+    return items, sorted(errors)
+
+
+def _plan_books(volume: CardVolume, books_dir: Path) -> dict:
+    """Validate the local shelf against the card; reads only, writes nothing."""
+    items, errors = local_book_items(books_dir)
+    return {"source": str(Path(books_dir).expanduser().resolve()), **_plan_shelf(volume, items, BOOKS_DIR, errors)}
+
+
+def _deliver_shelf(volume: CardVolume, plan: dict) -> dict:
+    """Copy planned shelf books without overwriting, reading every copy back against its hash."""
     marker = volume.root / LIBRARY_DIRTY
     copied: list[str] = []
     errors: list[str] = list(plan["errors"])
@@ -637,7 +752,7 @@ def _deliver_novels(volume: CardVolume, plan: dict) -> dict:
                 removed = "; the bad copy was removed"
             except OSError as exc:
                 removed = f"; could not remove the bad copy: {exc}"
-            errors.append(f"{item['rel']}: card readback does not match the converted EPUB{removed}")
+            errors.append(f"{item['rel']}: card readback does not match the shelf EPUB{removed}")
             continue
         copied.append(str(destination))
     return {

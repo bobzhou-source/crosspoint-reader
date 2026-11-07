@@ -28,7 +28,7 @@ from .epub import CONTAINER_XML, pack_epub
 
 CONVERTER_VERSION = 10
 UNGROUPED_VERSION = 9  # unchanged books retain their reproducible EPUB identity
-TEXT_CLEAN_REVISION = 1  # provenance only: recorded in the manifest of books built by this text handling; never forces a rebuild
+TEXT_CLEAN_REVISION = 3  # provenance of the text handling in a build; `convert_tree(rebuild_stale=True)` reconverts older entries
 GROUP_CHAPTER_THRESHOLD = 3_000
 MANIFEST_NAME = ".novels-manifest.json"
 REPORT_NAME = ".novels-report.json"
@@ -358,21 +358,43 @@ def _chapter_key(line: str) -> tuple[str, int] | None:
     return (match.group(2), number) if number is not None else None
 
 
+def _echo_identity(text: str) -> tuple[tuple[str, int] | None, str] | None:
+    """What a heading shows, for comparing a title with its echoes.
+
+    The chapter number is compared as a number — `第200章`, `第00200章` and `第二百章` are the same
+    chapter — and the remaining characters without any whitespace. Sources reprint a title with a
+    different numeral form or different spacing, which the reader cannot show as anything but the
+    same line. Everything else is compared as written.
+    """
+    stripped = strip_decoration(text)
+    match = _ECHO_KEY.match(stripped)
+    number = parse_numeral(match.group(1)) if match else None
+    if match and number is not None:
+        return (match.group(2), number), "".join(stripped[match.end():].split())
+    visible = "".join(stripped.split())
+    return (None, visible) if visible else None
+
+
 def _echoes(paragraphs: list[str], found: dict[int, Heading]) -> dict[int, int]:
-    """{echo index: index of the heading it repeats} for headings that only repeat the number of the one before.
+    """{echo index: index of the heading it repeats} for titles that only repeat the one before.
 
     `## 第二章 标题` / `====` / `第002章`: only blank or decoration-only lines may lie between the two, so the
     echo has no body of its own and belongs to the chapter of the heading it repeats instead of opening one.
+    The repeat may print the number in another numeral form or with different spacing (see `_echo_identity`).
     """
     echoes: dict[int, int] = {}
-    anchor: tuple[int, tuple[str, int]] | None = None
+    anchor: tuple[int, tuple[tuple[str, int] | None, str] | None, tuple[str, int] | None] | None = None
     for index in sorted(found):
         key = _chapter_key(paragraphs[index])
-        if (key is not None and anchor is not None and key == anchor[1]
-                and all(i in echoes or _DECORATION_LINE.fullmatch(paragraphs[i]) for i in range(anchor[0] + 1, index))):
+        identity = _echo_identity(paragraphs[index])
+        repeated = (anchor is not None and identity is not None
+                    and (identity == anchor[1] or (key is not None and key == anchor[2]))
+                    and all(i in echoes or _DECORATION_LINE.fullmatch(paragraphs[i])
+                            for i in range(anchor[0] + 1, index)))
+        if repeated:
             echoes[index] = anchor[0]
         else:
-            anchor = (index, key) if key is not None else None
+            anchor = (index, identity, key)
     return echoes
 
 
@@ -471,20 +493,32 @@ def chapter_starts(headings: dict[int, Heading]) -> list[int]:
 
 
 def duplicate_echoes(paragraphs: list[str], headings: dict[int, Heading]) -> set[int]:
-    """Paragraph indices of echo lines that repeat their heading's displayed text exactly.
+    """Paragraph indices of echo lines the reader would show as a second copy of the title.
 
-    `第1章 标题` / `第1章 标题` would show the same title twice in a row; the second line is dropped (and
-    accounted for as removed text). An echo that differs in any character is kept under the heading.
+    `第1章 标题` / `第1章 标题` shows the same title twice in a row; the second line is dropped (and
+    accounted for as removed text). The comparison is `_echo_identity` — whitespace aside, and with
+    the chapter number read as a number — so `第二百章 标题` after `第200章 标题` is the same title.
+    An echo that repeats an earlier echo of the same chapter is dropped too, and an echo that adds
+    any visible character is kept under the heading.
     """
     if len(chapter_starts(headings)) < MIN_HEADINGS:
         return set()
     dropped: set[int] = set()
     owner: int | None = None
+    shown: set = set()
     for index in sorted(headings):
         if headings[index].level != ECHO:
             owner = index
-        elif owner is not None and strip_decoration(paragraphs[index]) == strip_decoration(paragraphs[owner]):
-            dropped.add(index)
+            identity = _echo_identity(paragraphs[index])
+            shown = {identity} if identity is not None else set()
+        elif owner is not None:
+            identity = _echo_identity(paragraphs[index])
+            if identity is None:
+                continue
+            if identity in shown:
+                dropped.add(index)
+            else:
+                shown.add(identity)
     return dropped
 
 
@@ -784,8 +818,8 @@ def expected_book_text(normalized: str) -> tuple[str, dict]:
     `、` of a `☆、` marker) on heading lines, and lines made of nothing but those characters. Every
     removal is verified to sit at the edge of its heading or to be a whole decoration line, and the
     total is reconciled with the length of the source, so nothing else can disappear unnoticed. The one
-    other removal is an echo line identical to its heading (`duplicate_echoes`), counted whole in
-    `duplicate_heading_chars_removed`, never in `removed_decoration_chars`.
+    other removal is an echo line that repeats its heading's visible characters (`duplicate_echoes`),
+    counted whole in `duplicate_heading_chars_removed`, never in `removed_decoration_chars`.
     """
     paragraphs, headings, ornaments = read_structure(normalized)
     shown = apply_decoration(paragraphs, headings)
@@ -960,7 +994,7 @@ def _convert_one(task: dict) -> dict:
         compatible = prior_version == CONVERTER_VERSION or (
             prior_version == UNGROUPED_VERSION and isinstance(prior.get("chapters"), int)
             and 0 <= prior["chapters"] <= GROUP_CHAPTER_THRESHOLD)
-        if (not task["force"] and prior.get("status") == "ok" and prior.get("source_sha256") == sha
+        if (not task["force"] and not task["stale"] and prior.get("status") == "ok" and prior.get("source_sha256") == sha
                 and compatible and prior.get("output") == task["out_rel"]
                 and out_path.is_file() and out_path.stat().st_size == prior.get("output_bytes")):
             return {**prior, **result, "status": "skipped"}
@@ -1003,8 +1037,14 @@ def default_jobs() -> int:
 
 
 def convert_tree(src: Path, out: Path, *, force: bool = False, jobs: int = 1,
+                 rebuild_stale: bool = False,
                  progress: Callable[[int, int, dict], None] | None = None) -> dict:
-    """Convert every .txt below `src` into a mirrored .epub below `out`. `src` is only ever read."""
+    """Convert every .txt below `src` into a mirrored .epub below `out`. `src` is only ever read.
+
+    ``rebuild_stale`` reconverts entries whose recorded ``text_clean`` revision is missing or
+    older than ``TEXT_CLEAN_REVISION`` even when their source is unchanged; ``force`` rebuilds
+    everything instead.
+    """
     src = Path(src).expanduser().resolve()
     out = Path(out).expanduser().resolve()
     if not src.is_dir():
@@ -1030,8 +1070,10 @@ def convert_tree(src: Path, out: Path, *, force: bool = False, jobs: int = 1,
                                "error": f"Output name collides with the conversion of {claimed[out_rel]}"})
             continue
         claimed[out_rel] = rel
+        prior = entries.get(rel)
         tasks.append({"path": str(path), "rel": rel, "out_rel": out_rel, "out_path": str(out / out_rel),
-                      "prior": entries.get(rel), "force": force})
+                      "prior": prior, "force": force,
+                      "stale": bool(rebuild_stale and (prior or {}).get("text_clean") != TEXT_CLEAN_REVISION)})
     total = len(tasks) + len(collisions)
     done = 0
     since_save = 0

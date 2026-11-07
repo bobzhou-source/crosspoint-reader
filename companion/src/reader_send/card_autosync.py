@@ -14,9 +14,17 @@ One run, started by the ``dev.reader-workbench.card-autosync`` LaunchAgent (``St
    Only items whose card copy matches are acknowledged, which is what frees the server bytes.
 4. HTTP 429 stops the run; nothing unverified is acknowledged and the next mount retries.
 
-It never ejects, never stages firmware, never touches ``/books/Novels`` or ``/books/Books``, and
-deletes no book. The management key comes from ``READER_SYNC_KEY`` or, when that is absent, the
-dedicated Keychain item; it is held only in this process and never logged.
+The configured novel shelf (``~/papyrix/novels-epub``) and local shelf (``~/papyrix/books``) are
+copied the same way as the cloud books, into ``/books/Novels`` and ``/books/Books``; the
+``<book>.pre-hooks.epub`` backups that ``reader-send hooks`` leaves beside an enriched book are
+never copied. With ``crossfire`` the imported annotations also produce one Cross-Fire card in
+``/books/Inbox``. The run ends with the Inbox cleanup plan, which is a dry run unless
+``"inbox_cleanup": true`` is set in ``card.json``.
+
+It never ejects and never stages firmware, and it deletes no book unless that cleanup opt-in is
+set (cleanup only moves finished or expired feed items into ``/books/Inbox/.trash/``). The management
+key comes from ``READER_SYNC_KEY`` or, when that is absent, the dedicated Keychain item; it is held
+only in this process and never logged.
 """
 
 from __future__ import annotations
@@ -30,7 +38,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Callable
 
-from . import card
+from . import card, inbox_card
 from .cache import Cache
 from .cloud import DEFAULT_ORIGIN, CloudClient
 from .cloud_sync import pull_ready
@@ -154,6 +162,9 @@ def autosync(
     batch: int = DEFAULT_BATCH,
     passes: int = DEFAULT_PASSES,
     wait: Callable[[float], None] = time.sleep,
+    novels_dir: Path | None = None,
+    books_dir: Path | None = None,
+    crossfire=None,
 ) -> dict:
     log = log or RunLog(None)
     if type(batch) is not int or not 1 <= batch <= MAX_BATCH:
@@ -174,12 +185,14 @@ def autosync(
         log("another autosync run holds the lock; exiting")
         return {"status": "busy"}
     try:
-        return _run(cache, config, volume, client_factory, key_provider, notify, log, batch, passes, wait)
+        return _run(cache, config, volume, client_factory, key_provider, notify, log, batch, passes, wait,
+                    novels_dir, books_dir, crossfire)
     finally:
         lock.close()
 
 
-def _run(cache, config, volume, client_factory, key_provider, notify, log, batch, passes, wait) -> dict:
+def _run(cache, config, volume, client_factory, key_provider, notify, log, batch, passes, wait,
+         novels_dir=None, books_dir=None, crossfire=None) -> dict:
     expected = config["volume_uuid"]
     log(f"reader card {expected} mounted at {volume.root}; starting delivery")
 
@@ -209,7 +222,8 @@ def _run(cache, config, volume, client_factory, key_provider, notify, log, batch
                 break
             result["passes"] = number
             try:
-                outcome = _pass(cache, config, volume, client, batch, log, result["acked"])
+                outcome = _pass(cache, config, volume, client, batch, log, result["acked"],
+                                novels_dir, books_dir, crossfire)
             except ReaderError as exc:
                 if is_rate_limited(exc):
                     result["status"] = "rate_limited"
@@ -244,7 +258,8 @@ def _run(cache, config, volume, client_factory, key_provider, notify, log, batch
     if card_result is None:
         # Cloud unavailable or nothing to deliver: the card's annotations are still imported.
         try:
-            card_result = card.sync_card(cache, config, volume=volume, only_ids=set())
+            card_result = card.sync_card(cache, config, volume=volume, only_ids=set(),
+                                         novels_dir=novels_dir, books_dir=books_dir, crossfire=crossfire)
         except (ReaderError, OSError) as exc:
             result["status"] = "error" if result["status"] == "ok" else result["status"]
             result["errors"].append(str(exc))
@@ -252,6 +267,17 @@ def _run(cache, config, volume, client_factory, key_provider, notify, log, batch
     if card_result is not None:
         result["annotations"] = card_result["annotations"]
         result["card"] = card_result["card"]
+        result["shelves"] = {"novels": card_result.get("novels"),
+                             "books": card_result["books"].get("shelf")}
+        for name, shelf in result["shelves"].items():
+            if shelf is None:
+                continue
+            log(f"{name} shelf: copied {shelf['copied']}, unchanged {shelf['unchanged']}, errors {len(shelf['errors'])}")
+            for error in shelf["errors"]:
+                result["errors"].append(f"{name}: {error}")
+            if shelf["errors"] and result["status"] == "ok":
+                result["status"] = "error"
+    result["cleanup"] = _cleanup(cache, config, volume, log)
     for item in result["unverified"]:
         log(f"not acknowledged (card copy did not verify): {item['id']}")
     for item_id in result["acked"]:
@@ -266,7 +292,7 @@ def _run(cache, config, volume, client_factory, key_provider, notify, log, batch
 
 
 def _pass(cache: Cache, config: dict, volume: card.CardVolume, client: CloudClient, batch: int, log,
-          acked: list) -> dict:
+          acked: list, novels_dir=None, books_dir=None, crossfire=None) -> dict:
     requests = client.requests
     items = client.items(ready_only=True)
     # Everything this pass sends must fit the per-minute allowance, so plan it first: books already in the
@@ -294,7 +320,9 @@ def _pass(cache: Cache, config: dict, volume: card.CardVolume, client: CloudClie
     wanted.sort(key=lambda item: item["sha256"] not in cached)  # stable: cached books first, server order kept
     log(f"{len(items)} ready on server; pulled {len(pulled['pulled'])}, {len(pulled['already_cached'])} already cached, "
         f"{pulled['deferred']} deferred")
-    card_result = card.sync_card(cache, config, volume=volume, only_ids={record["id"] for record in by_sha.values()})
+    card_result = card.sync_card(cache, config, volume=volume,
+                                 only_ids={record["id"] for record in by_sha.values()},
+                                 novels_dir=novels_dir, books_dir=books_dir, crossfire=crossfire)
     ack_budget = budget - len(pulled["pulled"]) - len(pulled["released"])
     ledger = card._load_ledger(cache, volume.volume_uuid)
     unverified, fresh_proofs = [], {}
@@ -340,3 +368,24 @@ def _message(result: dict, annotations: int) -> str:
     if result["unverified"]:
         text += f"; {len(result['unverified'])} held back (copy not verified)"
     return text
+
+
+def _cleanup(cache: Cache, config: dict, volume: card.CardVolume, log) -> dict:
+    """Plan the Inbox auto-delete pass every mount; apply it only with ``inbox_cleanup: true`` in card.json."""
+    apply = config.get("inbox_cleanup", False) is True
+    try:
+        ledger = card._load_ledger(cache, volume.volume_uuid)
+        delivered = {f"/{card.BOOK_INBOX.as_posix()}/{entry['filename']}" for entry in ledger.values()}
+        outcome = inbox_card.run_cleanup(volume.root, inbox_card.state_path(cache.root, volume.volume_uuid),
+                                         apply=apply, delivered=delivered)
+    except (ReaderError, OSError) as exc:
+        log(f"inbox cleanup skipped: {exc}")
+        return {"error": str(exc)}
+    counts = outcome["counts"]
+    mode = "applied" if apply else "dry run (set \"inbox_cleanup\": true in card.json to apply)"
+    log(f"inbox cleanup {mode}: {counts['trash']} to trash, {counts['hold']} held for unconfirmed annotations, "
+        f"{counts['purge']} trash entries past {inbox_card.TRASH_DAYS} days")
+    for entry in outcome["files"]:
+        if entry["action"] != "keep":
+            log(f"  {entry['action']}: {entry['file']} ({entry['reason']})")
+    return {"dry_run": outcome["dry_run"], "counts": counts, "applied": outcome["applied"]}

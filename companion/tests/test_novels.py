@@ -527,11 +527,14 @@ class EchoTest(unittest.TestCase):
         book = self.convert("## 正文_{a} 标题{n}\n{b} 标题{n}\n正文{n}。\n")
         shown = blocks(read_epub(book.epub))
         self.assertEqual((book.info["chapters"], book.info["files"]), (6, 6))
-        self.assertEqual([tag for tag, _ in shown][:3], ["h2", "h3", "p"])
+        # The prefix is part of the shown title, so the bare echo is the same title and is dropped.
+        self.assertEqual([tag for tag, _ in shown][:2], ["h2", "p"])
+        self.assertEqual(book.info["duplicate_headings_dropped"], 6)
         self.assertEqual(shown[0][1], "正文_第一章 标题1")
 
     def test_several_echoes_stay_with_the_chapter(self):
-        text = "".join(f"第{n}章 标题\n第0{n}章\n----\n第00{n}章\n正文{n}。\n" for n in range(1, 7))
+        text = "".join(f"第{n}章 标题\n第{n}章 标题（一更）\n----\n第0{n}章（二更）\n正文{n}。\n"
+                       for n in range(1, 7))
         book = convert_bytes(text.encode("utf-8"), "chain")
         self.assertEqual(book.info["chapters"], 6)
         self.assertEqual([tag for tag, _ in blocks(read_epub(book.epub))][:4], ["h2", "h3", "h3", "p"])

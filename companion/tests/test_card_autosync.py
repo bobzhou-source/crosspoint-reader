@@ -330,6 +330,40 @@ class CardAutosyncTest(unittest.TestCase):
         self.assertIn("1 annotation imported", self.notes[-1])
         self.assertNotIn("READER_SYNC_KEY", os.environ)
 
+    def test_shelves_are_copied_and_marked_dirty_even_when_the_cloud_is_unreachable(self):
+        shelf = self.root / "shelf"
+        shelf.mkdir()
+        (shelf / "Local Book.epub").write_bytes(epub_bytes("local"))
+
+        result = card_autosync.autosync(
+            self.cache, self.config, resolve=lambda uuid: CardVolume(self.card, "disk9s1", UUID),
+            key_provider=lambda: ("", "No Keychain item"), notify=self.notes.append,
+            log=card_autosync.RunLog(self.log_path), books_dir=shelf)
+
+        self.assertEqual(result["status"], "error")  # the missing key is still reported
+        self.assertEqual(result["shelves"]["books"]["copied"], 1)
+        self.assertIsNone(result["shelves"]["novels"])
+        self.assertEqual((self.card / "books/Books/Local Book.epub").read_bytes(), epub_bytes("local"))
+        self.assertTrue((self.card / card.LIBRARY_DIRTY).is_file())
+        log = self.log_path.read_text(encoding="utf-8")
+        self.assertIn("books shelf: copied 1, unchanged 0, errors 0", log)
+
+    def test_shelf_errors_make_the_run_fail_without_losing_the_cloud_books(self):
+        self.server.add(FIRST, epub_bytes("first"))
+        shelf = self.root / "shelf"
+        shelf.mkdir()
+        outside = self.root / "outside.epub"
+        outside.write_bytes(b"outside")
+        os.symlink(outside, shelf / "linked.epub")
+
+        result = self.run_autosync(books_dir=shelf)
+
+        self.assertEqual(result["status"], "error")
+        self.assertEqual(result["delivered"], 1)
+        self.assertEqual(result["acked"], [FIRST])
+        self.assertEqual(result["shelves"]["books"]["copied"], 0)
+        self.assertTrue(any("symlink" in error for error in result["errors"]))
+
     def test_a_second_run_while_one_is_active_exits_without_touching_anything(self):
         self.server.add(FIRST, epub_bytes("first"))
         held = card_autosync._acquire_lock(self.cache)
@@ -373,6 +407,7 @@ class CardAutosyncTest(unittest.TestCase):
                      "--log", str(self.log_path), "--no-notify"]
         with patch.object(card, "resolve_card", lambda uuid: CardVolume(self.card, "disk9s1", UUID)), \
                 patch.object(card_autosync, "CloudClient", client), \
+                patch.object(card, "default_shelves", dict), \
                 patch("sys.stdout", new_callable=io.StringIO) as stdout:
             code = cli.main(arguments)
 

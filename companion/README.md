@@ -194,6 +194,24 @@ The site route and card route use the same `/books/Inbox/<basename(source_path)>
 
 Use exactly one annotation uploader per deployment. If the card's `/.crosspoint/reader-sync.json` has direct device sync enabled, the firmware uploads annotations; do not also run `cloud sync --annotations-in` against that card. A pre-existing `Sync website.command` is for the companion-managed upload path, not a second uploader for a direct-sync card.
 
+### Enrich books: sharpest-passage front cards and Cross-Fire
+
+```sh
+# One-page "Sharpest Passages in This Book" card at the front of a real EPUB.
+reader-send hooks ./Grey-Eminence.epub --dry-run
+reader-send hooks ./Grey-Eminence.epub -o ./grey-hooked.epub
+
+# Pair the card's annotations with replies from the local Substack archive.
+reader-send crossfire --dry-run
+reader-send card sync --crossfire      # or: card autosync --crossfire
+```
+
+`hooks` reads the EPUB spine, skips covers, title pages, indexes, copyright, bibliographies and similar apparatus, and scores body paragraphs/sentences for claim density, contrast markers and aphoristic punch. It selects four or five self-contained passages from different chapters, adds an `id` anchor to each source paragraph (never overwriting an existing id), and inserts `reader-hooks-sharpest.xhtml` at spine position 0 with one tappable link per passage pointing at `chapter.xhtml#anchor`, so the reader jumps straight into the argument. The card carries a `reader-hooks:sharpest:v1` marker; a rerun replaces the same card and produces byte-identical output instead of duplicating it. In-place writes keep a `<book>.pre-hooks.epub` backup unless `--no-backup` is given. Books without enough strong prose are refused rather than padded.
+
+On the card side, `card sync` and `card autosync` copy the enriched book from the `~/papyrix/books` shelf into `/books/Books/` and ignore the `.pre-hooks.epub` backup (see the shelf rules under "Convert Chinese TXT novels for the reader"). `--crossfire` writes its `crossfire-<hash>.epub` card into `/books/Inbox`, where the Inbox cleanup pass leaves it alone because it is not a synced feed item.
+
+`crossfire` reads the imported native annotations (highlight, question, review-later), tokenizes the highlight plus note, and searches the local archive at `~/substack-corpus` (Markdown) and `~/substack-neighbors/posts` (JSONL). The archive is chunked into paragraph-sized passages and kept in a persistent SQLite FTS5 index whose rows are refreshed only for changed files by path+mtime+size signature; the first build over the full archive takes a few minutes and several hundred MB under `~/.cache/reader-send/crossfire.sqlite3`, later runs only re-sign files. Without FTS5 the same query uses an in-memory BM25 index over pre-filtered posts. Each annotation gets two or three sharp, non-duplicate passages from preferably distinct authors, plus the original author, essay title, date, URL and excerpt, in a single `Cross-Fire: Marginalia & Replies` EPUB written to `books/Inbox/`. The filename is the content hash, so rebuilds that change nothing write nothing; `card sync --crossfire` reports the result under `annotations.crossfire`, and a retrieval failure never blocks delivery of the books themselves.
+
 ### Automatic delivery when the card is plugged in
 
 ```sh
@@ -209,7 +227,7 @@ reader-send card autosync --no-notify --batch 8 --passes 1
 4. acknowledges, one request each, **only the items whose card copy matched**, until the pass's request budget is spent; an item that failed verification stays `ready` on the server and is reported as held back, and items beyond the budget are acknowledged on the next pass or mount;
 5. if more ready items remain it waits 60 seconds and repeats, up to `--passes` (1–10, default 3), which keeps every minute under the server's 60-request budget.
 
-HTTP 429 stops the run immediately with no retry: acknowledgements already made stand, everything else is retried by the next mount (a card copy that is already verified is acknowledged without downloading again, ahead of any new download). Annotations are imported even when the cloud step fails or the key is missing. The run never ejects, never stages firmware, never writes `/books/Novels` or `/books/Books`, and deletes no book. It appends a few lines per run to `~/Library/Logs/reader-card-autosync.log` (rotated at 512 KiB; never contains the key) and posts one macOS notification with the number of books delivered. Exit status is 0 for success, skipped or busy, and 2 for an error or rate limit.
+HTTP 429 stops the run immediately with no retry: acknowledgements already made stand, everything else is retried by the next mount (a card copy that is already verified is acknowledged without downloading again, ahead of any new download). Annotations are imported even when the cloud step fails or the key is missing. The same run also fills the two local shelves, with the `card sync` rules below and only when their source folders exist: the converted novels (`~/papyrix/novels-epub`, when it has a manifest) into `/books/Novels/`, and the local shelf folder (`~/papyrix/books`) into `/books/Books/`. Shelf books are copied, never moved, and a shelf error makes the run exit 2 without withholding the cloud books. The run never ejects and never stages firmware. It deletes no book: the Inbox cleanup step below only *plans* moves into `/books/Inbox/.trash/` unless `"inbox_cleanup": true` is set in `card.json`. It appends a few lines per run to `~/Library/Logs/reader-card-autosync.log` (rotated at 512 KiB; never contains the key) and posts one macOS notification with the number of books delivered. Exit status is 0 for success, skipped or busy, and 2 for an error, a shelf error or rate limit.
 
 The management key is **not** stored in a plist, script or log. `READER_SYNC_KEY` is used when it is in the environment; otherwise the run reads the dedicated Keychain item `reader-workbench:sync-key`, account `b` (the same item `collect` uses) at run time and holds the value only in the process, restoring the environment afterwards. To (re)store it, paste the 64-hex key at the prompt (no key on the command line):
 
@@ -219,11 +237,82 @@ security add-generic-password -U -a b -s reader-workbench:sync-key -w
 
 The LaunchAgent is `~/Library/LaunchAgents/dev.reader-workbench.card-autosync.plist` (label `dev.reader-workbench.card-autosync`). It has `StartOnMount` and `RunAtLoad` and runs `<repo>/companion/.venv/bin/python -m reader_send --cache-dir ~/.cache/reader-send card autosync`, with no secrets and no schedule: launchd starts it on every volume mount and the UUID check makes every other volume a no-op. Load it with `launchctl bootstrap gui/$(id -u) <plist>`; `launchctl bootout gui/$(id -u)/dev.reader-workbench.card-autosync` removes it. It is independent of the (disabled) `reader-send-subscriptions` agent. macOS may ask once to allow Python to access removable volumes; allow it.
 
+### X daily digests, Inbox repack and Inbox cleanup
+
+X posts reach the reader as **one EPUB per local day** instead of one book per post. The server (`robertzhou.dev`, `server/digest.js`) builds them, so Wi-Fi direct sync and card autosync both receive the same files and the firmware needs no change:
+
+- A post whose `original_url` is an X status URL is held back from the `ready`/`active` listings until its digest exists. An X post shared explicitly through `/reader/links` is still delivered on its own.
+- Every listing, management (the collector every 15 minutes, card autosync) or device, does at most one small unit of feed work, so each request stays within a Workers Free CPU budget (10 ms). A unit is one of the following:
+  - describing one uploaded item that is still undescribed;
+  - planning one volume;
+  - rendering one posts file;
+  - writing the front matter (feed.json, OPF, navigation, contents);
+  - sealing the volume.
+
+  Undescribed uploads are always described before any day is planned. A day (America/New_York, server env `READER_DIGEST_TZ`) is published once it has ended and the local clock has passed 05:00 (`READER_DIGEST_HOUR`). Each part is stored in D1 with its CRC-32 and size. The digest is served as a STORED (uncompressed) zip assembled from those parts, with no compression or CRC work per request, and a rebuild produces identical bytes.
+- Server volumes hold at most 100 posts or 512 KiB of post markup. Server digests are text-only: a photo becomes a `[photo]` link to the post. The firmware checks a whole-file SHA-256 before acknowledging, and computing that over images does not fit the per-request budget.
+- Titles: `X — Sun 2 Nov 2026`, then `X — 2 Nov (2)`, `(3)` …. Posts that arrive after a day's volume was delivered go into the next volume number; a built volume is never rewritten.
+- **Layout.** Posts flow like a feed, with no page breaks. Each post is a `<div class="post" id="p-<key>">` block:
+  - name, `@handle` and local time in small bold;
+  - then the text, quoted post or thread replies;
+  - then a thin `<hr/>` rule before the next post.
+
+  Whole author groups share spine documents `OEBPS/posts/NNNN.xhtml` of at most 25 posts and 48 KiB; a bigger group is split. The NCX and nav point at whole posts files, never at post anchors, because the reader starts a new page at every TOC anchor.
+- A re-uploaded copy of a post already in a volume joins that volume rather than being delivered twice.
+- Acknowledging a digest consumes every member post in the same transaction, once; a repeated acknowledgement is a no-op. Deleting an undelivered digest returns its posts to the queue.
+- Articles that have an author (Substack, RSS) stay one EPUB each but are listed under the card name `Author — Title (2 Nov 2026).epub`. The stored `source_path` is unchanged, so the collector's metadata comparison still holds.
+
+**Feed manifest (`reader-feed-v1`).** Every digest contains `META-INF/feed.json`, referenced from the OPF by `<meta name="reader-feed" content="META-INF/feed.json"/>`. A future on-device feed screen can read it instead of parsing HTML:
+
+```json
+{"format": "reader-feed-v1", "kind": "digest", "id": "<digest item id or null>", "source": "x",
+ "day": "2026-11-02", "volume": 1, "timezone": "America/New_York", "title": "X — Mon 2 Nov 2026",
+ "generator": "server",
+ "items": [{"id": "<cloud item id or null>", "key": "x:<status id>", "source": "x", "author": "Ann A",
+            "handle": "ann", "published": "2026-11-02T14:05:00Z", "url": "https://x.com/ann/status/…",
+            "href": "posts/0001.xhtml#p-x:<status id>", "title": "first 140 characters"}]}
+```
+
+- `href` is relative to `OEBPS/`: the posts file plus the post's anchor `p-<key>`. Items are in contents order: grouped by author, then by time. Inside a posts file, the i-th item with that file is the i-th `body/div`.
+- `OEBPS/contents.xhtml` is the first spine item and links every post by its `href`. `key` is stable across re-uploads and repacks. `id` is null only for digests repacked from card files with no cloud id.
+- `generator` is `"server"`, `"companion"` or `"companion-repack"`. All of them write the same fields and layout; only companion builds embed images.
+
+**Annotations in digests.** The firmware still uploads `item_id: null` with `book_path` set to the card path. Its `source_anchor.native` holds `chapterHref` (the posts file) and `xpath` (the page start, `/body/DocFragment[n]/body/div[i]…`).
+
+`GET /reader/annotations/feed?after=&limit=` (management key only) resolves each annotation to `{sequence, annotation_id, digest_id, item_id, key, href}` in four steps:
+1. Match the card name, including the firmware's `-<sha8>.epub` collision name and `<id>.epub`.
+2. Pick the manifest items in `chapterHref`'s posts file.
+3. Take the page-start post `div[i]`.
+4. If the annotation has a selection, use the first post from there on whose text contains its first 64 characters (whitespace squashed); otherwise keep the page-start post.
+
+The existing `/reader/annotations` records are unchanged. Repacked digests are named `… (card).epub` and are not known to the server, so their annotations stay unresolved (`digest_id: null`) rather than being matched to a server volume with the same title. Their `feed.json` carries the member ids for the same file + `div[i]` mapping offline.
+
+**Repacking the singles already on the card** (dry run by default; prints one line per file):
+
+```sh
+reader-send card repack --root "/Volumes/NO NAME"          # plan only: N singles → M digests
+reader-send card repack --root "/Volumes/NO NAME" --apply  # write digests, move singles away
+```
+
+- It reads each companion-format X post EPUB in `/books/Inbox` and groups them by local day (`--timezone`, default America/New_York) into digests named `X — Sun 2 Nov 2026 (card).epub`, with images kept inline. Digests already on the card, from the server or an earlier repack, continue their volume numbers and skip posts they already contain.
+- `--apply` writes each digest (temporary file, fsync, rename, SHA-256 read-back), then moves the originals to `/books/Inbox/.singles-archive/` without deleting anything. It drops their `recent.json` entries and marks the library dirty.
+- Singles that have highlights or notes stay where they are. Without `--root`, the configured card (`card.json`) is used.
+
+**Inbox cleanup** (auto-delete) runs at the end of every `card autosync` and can be run by hand with `reader-send card cleanup [--root PATH] [--apply]`. It is a dry run unless `--apply` is given or `card.json` has `"inbox_cleanup": true` (absent = off). The policy:
+
+- X digests and single X posts move to trash 3 days after they were finished, or 30 days after delivery even if unread. Delivery time is the file's modification time, or when cleanup first saw the file.
+- Articles move to trash 14 days after they were first seen finished. An unread long post is never removed, and neither is a non-X book that did not come from sync.
+- "Finished" comes from the reader's `progress.bin`: past the last spine item, or on the last page of the last one.
+- A book with highlights or notes is held until every one of its annotations has a server receipt (`/.crosspoint/reader-sync/notes/<id>.receipt`).
+- Annotations stay retrievable after cleanup: on the server (`reader-send cloud annotations`, `/reader/annotations/export`) and on the card, where `/.crosspoint/annotations/<key>/` is never touched.
+- "Delete" moves the book to `/books/Inbox/.trash/` and removes its reading cache (`/.crosspoint/epub_<hash>`) and its `recent.json` entry. Trash entries older than 7 days are purged.
+- State lives in `<cache>/.inbox-cleanup-<volume uuid>.json`, and repeated runs are idempotent.
+
 ### Convert Chinese TXT novels for the reader
 
 ```sh
-reader-send novels convert SRC_DIR OUT_DIR [--jobs N] [--force] [--json]
-reader-send card sync --novels OUT_DIR
+reader-send novels convert SRC_DIR OUT_DIR [--jobs N] [--force] [--rebuild-stale] [--json]
+reader-send card sync [--novels OUT_DIR] [--books DIR]
 ```
 
 The reader builds a book's page index one spine file at a time, so a multi-megabyte `.txt` takes tens of seconds to open while the same text split into chapter files opens in seconds. `novels convert` walks `SRC_DIR` recursively (hidden files and folders are skipped; `.txt` only, case-insensitive), writes a mirrored `.epub` tree below `OUT_DIR`, and **only ever reads `SRC_DIR`**: an `OUT_DIR` equal to or inside `SRC_DIR` is refused before anything is created.
@@ -238,10 +327,12 @@ The reader builds a book's page index one spine file at a time, so a multi-megab
 - **Nothing is lost silently.** Each EPUB is re-read before it is written: every non-whitespace character of the spine, in order, must equal the normalized source text with only the documented removals applied (newlines unified; the removals are XML-illegal control characters, which are counted, and the decoration below). Zip layout, XHTML well-formedness, the 60 KB file ceiling and nav/NCX targets are checked too. A book that fails is not written and is reported as failed.
 - **Decoration.** On heading lines the leading and trailing `#`, `=`, `-`, `*`, `☆`, `★`, `※` and spaces are not displayed (`## 第1章 标题 ##` → `第1章 标题`; the comma of a Jinjiang `☆、` marker goes with its star), and lines made only of those characters (`====`, `----`, `****`, `☆☆☆`, `* * *`) are dropped. The same characters inside a heading or in an ordinary paragraph are kept. The check derives the expected text from the source by that same rule and requires each removed character to be a decoration character at the edge of a detected heading or part of a decoration-only line; anything else missing fails the book. Per book, `removed_decoration_chars`, `decoration_lines_dropped` and `headings_cleaned` are recorded in the manifest and report, with totals in the report summary. Books without detected headings (size mode) keep marker characters in their text but still lose decoration-only lines.
 - **Echoes.** Some sources print a chapter's number again right under its title (`## 第二章 灭世重生` / `====` / `第002章`). A heading that repeats the chapter number (same unit, same value; Chinese, Arabic and fullwidth numerals and zero padding are equal; a short prefix such as `正文_` is ignored) of the heading before it, with only blank or decoration-only lines between them, is not a chapter of its own: the titled heading stays the chapter and its TOC entry, and the repeat is shown as a heading-styled `<h3>` line at the top of the same file. The text is kept, so the preservation check is unchanged. A repeat separated from its title by any body text (a `PS：` note, a site advertisement) is not an echo. A heading that has nothing but echoes after it is still a bodiless heading and stays plain text.
-- **Duplicate titles.** An echo line that is character-for-character identical to the heading it follows (the same title printed twice in a row, as in some site exports where `第79章 ，夺宝` is followed by `第79章 ，夺宝`) is not shown a second time. It is dropped and counted in `duplicate_headings_dropped` (lines) and `duplicate_heading_chars_removed` (its non-whitespace characters); these are never part of `removed_decoration_chars`, which keeps its meaning. The preservation check requires source length = shown text + decoration removals + duplicate characters, so nothing else can vanish. Both counters are in the manifest and the report summary. An echo that differs in any character, including spacing, stays as the `<h3>` line. Source spacing, no-break spaces and invisible characters are not rewritten. Manifest entries of newly built books carry `text_clean` as provenance only: existing entries without it are still skipped when the source is unchanged, and are rebuilt only by an explicit `--force` (or a source change).
-- **Idempotent.** `OUT_DIR/.novels-manifest.json` records each source's SHA-256 and the converter version; unchanged books with an existing output are skipped, failed books are retried, `--force` rebuilds everything, and manifest entries whose source disappeared are reported as `orphaned` but their EPUBs are never deleted. `OUT_DIR/.novels-report.json` holds the full per-book report (status, encoding, mode, volumes/chapters/files, warnings, errors); `--json` prints it, and per-book progress goes to stderr. The exit status is 2 when any book failed.
+- **Duplicate titles.** An echo line whose visible characters equal the heading it follows (the same title printed twice in a row, as in some site exports where `第79章 ，夺宝` is followed by `第79章 ，夺宝`) is not shown a second time: spacing between the two lines is ignored, so `第79章，夺宝` after `第79章　　夺宝` is the same title, and the chapter number is read as a number, so `第二百章 布拉德` under `第200章 布拉德` is the same title too. A second copy of a title already shown under the same chapter is dropped as well. It is dropped and counted in `duplicate_headings_dropped` (lines) and `duplicate_heading_chars_removed` (its non-whitespace characters); these are never part of `removed_decoration_chars`, which keeps its meaning. The preservation check requires source length = shown text + decoration removals + duplicate characters, so nothing else can vanish. Both counters are in the manifest and the report summary. An echo that differs in any character, spacing aside, stays as the `<h3>` line. Source spacing, no-break spaces and invisible characters are not rewritten. Manifest entries of newly built books carry `text_clean` as provenance only: existing entries without it are still skipped when the source is unchanged, and are rebuilt only by `--rebuild-stale` or an explicit `--force` (or a source change).
+- **Idempotent.** `OUT_DIR/.novels-manifest.json` records each source's SHA-256, the converter version and the `text_clean` revision of the text handling that built it; unchanged books with an existing output are skipped, failed books are retried, `--force` rebuilds everything, and manifest entries whose source disappeared are reported as `orphaned` but their EPUBs are never deleted. `--rebuild-stale` reconverts exactly the entries built by an older text handling (a missing or older `text_clean`) without touching the current ones, which is how the corpus is brought up to date after a converter change that alters the XHTML rather than the source fingerprint. `OUT_DIR/.novels-report.json` holds the full per-book report (status, encoding, mode, volumes/chapters/files, warnings, errors); `--json` prints it, and per-book progress goes to stderr. The exit status is 2 when any book failed.
 
-`card sync --novels OUT_DIR` additionally copies the manifest-tracked EPUBs into `/books/Novels/` on the card (subfolders are mirrored) and asks for a library rescan with the usual `/.crosspoint/library.dirty` marker. It validates the whole plan before the first card write: a missing manifest or a symlinked card folder aborts with nothing written, and an EPUB that no longer matches its recorded SHA-256 (or whose card path is too long for the reader) is skipped and reported. Copies are fsynced, never overwrite, and are read back and compared with the manifest hash; a bad copy is removed and reported (exit status 2) while the other books still land. Existing card files are never deleted; if the same name already holds different bytes, the new EPUB is installed as `<stem>-<sha256[0:8]>.epub`. Reconverting a changed source therefore adds a hashed copy and leaves the old one for you to remove. Without `--novels`, `card sync` behaves exactly as before.
+`card sync` also fills the reader's two local shelves; `--novels OUT_DIR` and `--books DIR` point them elsewhere. Both plans are validated before the first card write and both ask for a library rescan with the usual `/.crosspoint/library.dirty` marker. `--novels` copies the converted Drive novels (default `~/papyrix/novels-epub` when it holds a `.novels-manifest.json`) into `/books/Novels/` (subfolders are mirrored); a missing manifest or a symlinked card folder aborts with nothing written, and an EPUB that no longer matches its recorded SHA-256 (or whose card path is too long for the reader) is skipped and reported. `--books` copies every `.epub` below one local shelf folder (default `~/papyrix/books` when it exists) into `/books/Books/`, keeping relative subfolders, deduplicating identical files by content, and reporting — never following — symlinked books. On both shelves copies are fsynced, never overwrite, and are read back and compared with the source hash; a bad copy is removed and reported (exit status 2) while the other books still land. Nothing is moved: the Mac's files stay where they are. Existing card files are never deleted; if the same name already holds different bytes, the new EPUB is installed as `<stem>-<sha256[0:8]>.epub`. Reconverting a changed source therefore adds a hashed copy and leaves the old one for you to remove.
+
+`--books` and `card autosync` never deliver `*.pre-hooks.epub` files: that is the name of the original copy `reader-send hooks` keeps beside a book it enriched in place, and delivering it would put the same book on the card twice (once without its front card). The enriched book is copied; the backups stay on the Mac. Keep the backups outside the shelf if you prefer a tidy folder (`~/papyrix/books-pre-hooks/` is where the real shelf's originals live).
 
 ### Stage reviewed firmware only
 
@@ -316,6 +407,8 @@ PYTHONPATH=companion/src companion/.venv/bin/python -m unittest discover -s comp
 ```
 
 `test_card_autosync.py` drives the real cloud client against a fake HTTP transport and a plain folder as the card: delivery of only the cloud books with byte-identical copies, ack only after the card copy verifies (a corrupted copy stays unacknowledged), idempotent rerun, wrong/absent volume doing nothing at all, HTTP 429 on the listing, during a pull and during an ack with clean recovery on the next run, annotation import with no key, the concurrency lock, multi-pass backlog and the command line end to end.
+
+`companion/tests/test_companion_integration.py` runs the features together on one plain-folder card: a real hooked EPUB with its `.pre-hooks.epub` backup on the shelf (only the enriched book is delivered), `card sync`/`card autosync` with `--crossfire` plus the Inbox cleanup plan in the same mount, and a check that cleanup never trashes a Cross-Fire card. The opt-in real-data tests in `test_book_hooks.py` and `test_crossfire.py` read `RW_REAL_BOOKS`, `RW_REAL_CORPUS`, `RW_REAL_NEIGHBORS` and `RW_REAL_DB`.
 
 `companion/tests/test_novels.py` covers the novel converter and its card delivery the same way (temporary directories only; the card is a plain folder):
 

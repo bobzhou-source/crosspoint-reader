@@ -45,6 +45,23 @@ from .model import ReadingItem
 DEFAULT_MAX_ITEMS = 8
 
 
+def delivery_name(item: dict) -> str | None:
+    """basename(source_path) when the firmware would accept it as the card file name, else None.
+
+    Direct Wi-Fi sync names a book after its source_path (6–240 bytes, ``.epub``, no leading dot,
+    control characters or ``\\:*?"<>|``); the card path uses the same name so both routes agree,
+    e.g. ``X — Sun 2 Nov 2026.epub`` for a server digest.
+    """
+    path = item.get("source_path")
+    if not isinstance(path, str):
+        return None
+    name = path.rsplit("/", 1)[-1]
+    if (not 6 <= len(name.encode("utf-8")) <= 240 or not name.endswith(".epub") or name.startswith(".")
+            or any(ord(char) < 32 or char in '\\:*?"<>|' for char in name)):
+        return None
+    return name
+
+
 def cache_id_for(item_id: str) -> str:
     """Stable 24-character cache ID for a cloud item UUID, so no separate ledger is needed."""
     return digest(item_id)[:24]
@@ -173,7 +190,7 @@ def pull_ready(client: CloudClient, cache: Cache, items: list[dict], *,
         article = ReadingItem(title=item["title"], author="", source_url=item.get("original_url") or "",
                               date="", language="", content="", images=[],
                               source_type="cloud", source_id="cloud:" + item["id"])
-        record = cache.store(cache_id, article, data)
+        record = cache.store(cache_id, article, data, delivery_name(item))
         known.add(item["sha256"])
         pulled.append({"item_id": item["id"], "cache_id": cache_id, "path": record["path"]})
     return {"pulled": pulled, "already_cached": already_cached, "released": released, "deferred": deferred}
