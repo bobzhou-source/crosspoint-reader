@@ -43,6 +43,7 @@ class ReadingInboxActivity final : public UiListActivity {
   static AnnotationStore::Result collectEntry(const AnnotationEntry& entry, void* context);
   void reload();
   void openEntry(size_t index);
+  void openSurprise();
   void exportInbox();
   void showMessage(StrId message, const char* detail = nullptr);
 };

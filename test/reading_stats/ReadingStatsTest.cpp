@@ -123,6 +123,70 @@ int main() {
   CHECK(load(files, "daily", &summary, sizeof(summary), loadedGeneration));
   CHECK(memcmp(&summary, &a.summary, sizeof(summary)) == 0);
 
+  // --- habit: current/best streak and today's totals -------------------------
+  {
+    const auto setDay = [](Summary& s, uint32_t date, uint32_t pages, uint64_t ms) {
+      Day& day = s.days[date % 30];
+      day = {};
+      day.date = date;
+      day.totals.pages = pages;
+      day.totals.milliseconds = ms;
+    };
+    Accumulator habit;
+    CHECK(habit.habit(day).currentStreakDays == 0);  // empty ring
+    CHECK(habit.habit(0).currentStreakDays == 0);    // clock unknown
+
+    setDay(habit.summary, day, 12, 30 * 60000);
+    Habit h = habit.habit(day);
+    CHECK(h.currentStreakDays == 1 && h.bestStreakDays == 1);
+    CHECK(h.todayPagesRead == 12 && h.todayMinutesRead == 30);
+
+    // Three consecutive days ending today.
+    setDay(habit.summary, day - 1, 4, 5 * 60000);
+    setDay(habit.summary, day - 2, 1, 60000);
+    h = habit.habit(day);
+    CHECK(h.currentStreakDays == 3 && h.bestStreakDays == 3);
+
+    // A gap two days back breaks the run at one day; best keeps the old run.
+    setDay(habit.summary, day - 3, 0, 0);
+    h = habit.habit(day);
+    CHECK(h.currentStreakDays == 3 && h.bestStreakDays == 3);
+
+    // Today not read yet: the run ending yesterday is still live, so the badge
+    // shows the streak the reader is protecting, with zero pages today.
+    setDay(habit.summary, day, 0, 0);
+    h = habit.habit(day);
+    CHECK(h.currentStreakDays == 2 && h.bestStreakDays == 2);
+    CHECK(h.todayPagesRead == 0 && h.todayMinutesRead == 0);
+
+    // A session opened with no page and no credited time is not a habit day.
+    setDay(habit.summary, day, 0, 0);
+    h = habit.habit(day);
+    CHECK(h.currentStreakDays == 2);
+
+    // A stale ring slot (same index, 30 days older) never counts as today.
+    setDay(habit.summary, day - 30, 9, 9 * 60000);
+    h = habit.habit(day);
+    CHECK(h.todayPagesRead == 0 && h.currentStreakDays == 2);
+    // ... and the 30-day cap: a full ring reads as 30, not as a wrong number.
+    for (uint32_t back = 0; back < 30; ++back) setDay(habit.summary, day - back, 1, 60000);
+    CHECK(habit.habit(day).currentStreakDays == 30);
+    CHECK(habit.habit(day).bestStreakDays == 30);
+    // One day past the ring's reach cannot extend the run beyond 30.
+    CHECK(habit.habit(day + 1).currentStreakDays == 30);
+
+    // Month and year boundaries: pure civil-day arithmetic, no calendar gaps.
+    const uint32_t newYear = civilDay(2027, 1, 1);
+    Accumulator crossing;
+    setDay(crossing.summary, newYear, 3, 3 * 60000);
+    setDay(crossing.summary, civilDay(2026, 12, 31), 3, 3 * 60000);
+    setDay(crossing.summary, civilDay(2026, 12, 30), 3, 3 * 60000);
+    CHECK(crossing.habit(newYear).currentStreakDays == 3 && crossing.habit(newYear).bestStreakDays == 3);
+    // Leap day is one day wide, never two.
+    const uint32_t leap = civilDay(2028, 2, 29);
+    CHECK(leap - civilDay(2028, 2, 28) == 1 && civilDay(2028, 3, 1) - leap == 1);
+  }
+
   // One hour with input each minute: 20 checkpoints, two logical file
   // commits each; no page events trigger a write. Lifecycle flushes are extra.
   Accumulator hour;
@@ -137,8 +201,8 @@ int main() {
   CHECK(checkpoints == 20);
   printf(
       "PASS: accumulation, idle cutoff/resume, foreground pause, sessions, midnight, rolling window, clock unknown, "
-      "millis wrap, progress, round-trip, corruption fallback, truncation reset, failed commit, top books, one-hour "
-      "write budget\n");
+      "millis wrap, progress, round-trip, corruption fallback, truncation reset, failed commit, top books, "
+      "habit streaks/today, one-hour write budget\n");
   printf("sizeof(Book)=%zu sizeof(Summary)=%zu sizeof(Accumulator)=%zu; hourly commits=%u\n", sizeof(Book),
          sizeof(Summary), sizeof(Accumulator), checkpoints * 2);
 }

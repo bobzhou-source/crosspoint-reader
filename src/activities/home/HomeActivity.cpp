@@ -25,9 +25,56 @@
 #include "ReadingInboxActivity.h"
 #include "components/UITheme.h"
 #include "fontIds.h"
+#include "util/HabitBadge.h"
+#include "util/SurpriseMeSource.h"
+
+namespace {
+StrId menuLabel(const HomeMenuItem item) {
+  switch (item) {
+    case HomeMenuItem::FILE_BROWSER:
+      return StrId::STR_BROWSE_FILES;
+    case HomeMenuItem::LIBRARY:
+      return StrId::STR_LIBRARY;
+    case HomeMenuItem::READING_INBOX:
+      return StrId::STR_READING_INBOX;
+    case HomeMenuItem::OPDS_BROWSER:
+      return StrId::STR_OPDS_BROWSER;
+    case HomeMenuItem::FILE_TRANSFER:
+      return StrId::STR_FILE_TRANSFER;
+    case HomeMenuItem::SETTINGS_MENU:
+      return StrId::STR_SETTINGS_TITLE;
+    case HomeMenuItem::HOME_SURPRISE:
+      return StrId::STR_SURPRISE_ME;
+    default:
+      return StrId::STR_CONTINUE_READING;  // a recent-book row
+  }
+}
+
+UIIcon menuIcon(const HomeMenuItem item) {
+  switch (item) {
+    case HomeMenuItem::FILE_BROWSER:
+      return Folder;
+    case HomeMenuItem::LIBRARY:
+      return Library;
+    case HomeMenuItem::READING_INBOX:
+      return Book;
+    case HomeMenuItem::OPDS_BROWSER:
+      return Blocks;
+    case HomeMenuItem::FILE_TRANSFER:
+      return Transfer;
+    case HomeMenuItem::SETTINGS_MENU:
+      return Settings;
+    case HomeMenuItem::HOME_SURPRISE:
+      return Book;
+    default:
+      return Book;
+  }
+}
+}  // namespace
 
 int HomeActivity::getMenuItemCount() const {
   int count = 5;  // File Browser, Library, Reading inbox, File transfer, Settings
+  if (!coverGridUi) count++;  // Surprise me (deal mode), list home only
   if (!recentBooks.empty()) {
     count += recentBooks.size();
   }
@@ -287,11 +334,14 @@ void HomeActivity::onEnter() {
     if (!coverGridUi) LOG_ERR("HOME", "OOM: cover grid UI; using standard home");
   }
   loadRecentBooks(coverGridUi ? CoverGridHomeUi::MAX_BOOKS : metrics.homeRecentBooksCount);
+  // Before the first paint, on the main task: the render task only reads this.
+  habitBadge(habitText, sizeof(habitText));
   hasContinueReading = !recentBooks.empty();
   if (coverGridUi) {
     fillCoverGridFromLibrary();
     resolveGridCoverPaths();
-    coverGridUi->begin(recentBooks, hasOpdsServers, hasContinueReading);
+    coverGridUi->begin(recentBooks, hasOpdsServers, hasContinueReading,
+                       habitText[0] ? habitText : nullptr);
   }
 
   const auto base = static_cast<int>(recentBooks.size());
@@ -374,6 +424,9 @@ void HomeActivity::loop() {
         break;
       case HomeMenuItem::SETTINGS_MENU:
         onSettingsOpen();
+        break;
+      case HomeMenuItem::HOME_SURPRISE:
+        onSurpriseMe();
         break;
       default:
         break;
@@ -543,11 +596,14 @@ void HomeActivity::render(RenderLock&&) {
   coverRectH = layout.cover.height;
   bool bufferRestored = coverBufferStored && restoreCoverBuffer();
 
+  // Understated habit cue in the header's right label: the streak the reader is
+  // protecting and what they read today. Absent until there is something to say.
+  const char* habitText = this->habitText[0] ? this->habitText : nullptr;
   // Home is the stack root: no back button in its header.
   GUI.drawHeader(renderer, layout.header,
                  metrics.listSelectionStyle == 2 ? tr(STR_HOME_SHORTCUT)
                      : metrics.homeContinueReadingInMenu && !recentBooks.empty() ? recentBooks[0].title.c_str() : nullptr,
-                 nullptr, false);
+                 habitText, false);
   GUI.drawRecentBookCover(renderer, layout.cover, recentBooks, selectorIndex, coverRendered, coverBufferStored,
                           bufferRestored, [this] { return storeCoverBuffer(); });
   if (metrics.listSelectionStyle == 2 && renderer.getScreenWidth() <= renderer.getScreenHeight()) {
@@ -556,23 +612,15 @@ void HomeActivity::render(RenderLock&&) {
                       layout.cover.x + layout.cover.width - metrics.contentSidePadding - 1, ruleY);
   }
 
-  static constexpr StrId menuLabels[] = {StrId::STR_LIBRARY, StrId::STR_READING_INBOX, StrId::STR_BROWSE_FILES,
-                                         StrId::STR_OPDS_BROWSER, StrId::STR_FILE_TRANSFER, StrId::STR_SETTINGS_TITLE};
-  static constexpr UIIcon menuIcons[] = {Library, Book, Folder, Blocks, Transfer, Settings};
-  const auto actionIndex = [this, &layout](int row) {
-    const int index = layout.menuBase + layout.firstRow + row - static_cast<int>(recentBooks.size());
-    return !hasOpdsServers && index >= 3 ? index + 1 : index;
+  // Labels and icons come from the menu ITEM, not the row position, so the
+  // optional OPDS row and the appended deal-mode row cannot shift each other.
+  const auto menuEntry = [this, &layout](const int row) {
+    return indexToMenuItem(layout.menuBase + layout.firstRow + row - static_cast<int>(recentBooks.size()),
+                           hasOpdsServers);
   };
-  GUI.drawButtonMenu(
-      renderer, layout.menu, layout.visibleRows, selectorIndex - layout.menuBase - layout.firstRow,
-      [&actionIndex](int row) {
-        const int index = actionIndex(row);
-        return std::string(I18N.get(index < 0 ? StrId::STR_CONTINUE_READING : menuLabels[index]));
-      },
-      [&actionIndex](int row) {
-        const int index = actionIndex(row);
-        return index < 0 ? Book : menuIcons[index];
-      });
+  GUI.drawButtonMenu(renderer, layout.menu, layout.visibleRows, selectorIndex - layout.menuBase - layout.firstRow,
+                     [&menuEntry](int row) { return std::string(I18N.get(menuLabel(menuEntry(row)))); },
+                     [&menuEntry](int row) { return menuIcon(menuEntry(row)); });
   const int rowCount = getMenuItemCount() - layout.menuBase;
   if (layout.visibleRows > 0 && rowCount > layout.visibleRows) {
     const int trackHeight = layout.visibleRows * (layout.rowHeight + metrics.menuSpacing) - metrics.menuSpacing;
@@ -589,6 +637,14 @@ void HomeActivity::render(RenderLock&&) {
                                             tr(STR_DIR_DOWN));
   GUI.drawButtonHints(renderer, labels.btn1, labels.btn2, labels.btn3, labels.btn4);
 
+  if (notice) {
+    // One-shot feedback for a deal-mode press that found nothing to open. The
+    // next repaint (navigation or the reader) removes it; no second refresh is
+    // requested, so it does not cost an extra panel update.
+    GUI.drawPopup(renderer, notice);
+    notice = nullptr;
+  }
+
   renderer.displayBuffer(cleanInitialRefresh && !firstRenderDone ? HalDisplay::HALF_REFRESH : HalDisplay::FAST_REFRESH);
 
   if (!firstRenderDone) {
@@ -602,6 +658,19 @@ void HomeActivity::render(RenderLock&&) {
 }
 
 void HomeActivity::onSelectBook(const std::string& path) { activityManager.goToReader(path); }
+
+// Deal mode: one press, one unread item, straight into the reader. The reader
+// opens at the saved position (page 1 for a book that was never started), so no
+// extra screen or confirmation stands between the press and the text.
+void HomeActivity::onSurpriseMe() {
+  std::string path;
+  if (!surprise::findBook(path)) {
+    notice = tr(STR_SURPRISE_NONE);
+    requestUpdate();
+    return;
+  }
+  onSelectBook(path);
+}
 
 void HomeActivity::onFileBrowserOpen() { activityManager.goToFileBrowser(); }
 

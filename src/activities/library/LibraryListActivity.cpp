@@ -30,6 +30,7 @@
 #include "components/icons/search32.h"
 #include "fontIds.h"
 #include "util/BookCacheUtils.h"
+#include "util/SurpriseMeSource.h"
 
 namespace fui = freeink::ui;
 
@@ -495,10 +496,11 @@ void LibraryListActivity::showRecentBookOptions(const int entry) {
     }
   }
 
-  const char* STORE_OPTIONS[] = {tr(STR_OPEN), tr(STR_REMOVE_FROM_RECENTS), tr(STR_DELETE), tr(STR_LIBRARY_REBUILD)};
-  const char* INDEX_OPTIONS[] = {tr(STR_OPEN), tr(STR_DELETE), tr(STR_LIBRARY_REBUILD)};
+  const char* STORE_OPTIONS[] = {tr(STR_OPEN), tr(STR_SURPRISE_ME), tr(STR_REMOVE_FROM_RECENTS), tr(STR_DELETE),
+                                 tr(STR_LIBRARY_REBUILD)};
+  const char* INDEX_OPTIONS[] = {tr(STR_OPEN), tr(STR_SURPRISE_ME), tr(STR_DELETE), tr(STR_LIBRARY_REBUILD)};
   app.clearTapFlash();
-  optionPopup.show(tr(STR_LIBRARY), title.c_str(), isStoreRow ? STORE_OPTIONS : INDEX_OPTIONS, isStoreRow ? 4 : 3, 0,
+  optionPopup.show(tr(STR_LIBRARY), title.c_str(), isStoreRow ? STORE_OPTIONS : INDEX_OPTIONS, isStoreRow ? 5 : 4, 0,
                    [this, path, title, isStoreRow](const int choice) {
                      swallowHeldReleases();
                      switch (choice) {
@@ -506,19 +508,22 @@ void LibraryListActivity::showRecentBookOptions(const int entry) {
                          openBookByPath(path);
                          break;
                        case 1:
+                         openSurprise();
+                         break;
+                       case 2:
                          if (isStoreRow) {
                            promptRemoveRecentBook(path, title);
                          } else {
                            promptDeleteBookByPath(path, title);
                          }
                          break;
-                       case 2:
+                       case 3:
                          if (isStoreRow)
                            promptDeleteBookByPath(path, title);
                          else
                            queueRebuild();
                          break;
-                       case 3:
+                       case 4:
                          if (isStoreRow) queueRebuild();
                          break;
                        default:
@@ -526,6 +531,26 @@ void LibraryListActivity::showRecentBookOptions(const int entry) {
                      }
                    });
   requestUpdate();
+}
+
+// Deal mode from the shelf: pick something unread and open it, so a reader who
+// cannot choose does not have to. The reader needs the card and the heap, so the
+// worker and the index handle are released first, exactly as for a row open.
+void LibraryListActivity::openSurprise() {
+  app.clearTapFlash();
+  optionPopup.dismiss();
+  stopBuild();
+  index.close();
+  std::string path;
+  if (!surprise::findBook(path)) {
+    // Never fall back to a finished book: the shelf stays usable and says why.
+    static constexpr StrId OK[] = {StrId::STR_OK_BUTTON};
+    optionPopup.show(StrId::STR_SURPRISE_ME, OK, 1, 0, [this](int) { swallowHeldReleases(); });
+    if (!index.open(library::libraryIndexPath())) LOG_ERR("LIB", "cannot reopen library index");
+    requestUpdate();
+    return;
+  }
+  onSelectBook(path);
 }
 
 void LibraryListActivity::resetAfterRebuild() {

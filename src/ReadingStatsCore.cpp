@@ -121,6 +121,55 @@ Totals Accumulator::recent(uint32_t day, unsigned count) const {
   }
   return result;
 }
+namespace {
+// A day counts toward the habit only when it holds real reading: a session
+// opened and closed without a page turn or a credited idle interval is not a
+// habit day. Ring slots are checked against their stored date so a stale slot
+// from 30 days ago can never be mistaken for today.
+bool activeDay(const Summary& summary, const uint32_t day) {
+  if (!day) return false;
+  const Day& entry = summary.days[day % 30];
+  return entry.date == day && (entry.totals.pages || entry.totals.milliseconds);
+}
+}  // namespace
+
+Habit Accumulator::habit(const uint32_t today) const {
+  Habit result;
+  if (!today) return result;
+  if (const Day& entry = summary.days[today % 30]; entry.date == today) {
+    result.todayPagesRead = entry.totals.pages;
+    result.todayMinutesRead = static_cast<uint32_t>(entry.totals.milliseconds / 60000);
+  }
+  // The ring holds 30 days, so a streak is reported within that window; a
+  // longer run reads as 30+ days rather than a wrong number.
+  for (uint32_t back = 0; back < 30; ++back) {
+    const uint32_t day = today - back;
+    if (!day || !activeDay(summary, day)) break;
+    ++result.currentStreakDays;
+  }
+  // Today is not over: a run that ended yesterday is still the live streak, so
+  // the badge does not drop to zero while the reader has not started yet. The
+  // 30-day ring bounds this walk; a slot from 30 days ago cannot masquerade as
+  // yesterday because activeDay() checks the stored date.
+  if (!result.currentStreakDays && activeDay(summary, today - 1)) {
+    for (uint32_t back = 1; back <= 30; ++back) {
+      const uint32_t day = today - back;
+      if (!day || !activeDay(summary, day)) break;
+      ++result.currentStreakDays;
+    }
+  }
+  for (uint32_t back = 0; back < 30; ++back) {
+    const uint32_t day = today - back;
+    if (!day || !activeDay(summary, day)) continue;
+    // Count each run once, from its oldest day.
+    if (day > 1 && activeDay(summary, day - 1)) continue;
+    uint32_t length = 0;
+    for (uint32_t forward = day; forward <= today && activeDay(summary, forward); ++forward) ++length;
+    result.bestStreakDays = std::max(result.bestStreakDays, length);
+  }
+  return result;
+}
+
 void Accumulator::updateTop() {
   size_t index = TOP_COUNT - 1;
   for (size_t i = 0; i < TOP_COUNT; ++i) {
