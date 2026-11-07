@@ -19,15 +19,17 @@ Not supported: dictionaries with 64-bit index offsets (`idxoffsetbits=64` in the
 
 1. Copy your dictionary folder(s) to `/dictionaries/` on the SD card — one dictionary per folder, e.g. `/dictionaries/webster/webster.idx` + `webster.dict.dz`. A hidden `/.dictionaries/` folder (dot-prefixed) works the same way, for keeping it out of the file browser.
 2. Open **Settings → Reader → Dictionary** on the device.
-3. Select a dictionary from the list, or **None** to disable lookups.
+3. Select the dictionary to search first. If none is selected when you look a word up, the first installed one (alphabetically) is selected for you; to turn lookups off, remove the dictionary folders.
 
 The Dictionary setting only appears when at least one usable dictionary folder exists. Folders containing more than one dictionary (multiple `.idx` stems) are skipped as ambiguous.
+
+Every installed dictionary takes part in a lookup: the selected one is searched first, then the others — for Chinese words those named like `cedict`, `cjk`, `zh` or `chinese` first, for other words those named like `english`/`en…` first. So with both `/dictionaries/cedict/` and `/dictionaries/english/` installed, English and Chinese words are both found whichever one is selected, and the definition comes from the dictionary that has the word.
 
 ## Looking Up a Word
 
 Three ways to start a lookup while reading:
 
-- On a touch screen, **press and hold a word** on the page for about half a second. Its definition opens straight away; **Back** returns to the same page. A hold on blank space (margins, the gap between paragraphs, the empty end of a short line) does nothing, and the finger may land up to about one space outside the word. For Chinese, hold the **first character** of the word. If no dictionary is selected, the reader shows the usual "no dictionary" note. When a page-turn button hold (**Long-press Chapter Skip**, or rotating) is set and page turns use tap zones, a hold on those zones keeps that meaning; elsewhere, including the centre menu area, a hold on a word looks it up. Short taps are unchanged.
+- On a touch screen, **press and hold a word** on the page for about half a second. Its definition opens straight away; **Back** returns to the same page. A hold on blank space (margins, the gap between paragraphs, the empty end of a short line) does nothing, and the finger may land up to about one space outside the word. For Chinese, hold any character of the word: the longest entry starting at the held character is shown, and when that is only the single character, a longer entry starting one character earlier (holding 京 in 北京 shows 北京) is preferred. When a page-turn button hold (**Long-press Chapter Skip**, or rotating) is set and page turns use tap zones, a hold on those zones keeps that meaning; elsewhere, including the centre menu area, a hold on a word looks it up. Short taps are unchanged.
 - Open the reader menu (**Confirm**) and choose **Look Up**.
 - Or set **Settings → Controls → Long-press Menu** to "Dictionary", then hold **Confirm** (~0.4s) on the reading page.
 
@@ -41,10 +43,10 @@ On the very first lookup with a dictionary (and again whenever the `.idx` or `.s
 
 ### How Lookup Works
 
-1. **Direct match** — the word is found as-is (case-insensitive) in the dictionary index. Surrounding punctuation is ignored.
+1. **Direct match** — the word is found as-is (case-insensitive) in the dictionary index. Surrounding punctuation is ignored, and curly apostrophes count as straight ones (`don’t` finds `don't`).
 2. **Synonyms** — on a miss, if the dictionary ships a `.syn` file, alternate spellings and irregular forms recorded there are resolved to their headword (e.g. `oxen` → `ox`, `colour` → `color`). This step is skipped if the `.sidx` sidecar could not be built (e.g. transient low memory during indexing); the dictionary otherwise stays usable, and the build is retried the next time it is opened.
 3. **Stemming** — still no match: common English word forms are retried automatically: possessives and plurals (`dogs` → `dog`, `stories` → `story`) and verb endings (`walked` → `walk`, `running` → `run`, `making` → `make`).
-4. **Not found** — a short popup appears and you return to word selection (or, after a press and hold, to the page).
+4. **Not found** — no installed dictionary has the word: a short popup appears and you return to word selection (or, after a press and hold, to the page).
 
 ## The Definition Screen
 

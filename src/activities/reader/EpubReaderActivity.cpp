@@ -57,6 +57,7 @@
 #include "util/AnnotationExport.h"
 #include "util/BookmarkUtil.h"
 #include "util/ButtonNavigator.h"
+#include "util/DictionaryRegistry.h"
 #include "util/ScreenshotUtil.h"
 
 namespace {
@@ -357,7 +358,7 @@ void EpubReaderActivity::pageTextMargins(int& left, int& top) const {
 }
 
 void EpubReaderActivity::openDictionaryWordSelect() {
-  if (SETTINGS.dictionaryName[0] == '\0') {
+  if (!DictionaryRegistry::ensureSelected(SETTINGS.dictionaryName, sizeof(SETTINGS.dictionaryName))) {
     showDictionaryMessage = true;
     dictionaryMessageTime = millis();
     requestUpdate();
@@ -407,7 +408,9 @@ bool EpubReaderActivity::handleWordHold() {
     page->extractWords(renderer, fontId, marginLeft, marginTop, words, rowCount);
     hit = DictionaryPageWords::wordNear(words, x, y, renderer.getLineHeight(fontId));
   }
-  switch (ReaderTouchZones::holdAction(zone, zoneHoldActions, hit >= 0, SETTINGS.dictionaryName[0] != '\0')) {
+  switch (ReaderTouchZones::holdAction(
+      zone, zoneHoldActions, hit >= 0,
+      hit >= 0 && DictionaryRegistry::ensureSelected(SETTINGS.dictionaryName, sizeof(SETTINGS.dictionaryName)))) {
     case ReaderTouchZones::HoldAction::None:
       return false;
     case ReaderTouchZones::HoldAction::NoDictionary:

@@ -186,6 +186,18 @@ inline size_t cjkRun(const std::vector<WordBox>& words, const size_t index, char
   return characters;
 }
 
+// The runs for a hold on words[index]: `run` from the held character (see
+// cjkRun) and `previous` from the character before it when that one is Han in
+// the same run (else empty), for Dictionary::lookupCjk's compound fallback.
+inline void heldCjkRuns(const std::vector<WordBox>& words, const size_t index, char (&run)[CjkDictionary::RUN_BYTES],
+                        char (&previous)[CjkDictionary::RUN_BYTES]) {
+  previous[0] = '\0';
+  if (cjkRun(words, index, run) && index > 0 && words[index - 1].cjkBytes &&
+      words[index - 1].run == words[index].run) {
+    cjkRun(words, index - 1, previous);
+  }
+}
+
 // Every lookup target on `page`, drawn at the margins, in reading order.
 // rowCount counts the lines that have at least one target.
 void extract(GfxRenderer& renderer, const Page& page, int fontId, int marginLeft, int marginTop,

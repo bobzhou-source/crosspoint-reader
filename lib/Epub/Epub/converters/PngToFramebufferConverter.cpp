@@ -15,6 +15,7 @@
 #include "DirectPixelWriter.h"
 #include "DitherUtils.h"
 #include "PixelCache.h"
+#include "SmoothResample.h"
 
 namespace {
 
@@ -45,6 +46,18 @@ struct PngContext {
   uint8_t* grayLineBuffer{nullptr};
   uint8_t* alphaLineBuffer{nullptr};
   uint32_t lastYieldMs{0};  // throttle state for yieldDuringDecode()
+
+  // Exact-size dithered opaque decodes resample smoothly and error-diffuse
+  // (see SmoothResample.h). smoothRow holds this source row at output width,
+  // smoothPrev the previous one (enlarging), smoothSum the running vertical
+  // box (shrinking, smoothRows rows), smoothDown the next output row's error.
+  int32_t invScaleX{0};
+  int32_t invScaleY{0};
+  uint8_t* smoothRow{nullptr};
+  uint8_t* smoothPrev{nullptr};
+  uint32_t* smoothSum{nullptr};
+  int16_t* smoothDown{nullptr};
+  int smoothRows{0};
 };
 
 // File I/O callbacks use pFile->fHandle to access the HalFile*,
@@ -212,6 +225,85 @@ void convertLineToGray(const uint8_t* pPixels, uint8_t* grayLine, int width, int
   }
 }
 
+// Positions pw on output row dstY and, while caching, cw on its cache row.
+// Returns whether this row is cached. The cache streams to disk one row at a
+// time; flushing rows below this one (PNGdec delivers scanlines top to bottom)
+// repositions the single-row band. A flush failure stops caching for the rest
+// of the decode so we never write past the band buffer; finalize() then drops
+// the partial file.
+bool beginOutputRow(PngContext* ctx, const int dstY, const int outY, DirectPixelWriter& pw, DirectCacheWriter& cw) {
+  pw.beginRow(outY);
+  if (!ctx->caching) return false;
+  if (!ctx->cache.advanceTo(dstY)) {
+    ctx->caching = false;
+    return false;
+  }
+  cw.init(ctx->cache.buffer, ctx->cache.bytesPerRow, ctx->cache.bandRows, ctx->cache.originX);
+  cw.beginRow(outY, ctx->config->y + ctx->cache.bandStart);
+  return true;
+}
+
+// One smoothed output row: value(x) is its filtered gray, error-diffused here.
+template <typename Value>
+void emitSmoothRow(PngContext* ctx, const int dstY, Value&& value) {
+  ctx->lastDstY = dstY;
+  const int outY = ctx->config->y + dstY;
+  if (outY >= ctx->screenHeight) return;
+  DirectPixelWriter pw;
+  pw.init(*ctx->renderer);
+  DirectCacheWriter cw;
+  const bool caching = beginOutputRow(ctx, dstY, outY, pw, cw);
+  int carry = 0;
+  for (int dstX = 0; dstX < ctx->dstWidth; dstX++) {
+    const uint8_t level = smooth_resample::diffuse(value(dstX), ctx->smoothDown, dstX, dstX == 0, carry);
+    const int outX = ctx->config->x + dstX;
+    if (outX >= ctx->screenWidth) continue;
+    pw.writePixel(outX, level);
+    if (caching) cw.writePixel(outX, level);
+  }
+}
+
+// Smooth path for one visible source row (already in grayLineBuffer): resample
+// it to output width, then emit every output row it completes.
+void smoothSourceRow(PngContext* ctx, const int visibleSrcY) {
+  const uint8_t* gray = ctx->grayLineBuffer + ctx->cropLeft;
+  uint8_t* row = ctx->smoothRow;
+  for (int dstX = 0; dstX < ctx->dstWidth; dstX++) {
+    const smooth_resample::Taps tx = smooth_resample::taps(dstX, ctx->invScaleX, 0, ctx->visibleWidth);
+    const auto sample = [gray](const int i) { return static_cast<int>(gray[i]); };
+    row[dstX] = static_cast<uint8_t>(smooth_resample::filter(tx, sample));
+  }
+
+  if (ctx->invScaleY >= smooth_resample::FP_ONE) {
+    // Shrinking: output row y averages the source rows its box covers.
+    const int dstY = ctx->lastDstY + 1;
+    if (dstY >= ctx->dstHeight) return;
+    for (int dstX = 0; dstX < ctx->dstWidth; dstX++) ctx->smoothSum[dstX] += row[dstX];
+    ctx->smoothRows++;
+    if (visibleSrcY + 1 < smooth_resample::taps(dstY, ctx->invScaleY, 0, ctx->visibleHeight).last) return;
+    const uint32_t* sum = ctx->smoothSum;
+    const uint32_t rows = static_cast<uint32_t>(ctx->smoothRows);
+    emitSmoothRow(ctx, dstY, [sum, rows](const int x) { return static_cast<int>(sum[x] / rows); });
+    memset(ctx->smoothSum, 0, sizeof(uint32_t) * ctx->dstWidth);
+    ctx->smoothRows = 0;
+    return;
+  }
+
+  // Enlarging: every output row whose two source rows have now arrived
+  // blends this row and the previous one.
+  uint8_t* prev = ctx->smoothPrev;
+  for (int dstY = ctx->lastDstY + 1; dstY < ctx->dstHeight; dstY++) {
+    const smooth_resample::Taps ty = smooth_resample::taps(dstY, ctx->invScaleY, 0, ctx->visibleHeight);
+    if (ty.last > visibleSrcY) break;
+    const uint8_t* top = ty.first < visibleSrcY ? prev : row;
+    const int weight = ty.weight;
+    emitSmoothRow(ctx, dstY,
+                  [top, row, weight](const int x) { return (top[x] * (256 - weight) + row[x] * weight) >> 8; });
+  }
+  ctx->smoothPrev = row;
+  ctx->smoothRow = prev;
+}
+
 int pngDrawCallback(PNGDRAW* pDraw) {
   PngContext* ctx = reinterpret_cast<PngContext*>(pDraw->pUser);
   if (!ctx || !ctx->config || !ctx->renderer || !ctx->grayLineBuffer) return 0;
@@ -223,6 +315,12 @@ int pngDrawCallback(PNGDRAW* pDraw) {
   if (srcY < ctx->cropTop || srcY >= ctx->cropTop + ctx->visibleHeight) return 1;
   const int visibleSrcY = srcY - ctx->cropTop;
 
+  if (ctx->smoothDown) {
+    convertLineToGray(pDraw->pPixels, ctx->grayLineBuffer, srcWidth, pDraw->iPixelType, pDraw->iBpp, pDraw->pPalette,
+                      pDraw->iHasAlpha, ctx->decoder ? ctx->decoder->getTransparentColor() : 0, nullptr);
+    smoothSourceRow(ctx, visibleSrcY);
+    return 1;
+  }
   // Map source rows with the exact output-height ratio. During downscaling,
   // multiple source rows can select the same output row; during upscaling, one
   // source row must be repeated across every output row in its range. Emitting
@@ -259,23 +357,8 @@ int pngDrawCallback(PNGDRAW* pDraw) {
     int outY = ctx->config->y + dstY;
     if (outY >= ctx->screenHeight) continue;
 
-    pw.beginRow(outY);
-
-    // The cache streams to disk one row at a time. Flushing rows below this one
-    // (PNGdec delivers scanlines top to bottom) repositions the single-row band.
-    // A flush failure stops caching for the rest of the decode so we never write
-    // past the band buffer; finalize() then drops the partial file.
-    bool caching = ctx->caching;
     DirectCacheWriter cw;
-    if (caching) {
-      if (!ctx->cache.advanceTo(dstY)) {
-        caching = false;
-        ctx->caching = false;
-      } else {
-        cw.init(ctx->cache.buffer, ctx->cache.bytesPerRow, ctx->cache.bandRows, ctx->cache.originX);
-        cw.beginRow(outY, ctx->config->y + ctx->cache.bandStart);
-      }
-    }
+    const bool caching = beginOutputRow(ctx, dstY, outY, pw, cw);
 
     int srcX = ctx->cropLeft;
     int error = 0;
@@ -447,6 +530,24 @@ bool PngToFramebufferConverter::decodeToFramebuffer(const std::string& imagePath
   }
   ctx.grayLineBuffer = lineBuffers.get();
   ctx.alphaLineBuffer = retainAlpha ? ctx.grayLineBuffer + grayBufSize : nullptr;
+
+  // Smooth path scratch, zeroed (8 bytes per output column): the box sum,
+  // the error row, then two resampled rows. Without it the decode falls back
+  // to point sampling and Bayer.
+  std::unique_ptr<uint32_t[]> smooth;
+  if (config.useExactDimensions && config.useDithering && !retainAlpha && ctx.dstWidth > 0 && ctx.dstHeight > 0) {
+    smooth = makeUniqueNoThrow<uint32_t[]>(static_cast<size_t>(ctx.dstWidth) * 2);
+    if (smooth) {
+      ctx.invScaleX =
+          static_cast<int32_t>(static_cast<int64_t>(ctx.visibleWidth) * smooth_resample::FP_ONE / ctx.dstWidth);
+      ctx.invScaleY =
+          static_cast<int32_t>(static_cast<int64_t>(ctx.visibleHeight) * smooth_resample::FP_ONE / ctx.dstHeight);
+      ctx.smoothSum = smooth.get();
+      ctx.smoothDown = reinterpret_cast<int16_t*>(ctx.smoothSum + ctx.dstWidth);
+      ctx.smoothRow = reinterpret_cast<uint8_t*>(ctx.smoothDown + ctx.dstWidth);
+      ctx.smoothPrev = ctx.smoothRow + ctx.dstWidth;
+    }
+  }
 
   // Stream the pixel cache to disk. PNGdec delivers source scanlines top to
   // bottom and we emit at most one (downscaled) output row per callback, so the

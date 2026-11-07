@@ -14,6 +14,7 @@
 #include "DirectPixelWriter.h"
 #include "DitherUtils.h"
 #include "PixelCache.h"
+#include "SmoothResample.h"
 
 namespace {
 
@@ -46,6 +47,13 @@ struct JpegContext {
 
   PixelCache cache;
   bool caching{false};
+
+  // Exact-size dithered decodes resample smoothly and error-diffuse (see
+  // SmoothResample.h): the next row's error per output column, and the error
+  // carried right across a block edge per band row.
+  int16_t* diffusionDown{nullptr};
+  int16_t* diffusionCarry{nullptr};
+  int diffusionCarryRows{0};
 
   uint32_t lastYieldMs{0};  // throttle state for yieldDuringDecode()
 };
@@ -188,6 +196,35 @@ int jpegDrawCallback(JPEGDRAW* pDraw) {
       cw.init(ctx->cache.buffer, ctx->cache.bytesPerRow, ctx->cache.bandRows, ctx->cache.originX);
       cacheOriginY = ctx->config->y + ctx->cache.bandStart;
     }
+  }
+
+  // === Smooth path: box/bilinear resample + error diffusion ===
+  // Blocks arrive left to right along each MCU row, so a row's right-going
+  // error crosses a block edge through diffusionCarry.
+  if (ctx->diffusionDown) {
+    for (int dstY = dstYStart; dstY < dstYEnd; dstY++) {
+      const int outY = cfgY + dstY;
+      pw.beginRow(outY);
+      if (caching) cw.beginRow(outY, cacheOriginY);
+      const smooth_resample::Taps ty = smooth_resample::taps(dstY, invScaleFPY, blockY, srcYEnd);
+      const int bandRow = dstY - dstYStart;
+      const bool carries = bandRow < ctx->diffusionCarryRows;
+      int carry = (dstXStart > 0 && carries) ? ctx->diffusionCarry[bandRow] : 0;
+      for (int dstX = dstXStart; dstX < dstXEnd; dstX++) {
+        const smooth_resample::Taps tx = smooth_resample::taps(dstX, invScaleFPX, blockX, srcXEnd);
+        const int gray = smooth_resample::filter(ty, [&](const int sy) {
+          const uint8_t* row = &pixels[(sy - blockY) * stride];
+          return smooth_resample::filter(tx,
+                                         [row, blockX](const int sx) { return static_cast<int>(row[sx - blockX]); });
+        });
+        const int outX = cfgX + dstX;
+        const uint8_t level = smooth_resample::diffuse(gray, ctx->diffusionDown, dstX, dstX == dstXStart, carry);
+        pw.writePixel(outX, level);
+        if (caching) cw.writePixel(outX, level);
+      }
+      if (carries) ctx->diffusionCarry[bandRow] = static_cast<int16_t>(carry);
+    }
+    return 1;
   }
 
   // === 1:1 fast path: no scaling math ===
@@ -482,12 +519,23 @@ bool JpegToFramebufferConverter::decodeToFramebuffer(const std::string& imagePat
   // Start streaming the pixel cache to disk. The band only needs to hold the
   // tallest single decode block: a JPEGDEC MCU cell is at most 16 scaled-source
   // rows tall, which our fine scale maps to this many output rows.
+  const int maxBlockDstRows = (int)(((int64_t)16 * ctx.fineScaleFPY) >> FP_SHIFT) + 2;
   ctx.caching = !config.cachePath.empty();
   if (ctx.caching) {
-    const int maxBlockDstRows = (int)(((int64_t)16 * ctx.fineScaleFPY) >> FP_SHIFT) + 2;
     if (!ctx.cache.begin(config.cachePath, destWidth, destHeight, config.x, config.y, maxBlockDstRows)) {
       LOG_ERR("JPG", "Failed to start cache stream, continuing without caching");
       ctx.caching = false;
+    }
+  }
+
+  // Smooth path scratch (zeroed); without it the decode falls back to Bayer.
+  std::unique_ptr<int16_t[]> diffusion;
+  if (config.useExactDimensions && config.useDithering) {
+    diffusion = makeUniqueNoThrow<int16_t[]>(static_cast<size_t>(destWidth + maxBlockDstRows));
+    if (diffusion) {
+      ctx.diffusionDown = diffusion.get();
+      ctx.diffusionCarry = ctx.diffusionDown + destWidth;
+      ctx.diffusionCarryRows = maxBlockDstRows;
     }
   }
 

@@ -110,4 +110,14 @@ bool resolveBasePath(const char* folderName, std::string& basePathOut) {
   return false;
 }
 
+bool ensureSelected(char* name, const size_t size) {
+  if (name[0] != '\0') return true;
+  std::vector<DictionaryEntry> found;
+  discover(found);
+  if (found.empty() || found.front().name.size() >= size) return false;
+  memcpy(name, found.front().name.c_str(), found.front().name.size() + 1);
+  LOG_INF("DICT", "No dictionary selected; using '%s'", name);
+  return true;
+}
+
 }  // namespace DictionaryRegistry

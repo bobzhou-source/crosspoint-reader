@@ -30,6 +30,7 @@
 #include "TxtReaderPageSelectionActivity.h"
 #include "components/UITheme.h"
 #include "fontIds.h"
+#include "util/DictionaryRegistry.h"
 
 namespace {
 // Background work yields for input between font-metric batches and display lines.
@@ -601,7 +602,7 @@ std::unique_ptr<ReaderWordPage> TxtReaderActivity::makeWordPage(GfxRenderer& ren
 }
 
 bool TxtReaderActivity::openDictionaryWordSelect() {
-  if (SETTINGS.dictionaryName[0] == '\0') {
+  if (!DictionaryRegistry::ensureSelected(SETTINGS.dictionaryName, sizeof(SETTINGS.dictionaryName))) {
     showDictionaryMessage = true;
     dictionaryMessageTime = millis();
     requestUpdate();
@@ -645,7 +646,9 @@ bool TxtReaderActivity::handleWordHold() {
     page->extractWords(renderer, fontId, 0, 0, words, rowCount);
     hit = DictionaryPageWords::wordNear(words, x, y, renderer.getLineHeight(fontId));
   }
-  switch (ReaderTouchZones::holdAction(zone, zoneHoldActions, hit >= 0, SETTINGS.dictionaryName[0] != '\0')) {
+  switch (ReaderTouchZones::holdAction(
+      zone, zoneHoldActions, hit >= 0,
+      hit >= 0 && DictionaryRegistry::ensureSelected(SETTINGS.dictionaryName, sizeof(SETTINGS.dictionaryName)))) {
     case ReaderTouchZones::HoldAction::None:
       return false;
     case ReaderTouchZones::HoldAction::NoDictionary:

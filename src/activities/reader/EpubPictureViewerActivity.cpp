@@ -33,8 +33,11 @@ constexpr size_t REPLAY_READ_BYTES = 4096;
 
 // The full-screen frame lives beside the source image in the book cache (and
 // goes with it when the cache is deleted). A distinct extension: page caches
-// are always "<stem>.pxc".
-std::string viewCachePath(const std::string& imagePath) { return imagePath + ".pxv"; }
+// are always "<stem>.pxc". Version 2 is the smoothed, error-diffused frame;
+// the turned layout has its own file so toggling does not re-decode.
+std::string viewCachePath(const std::string& imagePath, const bool rotate) {
+  return imagePath + (rotate ? ".pxv2r" : ".pxv2");
+}
 
 bool probeSourceDimensions(const std::string& path, uint32_t& width, uint32_t& height) {
   HalFile file;
@@ -112,25 +115,45 @@ EpubPictureViewerActivity::EpubPictureViewerActivity(GfxRenderer& renderer, Mapp
 void EpubPictureViewerActivity::onEnter() {
   Activity::onEnter();
   readerOrientation = renderer.getOrientation();
-  painted = false;
+  // Version-1 frames (point-sampled, Bayer-dithered) are never read again.
+  const std::string legacy = imagePath + ".pxv";
+  if (Storage.exists(legacy.c_str())) Storage.remove(legacy.c_str());
   requestUpdate();
 }
 
 void EpubPictureViewerActivity::onExit() {
   Activity::onExit();
-  // A rotated picture turned only the renderer; the reader repaints its page
+  // A turned picture turned only the renderer; the reader repaints its page
   // in its own orientation.
   renderer.setOrientation(readerOrientation);
   renderer.setRenderMode(GfxRenderer::BW);
 }
 
 void EpubPictureViewerActivity::loop() {
+  const uint32_t shownAt = shownAtMs.load();
+  if (shownAt != gateShownAtMs) {
+    gateShownAtMs = shownAt;
+    closeGate.frameShown(shownAt);
+  }
   int x = 0;
   int y = 0;
-  if (mappedInput.wasAnyReleased() || mappedInput.wasScreenTapped(x, y) || mappedInput.wasBackGesture()) {
+  const bool touching = mappedInput.isScreenTouchHeld(x, y);
+  const bool released = mappedInput.wasScreenTouchReleased();
+  const bool tapped = mappedInput.wasScreenTapped(x, y);
+  const bool backSwipe = mappedInput.wasBackGesture();
+  const bool touchMayClose = closeGate.closes(millis(), touching, released || tapped || backSwipe);
+
+  using Button = MappedInputManager::Button;
+  if (mappedInput.wasReleased(Button::Up) || mappedInput.wasReleased(Button::Down) ||
+      mappedInput.wasReleased(Button::Left) || mappedInput.wasReleased(Button::Right)) {
+    rotated = !rotated;
+    requestUpdate();
+  } else if (mappedInput.wasAnyReleased() || (touchMayClose && (tapped || backSwipe))) {
     finish();
   }
 }
+
+void EpubPictureViewerActivity::markShown() { shownAtMs = std::max<uint32_t>(1, millis()); }
 
 void EpubPictureViewerActivity::showMessage(const char* message) {
   renderer.setOrientation(readerOrientation);
@@ -145,8 +168,15 @@ void EpubPictureViewerActivity::showMessage(const char* message) {
 }
 
 void EpubPictureViewerActivity::render(RenderLock&&) {
-  if (painted) return;
-  painted = true;
+  const bool rotate = rotated;
+  if (paintedRotation == static_cast<int8_t>(rotate)) return;
+  paintedRotation = static_cast<int8_t>(rotate);
+  paint(rotate);
+  markShown();
+}
+
+void EpubPictureViewerActivity::paint(const bool rotate) {
+  renderer.setOrientation(readerOrientation);
   renderer.setRenderMode(GfxRenderer::BW);
 
   uint32_t sourceWidth = 0;
@@ -168,8 +198,8 @@ void EpubPictureViewerActivity::render(RenderLock&&) {
 
   const page_picture::FitLayout fit =
       page_picture::fitToScreen(static_cast<int>(sourceWidth), static_cast<int>(sourceHeight),
-                                renderer.getScreenWidth(), renderer.getScreenHeight());
-  const std::string cachePath = viewCachePath(imagePath);
+                                renderer.getScreenWidth(), renderer.getScreenHeight(), rotate);
+  const std::string cachePath = viewCachePath(imagePath, rotate);
   HalFile cached;
   const bool haveFrame = openViewCache(cachePath, fit, cached);
   if (haveFrame) cached.close();

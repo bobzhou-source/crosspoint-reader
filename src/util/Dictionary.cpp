@@ -591,9 +591,18 @@ std::string Dictionary::cleanWord(const char* word) {
   }
   if (start >= end) return "";
 
-  std::string result(word + start, end - start);
-  std::transform(result.begin(), result.end(), result.begin(),
-                 [](unsigned char c) { return c >= 0x80 ? c : static_cast<unsigned char>(std::tolower(c)); });
+  // Internal curly apostrophes (U+2019, U+2018) become ASCII so don’t and
+  // word’s match headwords and the -'s stem like their typed spellings.
+  std::string result;
+  result.reserve(end - start);
+  for (size_t i = start; i < end; i++) {
+    if (end - i >= 3 && b[i] == 0xE2 && b[i + 1] == 0x80 && (b[i + 2] == 0x98 || b[i + 2] == 0x99)) {
+      result.push_back('\'');
+      i += 2;
+    } else {
+      result.push_back(b[i] >= 0x80 ? static_cast<char>(b[i]) : static_cast<char>(std::tolower(b[i])));
+    }
+  }
   return result;
 }
 
@@ -611,10 +620,9 @@ void Dictionary::stemVariants(const std::string& word, std::vector<std::string>&
   };
 
   if (endsWith("'s")) add(word.substr(0, n - 2));
-  if (endsWith("\xE2\x80\x99s")) add(word.substr(0, n - 4));  // U+2019 apostrophe
-  if (endsWith("ies")) add(word.substr(0, n - 3) + "y");      // stories -> story
-  if (endsWith("es")) add(word.substr(0, n - 2));             // boxes -> box
-  if (endsWith("s")) add(word.substr(0, n - 1));              // dogs -> dog
+  if (endsWith("ies")) add(word.substr(0, n - 3) + "y");  // stories -> story
+  if (endsWith("es")) add(word.substr(0, n - 2));         // boxes -> box
+  if (endsWith("s")) add(word.substr(0, n - 1));          // dogs -> dog
   if (endsWith("ed")) {
     add(word.substr(0, n - 2));                                            // walked -> walk
     add(word.substr(0, n - 1));                                            // loved -> love
@@ -687,40 +695,61 @@ bool Dictionary::lookup(const char* word, std::string& definitionOut, std::strin
   return false;
 }
 
-bool Dictionary::lookupCjk(const char* run, std::string& definitionOut, std::string& matchedHeadwordOut,
-                           uint8_t& matchMask, LookupResult* outResult) {
+bool Dictionary::probeCjk(LookupSession& session, const char* run, uint8_t& matchMask, DictLocation& longest,
+                          uint8_t& longestBytes) {
   matchMask = 0;
-  if (outResult) *outResult = LookupResult::NotFound;
+  longestBytes = 0;
   uint8_t ends[CjkDictionary::MAX_CHARACTERS];
   const uint8_t count = CjkDictionary::prefixes(run, ends);
-  if (!count || !isOpen()) return false;
   char candidate[CjkDictionary::RUN_BYTES];
+  for (uint8_t i = 0; i < count; ++i) {
+    memcpy(candidate, run, ends[i]);
+    candidate[ends[i]] = '\0';
+    const DictLocation location = locate(session, candidate, nullptr);
+    if (location.readError) return false;
+    if (location.found) {
+      matchMask |= static_cast<uint8_t>(1u << i);
+      longest = location;
+      longestBytes = ends[i];
+    }
+  }
+  return true;
+}
+
+bool Dictionary::lookupCjk(const char* run, std::string& definitionOut, std::string& matchedHeadwordOut,
+                           uint8_t& matchMask, LookupResult* outResult, const char* previousRun, bool* usedPrevious) {
+  matchMask = 0;
+  if (usedPrevious) *usedPrevious = false;
+  if (outResult) *outResult = LookupResult::NotFound;
+  uint8_t ends[CjkDictionary::MAX_CHARACTERS];
+  if (!CjkDictionary::prefixes(run, ends) || !isOpen()) return false;
   DictLocation longest;
   uint8_t longestBytes = 0;
+  const char* source = run;
   {
     LookupSession session;
-    if (!openSession(session)) {
+    if (!openSession(session) || !probeCjk(session, run, matchMask, longest, longestBytes)) {
+      matchMask = 0;
       if (outResult) *outResult = LookupResult::ReadError;
       return false;
     }
-    for (uint8_t i = 0; i < count; ++i) {
-      memcpy(candidate, run, ends[i]);
-      candidate[ends[i]] = '\0';
-      const DictLocation location = locate(session, candidate, nullptr);
-      if (location.readError) {
-        if (outResult) *outResult = LookupResult::ReadError;
-        return false;
-      }
-      if (location.found) {
-        matchMask |= static_cast<uint8_t>(1u << i);
-        longest = location;
-        longestBytes = ends[i];
-      }
+    // A held second character: prefer the compound that starts one character
+    // earlier and covers it. A failed probe there keeps the forward result.
+    DictLocation before;
+    uint8_t beforeMask = 0;
+    uint8_t beforeBytes = 0;
+    if (matchMask <= 1 && previousRun && previousRun[0] &&
+        probeCjk(session, previousRun, beforeMask, before, beforeBytes) && (beforeMask & ~1u)) {
+      matchMask = static_cast<uint8_t>(beforeMask & ~1u);
+      longest = before;
+      longestBytes = beforeBytes;
+      source = previousRun;
+      if (usedPrevious) *usedPrevious = true;
     }
   }
   if (!longest.found) return false;
   if (!readDefinition(longest, definitionOut, outResult)) return false;
-  matchedHeadwordOut.assign(run, longestBytes);
+  matchedHeadwordOut.assign(source, longestBytes);
   if (outResult) *outResult = LookupResult::Found;
   return true;
 }

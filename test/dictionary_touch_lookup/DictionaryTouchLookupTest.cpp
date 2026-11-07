@@ -17,6 +17,7 @@
 #include "DictZip.h"
 #include "Dictionary.h"
 #include "DictionaryRegistry.h"
+#include "DictionaryRouter.h"
 #include "StringUtils.h"
 #include "src/activities/reader/DictionaryPageWords.h"
 #include "src/activities/reader/ReaderTouchZones.h"
@@ -285,63 +286,65 @@ void be32(std::ostream& out, const uint32_t value) {
   for (int shift = 24; shift >= 0; shift -= 8) out.put(static_cast<char>(value >> shift));
 }
 
+// A minimal StarDict (.idx/.dict/.ifo) at `stem`, sorted like the real ones.
+void writeStarDict(const std::string& stem, std::vector<std::pair<std::string, std::string>> entries) {
+  std::sort(entries.begin(), entries.end(),
+            [](auto& a, auto& b) { return StringUtils::asciiCaseCmp(a.first.c_str(), b.first.c_str()) < 0; });
+  std::ofstream idx(stem + ".idx", std::ios::binary);
+  std::ofstream data(stem + ".dict", std::ios::binary);
+  uint32_t offset = 0;
+  for (const auto& [word, definition] : entries) {
+    idx.write(word.c_str(), static_cast<std::streamsize>(word.size() + 1));
+    be32(idx, offset);
+    be32(idx, static_cast<uint32_t>(definition.size()));
+    data << definition;
+    offset += static_cast<uint32_t>(definition.size());
+  }
+  std::ofstream(stem + ".ifo") << "StarDict's dict ifo file\nversion=2.4.2\nsametypesequence=m\n";
+}
+
+std::filesystem::path freshDir(const char* prefix) {
+  const auto dir = std::filesystem::temp_directory_path() /
+                   (prefix + std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()));
+  std::filesystem::create_directories(dir);
+  return dir;
+}
+
+// What DictionaryWordSelectActivity::performLookup does with words[hit] for
+// one dictionary; returns "headword=definition".
+std::string lookUpWords(Dictionary& dict, const std::vector<WordBox>& words, const int hit) {
+  if (hit < 0) return "";
+  char run[CjkDictionary::RUN_BYTES];
+  char previous[CjkDictionary::RUN_BYTES];
+  DictionaryPageWords::heldCjkRuns(words, hit, run, previous);
+  std::string definition;
+  std::string headword;
+  uint8_t mask = 0;
+  const bool found = run[0] ? dict.lookupCjk(run, definition, headword, mask, nullptr, previous)
+                            : dict.lookup(words[hit].text, definition, headword);
+  return found ? headword + "=" + definition : "not found";
+}
+
 class HoldLookup : public ::testing::Test {
  protected:
   void SetUp() override {
-    dir = std::filesystem::temp_directory_path() /
-          ("hold-lookup-" + std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()));
-    ASSERT_TRUE(std::filesystem::create_directory(dir));
+    dir = freshDir("hold-lookup-");
     const std::string stem = (dir / "fixture").string();
-    std::vector<std::pair<std::string, std::string>> entries = {{"hello", "a greeting"},
-                                                                {"well-known", "widely known"},
-                                                                {"\xE7\xB3\xBB", "to tie"},
-                                                                {"\xE7\xB3\xBB\xE7\xBB\x9F", "system"},
-                                                                {"\xE7\xBB\x9F", "to unite"}};
-    std::sort(entries.begin(), entries.end(),
-              [](auto& a, auto& b) { return StringUtils::asciiCaseCmp(a.first.c_str(), b.first.c_str()) < 0; });
-    std::ofstream idx(stem + ".idx", std::ios::binary);
-    std::ofstream data(stem + ".dict", std::ios::binary);
-    uint32_t offset = 0;
-    for (const auto& [word, definition] : entries) {
-      idx.write(word.c_str(), static_cast<std::streamsize>(word.size() + 1));
-      be32(idx, offset);
-      be32(idx, static_cast<uint32_t>(definition.size()));
-      data << definition;
-      offset += static_cast<uint32_t>(definition.size());
-    }
-    idx.close();
-    data.close();
-    std::ofstream(stem + ".ifo") << "StarDict's dict ifo file\nversion=2.4.2\nsametypesequence=m\n";
+    writeStarDict(stem, {{"hello", "a greeting"},
+                         {"well-known", "widely known"},
+                         {"\xE7\xB3\xBB", "to tie"},
+                         {"\xE7\xB3\xBB\xE7\xBB\x9F", "system"},
+                         {"\xE7\xBB\x9F", "to unite"}});
     ASSERT_TRUE(dict.open(stem.c_str()));
     if (dict.needsIndex()) ASSERT_TRUE(dict.buildIndex());
   }
   void TearDown() override { std::filesystem::remove_all(dir); }
 
-  // What the direct lookup does with words[hit]; returns "headword=definition".
   std::string lookUp(const FakePage& page, const int x, const int y) {
-    const int hit = page.hold(x, y);
-    if (hit < 0) return "";
-    char run[CjkDictionary::RUN_BYTES];
-    DictionaryPageWords::cjkRun(page.words, hit, run);
-    std::string definition;
-    std::string headword;
-    uint8_t mask = 0;
-    const bool found = run[0] ? dict.lookupCjk(run, definition, headword, mask)
-                              : dict.lookup(page.words[hit].text, definition, headword);
-    return found ? headword + "=" + definition : "not found";
+    return lookUpWords(dict, page.words, page.hold(x, y));
   }
-
   std::string lookUpTxt(const TxtLines& page, const int x, const int y) {
-    const int hit = page.hold(x, y);
-    if (hit < 0) return "";
-    char run[CjkDictionary::RUN_BYTES];
-    DictionaryPageWords::cjkRun(page.words, hit, run);
-    std::string definition;
-    std::string headword;
-    uint8_t mask = 0;
-    const bool found = run[0] ? dict.lookupCjk(run, definition, headword, mask)
-                              : dict.lookup(page.words[hit].text, definition, headword);
-    return found ? headword + "=" + definition : "not found";
+    return lookUpWords(dict, page.words, page.hold(x, y));
   }
 
   std::filesystem::path dir;
@@ -357,7 +360,7 @@ TEST_F(HoldLookup, LatinHoldFindsTheCleanedWord) {
 TEST_F(HoldLookup, CjkHoldFindsTheLongestMatchFromTheHeldCharacter) {
   const FakePage page({{{"\xE7\xB3\xBB\xE7\xBB\x9F\xE5\xBE\x88"}, 0, 0}}, 0, 0);  // 系统很
   EXPECT_EQ(lookUp(page, 5, 5), "\xE7\xB3\xBB\xE7\xBB\x9F=system");               // 系 → 系统
-  EXPECT_EQ(lookUp(page, 30, 5), "\xE7\xBB\x9F=to unite");                        // 统 → 统
+  EXPECT_EQ(lookUp(page, 30, 5), "\xE7\xB3\xBB\xE7\xBB\x9F=system");  // 统 → 系统 (the compound it ends)
   EXPECT_EQ(lookUp(page, 52, 5), "not found");                                    // 很 is not in the fixture
 }
 
@@ -370,8 +373,127 @@ TEST_F(HoldLookup, TxtLatinHoldUsesTheDisplayLineWord) {
 TEST_F(HoldLookup, TxtCjkHoldFindsTheLongestMatchFromTheHeldCharacter) {
   const TxtLines page({"\xE7\xB3\xBB\xE7\xBB\x9F\xE5\xBE\x88"}, 0, 0);  // 系统很
   EXPECT_EQ(lookUpTxt(page, 5, 5), "\xE7\xB3\xBB\xE7\xBB\x9F=system");  // 系 → 系统
-  EXPECT_EQ(lookUpTxt(page, 30, 5), "\xE7\xBB\x9F=to unite");           // 统 → 统
+  EXPECT_EQ(lookUpTxt(page, 30, 5), "\xE7\xB3\xBB\xE7\xBB\x9F=system");  // 统 → 系统 (the compound it ends)
   EXPECT_EQ(lookUpTxt(page, 52, 5), "not found");                       // 很 is not in the fixture
+}
+
+TEST(HeldCompound, SecondCharacterFindsTheCompoundItEnds) {
+  const auto dir = freshDir("held-compound-");
+  const std::string stem = (dir / "cedict").string();
+  // 北京 Beijing, 京 capital, 北 north, 人 person; 京人 is not an entry.
+  writeStarDict(stem, {{"\xE5\x8C\x97\xE4\xBA\xAC", "Beijing"},
+                       {"\xE4\xBA\xAC", "capital"},
+                       {"\xE5\x8C\x97", "north"},
+                       {"\xE4\xBA\xBA", "person"}});
+  Dictionary dict;
+  ASSERT_TRUE(dict.open(stem.c_str()));
+  ASSERT_TRUE(dict.buildIndex());
+  const FakePage page({{{"\xE5\x8C\x97\xE4\xBA\xAC\xE4\xBA\xBA"}, 0, 0}}, 0, 0);  // 北京人
+  EXPECT_EQ(lookUpWords(dict, page.words, page.hold(5, 5)), "\xE5\x8C\x97\xE4\xBA\xAC=Beijing");   // 北
+  EXPECT_EQ(lookUpWords(dict, page.words, page.hold(30, 5)), "\xE5\x8C\x97\xE4\xBA\xAC=Beijing");  // 京
+  EXPECT_EQ(lookUpWords(dict, page.words, page.hold(52, 5)), "\xE4\xBA\xBA=person");               // 人
+
+  // The compound's match mask drops the lone first character (北), which
+  // would not cover the held one; usedPrevious names the run it describes.
+  char run[CjkDictionary::RUN_BYTES];
+  char previous[CjkDictionary::RUN_BYTES];
+  DictionaryPageWords::heldCjkRuns(page.words, page.hold(30, 5), run, previous);
+  EXPECT_STREQ(previous, "\xE5\x8C\x97\xE4\xBA\xAC\xE4\xBA\xBA");
+  std::string definition;
+  std::string headword;
+  uint8_t mask = 0;
+  bool usedPrevious = false;
+  ASSERT_TRUE(dict.lookupCjk(run, definition, headword, mask, nullptr, previous, &usedPrevious));
+  EXPECT_TRUE(usedPrevious);
+  EXPECT_EQ(mask, 2);
+
+  // A held first character of a run has no previous run.
+  DictionaryPageWords::heldCjkRuns(page.words, page.hold(5, 5), run, previous);
+  EXPECT_STREQ(previous, "");
+  std::filesystem::remove_all(dir);
+}
+
+TEST(CleanWord, CurlyApostrophesBecomeAscii) {
+  EXPECT_EQ(Dictionary::cleanWord("don\xE2\x80\x99t"), "don't");
+  EXPECT_EQ(Dictionary::cleanWord("Rock\xE2\x80\x98n"), "rock'n");
+  EXPECT_EQ(Dictionary::cleanWord("\xE2\x80\x98quoted\xE2\x80\x99"), "quoted");
+  EXPECT_EQ(Dictionary::cleanWord("Robert\xE2\x80\x99s,"), "robert's");
+}
+
+// --- Routing across installed dictionaries ------------------------------------
+
+TEST(DictionaryRouting, OrderPutsTheSelectedThenScriptMatches) {
+  const std::vector<std::string> installed{"cedict", "english", "jmdict", "zh-wiki"};
+  std::vector<std::string> order;
+  DictionaryRouter::order(installed, "cedict", false, order);
+  EXPECT_EQ(order, (std::vector<std::string>{"cedict", "english", "jmdict", "zh-wiki"}));
+  DictionaryRouter::order(installed, "english", true, order);
+  EXPECT_EQ(order, (std::vector<std::string>{"english", "cedict", "zh-wiki", "jmdict"}));
+  DictionaryRouter::order(installed, "", false, order);
+  EXPECT_EQ(order, (std::vector<std::string>{"english", "cedict", "jmdict", "zh-wiki"}));
+  EXPECT_TRUE(DictionaryRouter::suitsScript("en-gcide", false));
+  EXPECT_TRUE(DictionaryRouter::suitsScript("CC-CEDICT", true));
+  EXPECT_FALSE(DictionaryRouter::suitsScript("cedict", false));
+}
+
+class RoutedLookup : public ::testing::Test {
+ protected:
+  void SetUp() override {
+    dir = freshDir("routed-lookup-");
+    cedict = (dir / "cedict").string();
+    english = (dir / "english").string();
+    writeStarDict(cedict, {{"\xE5\x8C\x97\xE4\xBA\xAC", "Beijing"}, {"\xE4\xBA\xAC", "capital"}});
+    writeStarDict(english, {{"hello", "a greeting"}, {"don't", "do not"}, {"dog", "canine"}});
+  }
+  void TearDown() override { std::filesystem::remove_all(dir); }
+
+  std::string route(const std::vector<std::string>& names, const char* word,
+                    DictionaryRouter::Miss* missOut = nullptr) {
+    char run[CjkDictionary::RUN_BYTES] = {};
+    uint32_t cp = 0;
+    if (CjkDictionary::characterBytes(word, cp) && CjkDictionary::isCjk(cp)) {
+      memcpy(run, word, std::min(strlen(word), sizeof(run) - 1));
+    }
+    std::string definition;
+    std::string headword;
+    uint8_t mask = 0;
+    bool usedPrevious = false;
+    DictionaryRouter::Miss miss = DictionaryRouter::Miss::NoDictionary;
+    const bool found = router.lookup(names, word, run, "", [this] { ++indexBuilds; }, nullptr, definition, headword,
+                                     mask, usedPrevious, miss);
+    if (missOut) *missOut = miss;
+    return found ? headword + "=" + definition : "not found";
+  }
+
+  std::filesystem::path dir;
+  std::string cedict;
+  std::string english;
+  DictionaryRouter router;
+  int indexBuilds = 0;
+};
+
+TEST_F(RoutedLookup, EnglishWordFallsThroughTheSelectedChineseDictionary) {
+  EXPECT_EQ(route({cedict, english}, "Hello,"), "hello=a greeting");
+  EXPECT_EQ(route({cedict, english}, "Don\xE2\x80\x99t"), "don't=do not");
+  EXPECT_EQ(route({cedict, english}, "dogs"), "dog=canine");
+  EXPECT_EQ(indexBuilds, 2);  // each dictionary indexed once, then kept
+}
+
+TEST_F(RoutedLookup, ChineseWordFallsThroughTheSelectedEnglishDictionary) {
+  EXPECT_EQ(route({english, cedict}, "\xE5\x8C\x97\xE4\xBA\xAC"), "\xE5\x8C\x97\xE4\xBA\xAC=Beijing");
+  EXPECT_TRUE(router.dictionary().isOpen());
+}
+
+TEST_F(RoutedLookup, MissesAndMissingFoldersAreReported) {
+  DictionaryRouter::Miss miss;
+  EXPECT_EQ(route({cedict, english}, "zebra", &miss), "not found");
+  EXPECT_EQ(miss, DictionaryRouter::Miss::NotFound);
+  // A selected folder that is gone does not hide the other dictionaries.
+  EXPECT_EQ(route({(dir / "gone").string(), english}, "hello", &miss), "hello=a greeting");
+  EXPECT_EQ(route({(dir / "gone").string()}, "hello", &miss), "not found");
+  EXPECT_EQ(miss, DictionaryRouter::Miss::OpenFailed);
+  EXPECT_EQ(route({}, "hello", &miss), "not found");
+  EXPECT_EQ(miss, DictionaryRouter::Miss::NoDictionary);
 }
 
 // --- Who owns the hold ------------------------------------------------------

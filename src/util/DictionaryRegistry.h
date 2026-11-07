@@ -22,4 +22,10 @@ void discover(std::vector<DictionaryEntry>& out);
 // Returns false if the folder holds no usable dictionary in either root.
 bool resolveBasePath(const char* folderName, std::string& basePathOut);
 
+// Fill an empty settings field `name` (capacity `size`) with the first
+// installed dictionary, so hold-to-look-up works without a trip to Settings.
+// True when `name` names a dictionary afterwards (it was already set, or one
+// is installed).
+bool ensureSelected(char* name, size_t size);
+
 }  // namespace DictionaryRegistry

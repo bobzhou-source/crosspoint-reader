@@ -3,12 +3,13 @@
 #include <I18n.h>
 
 #include <memory>
+#include <string>
 #include <vector>
 
 #include "DictionaryPageWords.h"
 #include "ReaderWordPage.h"
 #include "activities/Activity.h"
-#include "util/Dictionary.h"
+#include "util/DictionaryRouter.h"
 
 // Word selection over the current reader page: Left/Right step through words
 // in reading order, Up/Down jump rows, Confirm looks the word up and opens
@@ -70,10 +71,11 @@ class DictionaryWordSelectActivity final : public Activity {
   uint16_t rowCount = 0;
   unsigned long lastHorizontalMoveTime = 0;
 
-  Dictionary dict;
-  bool dictOpenAttempted = false;
-  bool dictOpenOk = false;
-  bool dictNeedsIndex = false;
+  // Every installed dictionary is a lookup candidate (see DictionaryRouter);
+  // the folder list is scanned once, at the first lookup.
+  DictionaryRouter router;
+  std::vector<std::string> installed;
+  bool installedScanned = false;
 
   Popup popup = Popup::None;
   StrId popupMsg = StrId::STR_DICT_NOT_FOUND;

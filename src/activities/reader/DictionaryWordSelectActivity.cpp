@@ -13,6 +13,7 @@
 #include "DictionaryDefinitionActivity.h"
 #include "ReaderUtils.h"
 #include "components/UITheme.h"
+#include "util/DictionaryRegistry.h"
 
 namespace {
 
@@ -77,38 +78,42 @@ void DictionaryWordSelectActivity::moveVertical(const int direction) {
 
 void DictionaryWordSelectActivity::performLookup() {
   popup = Popup::Busy;
-  if (!dictOpenAttempted) {
-    dictOpenAttempted = true;
-    dictOpenOk = dict.open(SETTINGS.dictionaryName);
-    // needsIndex() opens and validates the .qidx sidecar, so ask it once per
-    // open rather than once per word: the answer only changes when we build
-    // the sidecar ourselves, which is handled below.
-    dictNeedsIndex = dictOpenOk && dict.needsIndex();
-  }
-  popupMsg = dictNeedsIndex ? StrId::STR_DICT_INDEXING : StrId::STR_DICT_LOOKING_UP;
+  popupMsg = StrId::STR_DICT_LOOKING_UP;
   requestUpdateAndWait();  // paint the busy popup before blocking on SD
 
-  bool ok = dictOpenOk;
-  Dictionary::IndexResult indexResult = Dictionary::IndexResult::Ok;
-  if (ok && dictNeedsIndex) {
-    ok = dict.buildIndex(&indexBuildYield, nullptr, &indexResult);
-    dictNeedsIndex = !ok;  // a successful build leaves the sidecar fresh; a failed one retries
+  if (!installedScanned) {
+    installedScanned = true;
+    std::vector<DictionaryEntry> entries;
+    DictionaryRegistry::discover(entries);
+    installed.reserve(entries.size());
+    for (auto& entry : entries) installed.push_back(std::move(entry.name));
   }
+
+  // A held CJK character also offers the run one character earlier, so a
+  // hold on the second character of 北京 still finds 北京.
+  char run[CjkDictionary::RUN_BYTES];
+  char previous[CjkDictionary::RUN_BYTES];
+  DictionaryPageWords::heldCjkRuns(words, selected, run, previous);
+  std::vector<std::string> names;
+  DictionaryRouter::order(installed, SETTINGS.dictionaryName, run[0] != '\0', names);
 
   std::string definition;
   std::string headword;
-  Dictionary::LookupResult result = Dictionary::LookupResult::NotFound;
-  char run[CjkDictionary::RUN_BYTES];
   uint8_t matchMask = 0;
-  DictionaryPageWords::cjkRun(words, selected, run);
-  const bool found = ok && (run[0] ? dict.lookupCjk(run, definition, headword, matchMask, &result)
-                                   : dict.lookup(words[selected].text, definition, headword, &result));
-
-  if (found) {
+  bool usedPrevious = false;
+  DictionaryRouter::Miss miss = DictionaryRouter::Miss::NoDictionary;
+  const auto beforeIndex = [this] {
+    popupMsg = StrId::STR_DICT_INDEXING;
+    requestUpdateAndWait();
+  };
+  if (router.lookup(names, words[selected].text, run, previous, beforeIndex, &indexBuildYield, definition, headword,
+                    matchMask, usedPrevious, miss)) {
     popup = Popup::None;
+    Dictionary& dict = router.dictionary();
+    const char* shown = usedPrevious ? previous : run;
     startActivityForResult(std::make_unique<DictionaryDefinitionActivity>(
                                renderer, mappedInput, std::move(headword), std::move(definition),
-                               dict.definitionsAreHtml(), run[0] ? &dict : nullptr, run, matchMask),
+                               dict.definitionsAreHtml(), run[0] ? &dict : nullptr, shown, matchMask),
                            [this](const ActivityResult&) {
                              if (direct) {
                                finish();
@@ -121,42 +126,30 @@ void DictionaryWordSelectActivity::performLookup() {
   // Name the failure: a genuine miss is "Not found"; a word that WAS found but
   // couldn't be read is a real error — and we distinguish decompression from a
   // low-memory allocation from a generic read error.
-  if (!ok) {
-    popup = Popup::Error;
-    // An index build allocates a scan buffer, so it fails the same way lookups
-    // do on a fragmented heap — name that rather than a generic error.
-    switch (indexResult) {
-      case Dictionary::IndexResult::LowMemory:
-        popupMsg = StrId::STR_DICT_LOW_MEMORY;
-        break;
-      case Dictionary::IndexResult::ReadError:
-        popupMsg = StrId::STR_DICT_READ_FAILED;
-        break;
-      case Dictionary::IndexResult::Ok:
-      default:
-        popupMsg = StrId::STR_DICT_ERROR;  // dict.open() failed, not the index
-        break;
-    }
-  } else {
-    switch (result) {
-      case Dictionary::LookupResult::Decompress:
-        popup = Popup::Error;
-        popupMsg = StrId::STR_DICT_DECOMPRESS_ERROR;
-        break;
-      case Dictionary::LookupResult::LowMemory:
-        popup = Popup::Error;
-        popupMsg = StrId::STR_DICT_LOW_MEMORY;
-        break;
-      case Dictionary::LookupResult::ReadError:
-        popup = Popup::Error;
-        popupMsg = StrId::STR_DICT_READ_FAILED;
-        break;
-      case Dictionary::LookupResult::NotFound:
-      default:
-        popup = Popup::NotFound;
-        popupMsg = StrId::STR_DICT_NOT_FOUND;
-        break;
-    }
+  popup = Popup::Error;
+  switch (miss) {
+    case DictionaryRouter::Miss::NotFound:
+      popup = Popup::NotFound;
+      popupMsg = StrId::STR_DICT_NOT_FOUND;
+      break;
+    case DictionaryRouter::Miss::NoDictionary:
+      popupMsg = StrId::STR_DICT_NO_DICT_SET;
+      break;
+    case DictionaryRouter::Miss::Decompress:
+      popupMsg = StrId::STR_DICT_DECOMPRESS_ERROR;
+      break;
+    case DictionaryRouter::Miss::IndexLowMemory:
+    case DictionaryRouter::Miss::LowMemory:
+      popupMsg = StrId::STR_DICT_LOW_MEMORY;
+      break;
+    case DictionaryRouter::Miss::IndexReadError:
+    case DictionaryRouter::Miss::ReadError:
+      popupMsg = StrId::STR_DICT_READ_FAILED;
+      break;
+    case DictionaryRouter::Miss::OpenFailed:
+    default:
+      popupMsg = StrId::STR_DICT_ERROR;
+      break;
   }
   popupTime = millis();
   requestUpdate();

@@ -88,8 +88,15 @@ class Dictionary {
 
   // Probe at most eight CJK prefixes in one on-SD search session, read only
   // the longest hit. Bit (length - 1) records each exact-match length.
+  //
+  // previousRun (optional) is the run that starts one character before `run`
+  // in the same text run. When `run` matches nothing longer than its first
+  // character and previousRun has an entry of two or more characters (which
+  // covers that character: 北京 held on 京), that entry wins, matchMask
+  // describes previousRun without its lone first character, and *usedPrevious
+  // is set.
   bool lookupCjk(const char* run, std::string& definitionOut, std::string& matchedHeadwordOut, uint8_t& matchMask,
-                 LookupResult* outResult = nullptr);
+                 LookupResult* outResult = nullptr, const char* previousRun = nullptr, bool* usedPrevious = nullptr);
 
   static std::string cleanWord(const char* word);
 
@@ -167,6 +174,12 @@ class Dictionary {
   // Bisect the .syn/.sidx synonym index for target; on a hit follow its ordinal
   // through locateByOrdinal(). Returns not-found when no .syn exists.
   DictLocation locateSynonym(LookupSession& session, const char* target, std::string* matchedHeadwordOut);
+
+  // Locate every CJK prefix of `run` (up to MAX_CHARACTERS) in session. Sets bit
+  // (length - 1) of matchMask per exact match and the location and byte length
+  // of the longest. False when a search hit a read error.
+  bool probeCjk(LookupSession& session, const char* run, uint8_t& matchMask, DictLocation& longest,
+                uint8_t& longestBytes);
 
   // One streaming pass over sourcePath writing a sampled-offset sidecar. Each
   // source entry is a NUL-terminated word followed by suffixBytes fixed bytes
