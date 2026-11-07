@@ -158,11 +158,11 @@ int main() {
   assert(buttons.feedbackRequested == 0);
   buttons.recentBooks.clear();
   buttons.buttonPass();
-  assert(buttons.selectorIndex == 4 && buttons.updates == 3);
+  assert(buttons.selectorIndex == 5 && buttons.updates == 3);  // list home: five fixed rows plus Surprise me
   buttons.hasOpdsServers = true;
   buttons.selectorIndex = 0;
   buttons.buttonPass();
-  assert(buttons.selectorIndex == 5 && buttons.updates == 4);
+  assert(buttons.selectorIndex == 6 && buttons.updates == 4);  // the optional OPDS row adds one more
   buttons.buttonNavigator.previous = false;
   buttons.buttonNavigator.next = true;
   buttons.buttonPass();
