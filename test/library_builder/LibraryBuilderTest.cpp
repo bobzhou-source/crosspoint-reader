@@ -386,6 +386,43 @@ TEST_F(LibraryBuilderTest, LibrariesPastOldGateAndAtFormatCeilingKeepAllOrders) 
   }
 }
 
+TEST_F(LibraryBuilderTest, ASevenHundredBookShelfIndexesEveryFolderOnTheCard) {
+  // The card as Robert's collection actually looks: loose books at the root, the
+  // converted novel shelf (flat plus one publisher folder) and the local shelf
+  // with a subfolder, next to the cloud inbox.
+  fake::reset();
+  bookMetadata.clear();
+  std::vector<std::string> expected;
+  const auto stage = [&expected](const std::string& path) {
+    fake::add(path);
+    expected.push_back(path);
+  };
+  for (unsigned i = 0; i < 6; i++) stage("/book" + numbered("", i) + ".epub");
+  for (unsigned i = 0; i < 30; i++) stage("/books/Inbox/" + numbered("article", i) + ".epub");
+  for (unsigned i = 0; i < 40; i++) stage("/books/Books/" + numbered("local", i) + ".epub");
+  for (unsigned i = 0; i < 10; i++) stage("/books/Books/english/" + numbered("english", i) + ".epub");
+  for (unsigned i = 0; i < 665; i++) stage("/books/Novels/" + numbered("novel", i) + ".epub");
+  for (unsigned i = 0; i < 120; i++) stage("/books/Novels/Qidian/" + numbered("qidian", i) + ".epub");
+  ASSERT_EQ(expected.size(), 871u);
+
+  ASSERT_TRUE(buildLibraryIndex("/", stats, true));
+
+  EXPECT_EQ(stats.books, expected.size());
+  EXPECT_EQ(stats.duplicatesDropped, 0);
+  EXPECT_EQ(stats.unreadableSkipped, 0);
+  EXPECT_FALSE(stats.dedupDegraded);
+  EXPECT_FALSE(stats.ranksDegraded);
+  EXPECT_EQ(stats.folders, 6);  // only folders that hold books: "/", Inbox, Books, Books/english, Novels, Novels/Qidian
+  LibraryIndexFile index;
+  ASSERT_TRUE(index.open(INDEX));
+  ASSERT_EQ(index.bookCount(), expected.size());
+  std::vector<std::string> seen;
+  for (uint16_t row = 0; row < index.bookCount(); row++) seen.push_back(pathAt(index, SortOrder::RecentAsc, row));
+  std::sort(seen.begin(), seen.end());
+  std::sort(expected.begin(), expected.end());
+  EXPECT_EQ(seen, expected);
+}
+
 TEST_F(LibraryBuilderTest, SortAllocationFailureProducesValidDegradedIndex) {
   fake::reset();
   for (unsigned i = 0; i < 513; i++) fake::add("/book" + numbered("", i) + ".txt");

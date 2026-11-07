@@ -60,10 +60,13 @@ class DuplicateEchoTest(unittest.TestCase):
         self.assertEqual([tag for tag, _ in blocks(read_epub(book.epub))][:3], ["h2", "h3", "p"])
         self.assertEqual(book.info["duplicate_headings_dropped"], 0)
 
-    def test_an_echo_differing_only_in_spacing_is_kept(self):
-        book = convert_bytes(chapters("第{n}章 ，标题\n第{n}章，标题\n正文{n}。\n"), "spacing")
-        self.assertEqual([tag for tag, _ in blocks(read_epub(book.epub))][:3], ["h2", "h3", "p"])
-        self.assertEqual(book.info["duplicate_headings_dropped"], 0)
+    def test_an_echo_differing_only_in_spacing_is_dropped(self):
+        for echo, chars in (("第{n}章，标题", 6), ("第{n}章\u3000，标题", 6), ("第{n}章 \xa0，标题", 6)):
+            with self.subTest(echo=echo):
+                book = convert_bytes(chapters(f"第{{n}}章 ，标题\n{echo}\n正文{{n}}。\n"), "spacing")
+                self.assertEqual([tag for tag, _ in blocks(read_epub(book.epub))][:2], ["h2", "p"])
+                self.assertEqual(book.info["duplicate_headings_dropped"], 6)
+                self.assertEqual(book.info["duplicate_heading_chars_removed"], 6 * chars)
 
     def test_preservation_still_rejects_lost_text_after_a_dropped_echo(self):
         text = chapters("第{n}章 标题{n}\n第{n}章 标题{n}\n正文{n}。\n").decode("utf-8")
@@ -106,6 +109,49 @@ class DuplicateEchoTest(unittest.TestCase):
             self.assertEqual((entry["text_clean"], entry["duplicate_headings_dropped"], entry["duplicate_heading_chars_removed"],
                               entry["removed_decoration_chars"]), (novels.TEXT_CLEAN_REVISION, 6, 30, 0))
             self.assertEqual((forced["summary"]["duplicate_headings_dropped"], forced["summary"]["duplicate_heading_chars_removed"]), (6, 30))
+
+
+    def test_the_same_title_reprinted_in_another_numeral_form_is_dropped(self):
+        # The shapes the real corpus showed: an Arabic heading with a Chinese-numeral echo, a site
+        # prefix, a stray second copy of the title, and a title printed twice under a different heading.
+        filler = "".join(f"## 第{n}章 标题{n}\n正文{n}。\n" for n in range(1, 6))
+        cases = (
+            ("## 第200章 布拉德\n第二百章布拉德\n第二百章布拉德\n正文。\n", 2, 0),
+            ("## 正文_第三十章 帮美女解惑\n第030章 帮美女解惑\n第030章 帮美女解惑\n正文。\n", 2, 0),
+            ("# 序章\n## 序章\n正文。\n", 1, 0),
+            ("## 第13章 选择\n第十三章选择（万赏加更求订阅）\n第十三章选择（万赏加更求订阅）\n正文。\n", 1, 1),
+        )
+        for chapter, dropped, kept in cases:
+            with self.subTest(chapter=chapter.splitlines()[0]):
+                book = convert_bytes((filler + chapter).encode("utf-8"), "shape")
+                self.assertEqual(book.info["duplicate_headings_dropped"], dropped)
+                tags = [tag for tag, _ in blocks(read_epub(book.epub))]
+                self.assertEqual(tags.count("h3"), kept)
+
+    def test_rebuild_stale_reconverts_only_books_built_by_older_text_handling(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            src, out = Path(temporary, "src"), Path(temporary, "out")
+            src.mkdir()
+            (src / "旧书.txt").write_bytes(chapters("第{n}章 标题\n第{n}章 标题\n正文{n}。\n"))
+            (src / "新书.txt").write_bytes(chapters("第{n}章 标题{n}\n正文{n}。\n", 3))
+            convert_tree(src, out)
+            manifest_path = out / novels.MANIFEST_NAME
+            manifest = json.loads(manifest_path.read_text("utf-8"))
+            manifest["entries"]["旧书.txt"].pop("text_clean")  # built before this text handling existed
+            manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+            rebuilt = convert_tree(src, out, rebuild_stale=True)
+            self.assertEqual((rebuilt["summary"]["converted"], rebuilt["summary"]["skipped"]), (1, 1))
+            entry = json.loads(manifest_path.read_text("utf-8"))["entries"]["旧书.txt"]
+            self.assertEqual((entry["text_clean"], entry["duplicate_headings_dropped"],
+                              entry["duplicate_heading_chars_removed"]), (novels.TEXT_CLEAN_REVISION, 6, 30))
+            again = convert_tree(src, out, rebuild_stale=True)
+            self.assertEqual((again["summary"]["converted"], again["summary"]["skipped"]), (0, 2))
+
+    def test_cli_parses_rebuild_stale(self):
+        from reader_send import cli
+        args = cli.parser().parse_args(["novels", "convert", "a", "b", "--rebuild-stale"])
+        self.assertTrue(args.rebuild_stale)
+        self.assertFalse(cli.parser().parse_args(["novels", "convert", "a", "b"]).rebuild_stale)
 
 
 if __name__ == "__main__":

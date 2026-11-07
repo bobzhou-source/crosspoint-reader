@@ -1,4 +1,5 @@
 import json
+import io
 import plistlib
 import subprocess
 import tempfile
@@ -9,6 +10,7 @@ from unittest.mock import patch
 
 from reader_send import cache as cache_module
 from reader_send import card as card_module
+from reader_send import cli
 from reader_send.cache import Cache
 from reader_send.card import (BOOK_INBOX, FIRMWARE_CONFIG_KEYS, FIRMWARE_NAME, FIRMWARE_ORIGIN, CardVolume,
                               _validate_reader_sync_config, provision_reader_sync, resolve_card,
@@ -403,6 +405,120 @@ class CardTest(unittest.TestCase):
             self.assertEqual(on_disk["schedule"], "interval")
             self.assertEqual(on_disk["device_key"], key)
             self.assertFalse(on_disk["enabled"])
+
+
+class CardBooksTest(unittest.TestCase):
+    def setUp(self):
+        self.temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temporary.cleanup)
+        self.root = Path(self.temporary.name)
+        self.card = self.root / "card"
+        self.card.mkdir()
+        self.shelf = self.root / "shelf"
+        (self.shelf / "english").mkdir(parents=True)
+        (self.shelf / "Book One.epub").write_bytes(b"one")
+        (self.shelf / "english" / "Book Two.epub").write_bytes(b"two")
+        (self.shelf / "english" / "another-name.epub").write_bytes(b"one")  # same bytes as Book One
+        (self.shelf / "notes.txt").write_bytes(b"not a book")
+        self.volume = CardVolume(self.card, "disk9s1", UUID)
+        self.cache = Cache(self.root / "cache")
+        self.config = CardTest.config(self, self.root)
+
+    def sync(self):
+        return sync_card(self.cache, self.config, volume=self.volume, books_dir=self.shelf)
+
+    def test_copies_shelf_epubs_once_with_a_library_marker(self):
+        result = self.sync()["books"]["shelf"]
+        self.assertEqual((result["planned"], result["copied"], result["unchanged"], result["errors"]), (2, 2, 0, []))
+        library = self.card / card_module.BOOKS_DIR
+        self.assertEqual((library / "Book One.epub").read_bytes(), b"one")
+        self.assertEqual((library / "english" / "Book Two.epub").read_bytes(), b"two")
+        self.assertFalse((library / "english" / "another-name.epub").exists())
+        self.assertFalse((library / "notes.txt").exists())
+        self.assertTrue((self.card / card_module.LIBRARY_DIRTY).is_file())
+
+    def test_rerun_leaves_the_card_alone_and_writes_no_new_marker(self):
+        self.sync()
+        (self.card / card_module.LIBRARY_DIRTY).unlink()
+        before = sorted((str(path.relative_to(self.card)), path.read_bytes())
+                        for path in self.card.rglob("*") if path.is_file())
+        result = self.sync()["books"]["shelf"]
+        self.assertEqual((result["copied"], result["unchanged"], result["errors"]), (0, 2, []))
+        self.assertEqual(sorted((str(path.relative_to(self.card)), path.read_bytes())
+                                for path in self.card.rglob("*") if path.is_file()), before)
+        self.assertFalse((self.card / card_module.LIBRARY_DIRTY).exists())
+
+    def test_pre_hooks_backups_are_never_delivered_as_duplicate_books(self):
+        (self.shelf / "Book One.pre-hooks.epub").write_bytes(b"one, before the front card")
+        (self.shelf / "english" / "Book Two.PRE-HOOKS.EPUB").write_bytes(b"two, before the front card")
+        os.symlink(self.root / "missing.epub", self.shelf / "Book Three.pre-hooks.epub")
+        items, errors = card_module.local_book_items(self.shelf)
+        self.assertEqual(sorted(item["rel"] for item in items), ["Book One.epub", "english/Book Two.epub"])
+        self.assertEqual(errors, [])
+        result = self.sync()["books"]["shelf"]
+        self.assertEqual((result["planned"], result["copied"], result["errors"]), (2, 2, []))
+        delivered = sorted(path.relative_to(self.card / card_module.BOOKS_DIR).as_posix()
+                           for path in (self.card / card_module.BOOKS_DIR).rglob("*.epub"))
+        self.assertEqual(delivered, ["Book One.epub", "english/Book Two.epub"])
+
+    def test_different_card_bytes_are_preserved_under_a_collision_name(self):
+        library = self.card / card_module.BOOKS_DIR
+        library.mkdir(parents=True)
+        (library / "Book One.epub").write_bytes(b"robert's own copy")
+        result = self.sync()["books"]["shelf"]
+        self.assertEqual((result["copied"], result["errors"]), (2, []))
+        self.assertEqual((library / "Book One.epub").read_bytes(), b"robert's own copy")
+        self.assertEqual([path.read_bytes() for path in library.glob("Book One-*.epub")], [b"one"])
+
+    def test_a_missing_shelf_writes_nothing(self):
+        with self.assertRaisesRegex(ReaderError, "Local book shelf not found"):
+            sync_card(self.cache, self.config, volume=self.volume, books_dir=self.root / "nope")
+        self.assertEqual(list(self.card.iterdir()), [])
+        self.assertFalse((self.root / "annotations").exists())
+
+    def test_symlinked_shelf_books_are_reported_not_followed(self):
+        outside = self.root / "outside.epub"
+        outside.write_bytes(b"outside")
+        os.symlink(outside, self.shelf / "linked.epub")
+        result = self.sync()["books"]["shelf"]
+        self.assertEqual(result["planned"], 2)
+        self.assertEqual(len(result["errors"]), 1)
+        self.assertIn("symlink", result["errors"][0])
+        self.assertFalse((self.card / card_module.BOOKS_DIR / "linked.epub").exists())
+
+    def test_the_default_shelves_only_include_existing_sources(self):
+        with patch.object(card_module, "default_novels_dir", return_value=self.root / "novels"), \
+             patch.object(card_module, "default_books_dir", return_value=self.root / "books"):
+            self.assertEqual(card_module.default_shelves(), {})
+            (self.root / "books").mkdir()
+            self.assertEqual(card_module.default_shelves(), {"books": self.root / "books"})
+            (self.root / "novels").mkdir()
+            self.assertEqual(card_module.default_shelves(), {"books": self.root / "books"})
+            (self.root / "novels" / ".novels-manifest.json").write_text('{"version": 1, "entries": {}}')
+            self.assertEqual(card_module.default_shelves(),
+                             {"novels": self.root / "novels", "books": self.root / "books"})
+
+    def test_cli_parses_the_books_option(self):
+        args = cli.parser().parse_args(["card", "sync", "--books", str(self.shelf)])
+        self.assertEqual(args.books, self.shelf)
+        self.assertIsNone(cli.parser().parse_args(["card", "sync"]).books)
+
+    def test_card_sync_uses_the_default_shelves_and_an_explicit_option_wins(self):
+        calls = []
+
+        def recorded(cache, config, **options):
+            calls.append(options)
+            return {"books": {}}
+
+        with patch.object(card_module, "default_shelves", lambda: {"novels": Path("/novels"), "books": Path("/books")}), \
+                patch.object(card_module, "load_config", lambda path: self.config), \
+                patch.object(card_module, "sync_card", recorded), \
+                patch("sys.stdout", new_callable=io.StringIO):
+            self.assertEqual(cli.main(["--cache-dir", str(self.cache.root), "card", "sync"]), 0)
+            self.assertEqual(cli.main(["--cache-dir", str(self.cache.root), "card", "sync",
+                                       "--books", str(self.shelf)]), 0)
+        self.assertEqual((calls[0]["novels_dir"], calls[0]["books_dir"]), (Path("/novels"), Path("/books")))
+        self.assertEqual((calls[1]["novels_dir"], calls[1]["books_dir"]), (Path("/novels"), self.shelf))
 
 
 if __name__ == "__main__":

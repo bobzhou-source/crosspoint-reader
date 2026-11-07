@@ -10,7 +10,7 @@ from pathlib import Path
 
 from . import __version__
 from .cache import ID_PATTERN, Cache, default_cache
-from .common import ReaderError, atomic_write, bounded_read, filename, http_url
+from .common import ReaderError, atomic_write, bounded_read, digest, filename, http_url
 from .epub import build_epub
 from .extract import extract
 from .localsend import Device, discover, endpoint, send
@@ -19,7 +19,8 @@ from .sources import load_sources
 from . import subscriptions as publications
 from .x_adapter import api_thread, load_export, thread_item
 from .x_browser import DEFAULT_CDP_ENDPOINT, capture_x_url
-from . import assist, card, card_autosync, cloud_cli, novels, x_following, collect
+from . import assist, book_hooks, card, card_autosync, cloud_cli, crossfire as crossfire_module, \
+    feed_digest, inbox_card, novels, x_following, collect
 
 
 def seconds(value: str) -> float:
@@ -167,7 +168,11 @@ def parser() -> argparse.ArgumentParser:
     cache_option(card_sync)
     config_option(card_sync)
     card_sync.add_argument("--novels", type=Path, metavar="OUT_DIR",
-                           help="also copy the EPUBs converted by `novels convert` into /books/Novels on the card")
+                           help="copy the EPUBs converted by `novels convert` into /books/Novels (default: ~/papyrix/novels-epub when it has a manifest)")
+    card_sync.add_argument("--books", type=Path, metavar="DIR",
+                           help="copy the EPUBs of one local shelf folder into /books/Books (default: ~/papyrix/books when it exists)")
+    card_sync.add_argument("--crossfire", action="store_true",
+                           help="after importing annotations, build a Cross-Fire card in /books/Inbox")
     card_status = card_actions.add_parser("status", help="Report whether the exact configured card is mounted; read-only")
     cache_option(card_status)
     config_option(card_status)
@@ -183,6 +188,22 @@ def parser() -> argparse.ArgumentParser:
     card_autosync_parser.add_argument("--log", type=Path, default=card_autosync.default_log_path(),
                                       help="append a short run log here (default ~/Library/Logs/reader-card-autosync.log)")
     card_autosync_parser.add_argument("--no-notify", action="store_true", help="do not post a macOS notification")
+    card_autosync_parser.add_argument("--crossfire", action="store_true",
+                                      help="after importing annotations, build a Cross-Fire card in /books/Inbox")
+    for name, description in (
+            ("repack", "Plan daily X digests from the single X-post EPUBs in /books/Inbox; --apply writes them and "
+                       "moves the singles to /books/Inbox/.singles-archive/ (never deletes)"),
+            ("cleanup", "Plan the Inbox auto-delete pass (finished/expired feed items to /books/Inbox/.trash/); "
+                        "--apply performs it")):
+        maintenance = card_actions.add_parser(name, help=description)
+        cache_option(maintenance)
+        config_option(maintenance)
+        maintenance.add_argument("--root", type=Path,
+                                 help="mounted card folder (default: resolve the configured card UUID)")
+        maintenance.add_argument("--apply", action="store_true", help="change the card; the default is a dry run")
+        if name == "repack":
+            maintenance.add_argument("--timezone", default=feed_digest.DEFAULT_TZ,
+                                     help=f"local day for grouping (default {feed_digest.DEFAULT_TZ})")
     card_update = card_actions.add_parser("update", help="Stage one reviewed firmware image on the card; never flashes")
     cache_option(card_update)
     config_option(card_update)
@@ -205,6 +226,8 @@ def parser() -> argparse.ArgumentParser:
     novels_convert.add_argument("--jobs", type=int, choices=range(1, 33), metavar="N", default=novels.default_jobs(),
                                 help="parallel conversion processes (default: one fewer than the CPU count, at most 6)")
     novels_convert.add_argument("--force", action="store_true", help="reconvert every book even when its source hash is unchanged")
+    novels_convert.add_argument("--rebuild-stale", action="store_true",
+                                help="reconvert only books built by an older text handling (missing or older text_clean revision)")
     novels_convert.add_argument("--json", action="store_true", help="print the full per-book report instead of the summary")
     scheduled = commands.add_parser("collect", help="Run recent subscriptions and X Following, then push/pull the private reader site")
     cache_option(scheduled)
@@ -215,6 +238,31 @@ def parser() -> argparse.ArgumentParser:
     inbox.add_argument("id", help="cached article ID")
     inbox.add_argument("--state", choices=("unread", "reading", "read"), required=True)
     inbox.add_argument("--progress", type=float, help="fraction from 0 to 1; defaults to 0/unread or 1/read")
+    hooks = commands.add_parser("hooks", help="Insert a 'Sharpest Passages' front card into a real EPUB book")
+    hooks.add_argument("book", type=Path, help="EPUB file (rewritten in place unless --output is given)")
+    hooks.add_argument("--output", "-o", type=Path, help="write the hooked copy here instead of replacing the book")
+    hooks.add_argument("--count", type=int, default=book_hooks.DEFAULT_COUNT,
+                       help=f"passages on the front card (1–12; default {book_hooks.DEFAULT_COUNT})")
+    hooks.add_argument("--minimum", type=int, default=book_hooks.DEFAULT_MINIMUM,
+                       help=f"refuse the book below this many strong passages (default {book_hooks.DEFAULT_MINIMUM})")
+    hooks.add_argument("--no-backup", action="store_true", help="do not keep a .pre-hooks.epub copy of the original")
+    hooks.add_argument("--dry-run", action="store_true", help="print the selected passages; write nothing")
+    crossfire = commands.add_parser(
+        "crossfire", help="Pair imported reader annotations with Substack replies and build an Inbox card")
+    crossfire.add_argument("--annotations", type=Path,
+                           help="annotation JSON/NDJSON file or directory (default: the mounted card's store)")
+    crossfire.add_argument("--config", type=Path, help="card configuration used to find the attached card")
+    crossfire.add_argument("--corpus", type=Path, help="Substack Markdown archive (default ~/substack-corpus)")
+    crossfire.add_argument("--neighbors", type=Path,
+                           help="neighbour JSONL folder (default ~/substack-neighbors/posts)")
+    crossfire.add_argument("--inbox", type=Path, help="output folder for the card (default <card>/books/Inbox)")
+    crossfire.add_argument("--out", type=Path, help="one explicit output EPUB path")
+    crossfire.add_argument("--db", type=Path, help="SQLite FTS5 index cache path")
+    crossfire.add_argument("--replies", type=int, default=crossfire_module.DEFAULT_REPLIES,
+                           help=f"contrasting passages per annotation (1–6; default {crossfire_module.DEFAULT_REPLIES})")
+    crossfire.add_argument("--limit", type=int, default=crossfire_module.DEFAULT_CANDIDATES,
+                           help="candidate chunks ranked per query (1–5000)")
+    crossfire.add_argument("--dry-run", action="store_true", help="print matches; write nothing")
     cloud_cli.add_parser(commands, cache_option, seconds)
     assist.add_parser(commands, seconds)
     return root
@@ -429,6 +477,27 @@ def subscription_command(args, cache: Cache) -> int:
         time.sleep(args.interval)
 
 
+def inbox_command(args, cache: Cache, config_path) -> int:
+    """card repack / card cleanup: dry runs by default, on --root or the configured card."""
+    if args.root is not None:
+        root = args.root.expanduser().resolve()
+        if not (root / inbox_card.INBOX).is_dir():
+            raise ReaderError(f"{root} has no books/Inbox folder")
+        state_key = "root-" + digest(str(root))[:16]
+    else:
+        volume = card.resolve_card(card.load_config(config_path)["volume_uuid"])
+        root, state_key = volume.root, volume.volume_uuid
+    if args.card_operation == "repack":
+        plan = inbox_card.plan_repack(root, args.timezone)
+        result = {"dry_run": not args.apply, **inbox_card.describe_repack(plan)}
+        if args.apply:
+            result["applied"] = inbox_card.apply_repack(root, plan)
+        emit(result)
+        return 0
+    emit(inbox_card.run_cleanup(root, inbox_card.state_path(cache.root, state_key), apply=args.apply))
+    return 0
+
+
 def card_command(args, cache: Cache) -> int:
     config_path = args.config or card.default_config_path()
     if args.card_operation == "setup":
@@ -436,19 +505,31 @@ def card_command(args, cache: Cache) -> int:
                         annotations_dir=args.annotations_dir, firmware_path=args.firmware,
                         firmware_sha256=args.sha256, launchers_dir=args.launchers_dir))
         return 0
+    if args.card_operation in ("repack", "cleanup"):
+        return inbox_command(args, cache, config_path)
     config = card.load_config(config_path)
     if args.card_operation == "status":
         result, mounted = card.card_status(config)
         emit(result)
         return 0 if mounted else 1
     if args.card_operation == "sync":
-        result = card.sync_card(cache, config, novels_dir=args.novels)
+        shelves = card.default_shelves()
+        result = card.sync_card(
+            cache, config,
+            novels_dir=args.novels if args.novels is not None else shelves.get("novels"),
+            books_dir=args.books if args.books is not None else shelves.get("books"),
+            crossfire=True if args.crossfire else None)
+        failures = [*result.get("novels", {}).get("errors", []),
+                    *result.get("books", {}).get("shelf", {}).get("errors", [])]
         emit(result)
-        return 2 if result.get("novels", {}).get("errors") else 0
+        return 2 if failures else 0
     if args.card_operation == "autosync":
+        shelves = card.default_shelves()
         result = card_autosync.autosync(
             cache, config, batch=args.batch, passes=args.passes, log=card_autosync.RunLog(args.log),
-            notify=None if args.no_notify else card_autosync.macos_notification)
+            notify=None if args.no_notify else card_autosync.macos_notification,
+            novels_dir=shelves.get("novels"), books_dir=shelves.get("books"),
+            crossfire=True if args.crossfire else None)
         emit(result)
         return 2 if result["status"] in {"error", "rate_limited"} else 0
     if args.card_operation == "provision":
@@ -469,10 +550,22 @@ def novels_command(args) -> int:
             detail = f"{record.get('mode')}, {record.get('chapters', 0)} chapters, {record.get('files', 0)} files"
         print(f"[{done}/{total}] {record['status']}: {record['source']} ({detail})", file=sys.stderr, flush=True)
 
-    report = novels.convert_tree(args.src, args.out, force=args.force, jobs=args.jobs, progress=progress)
+    report = novels.convert_tree(args.src, args.out, force=args.force, jobs=args.jobs,
+                                 rebuild_stale=args.rebuild_stale, progress=progress)
     failures = [{"source": b["source"], "error": b["error"]} for b in report["books"] if b["status"] == "failed"]
     emit(report if args.json else {"summary": report["summary"], "failures": failures})
     return 2 if failures else 0
+
+
+def hooks_command(args) -> int:
+    if args.dry_run:
+        passages = book_hooks.select_passages(args.book, count=args.count, minimum=args.minimum)
+        emit({"book": str(args.book), "passages": [passage.as_dict() for passage in passages]})
+        return 0
+    result = book_hooks.apply_hooks(args.book, args.output, count=args.count,
+                                    minimum=args.minimum, backup=not args.no_backup)
+    emit(result.as_dict())
+    return 0
 
 
 def run(args) -> int:
@@ -484,6 +577,11 @@ def run(args) -> int:
         return 0
     if args.command == "novels":
         return novels_command(args)
+    if args.command == "hooks":
+        return hooks_command(args)
+    if args.command == "crossfire":
+        emit(crossfire_module.run(args))
+        return 0
     cache = Cache(args.cache_dir)
     if args.command == "card":
         return card_command(args, cache)
