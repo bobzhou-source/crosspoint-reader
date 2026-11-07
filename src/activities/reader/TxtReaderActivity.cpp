@@ -16,10 +16,14 @@
 #include <cstring>
 
 #include "CrossPointSettings.h"
+#include "DictionaryPageWords.h"
+#include "DictionaryWordSelectActivity.h"
 #include "EpubReaderPercentSelectionActivity.h"
 #include "ProgressFile.h"
 #include "ReaderActivity.h"
+#include "ReaderTouchZones.h"
 #include "ReaderUtils.h"
+#include "ReaderWordPage.h"
 #include "TxtReaderChapterSelectionActivity.h"
 #include "TxtReaderMenuActivity.h"
 #include "TxtReaderPageSelectionActivity.h"
@@ -175,7 +179,13 @@ void TxtReaderActivity::onExit() {
 }
 
 void TxtReaderActivity::loop() {
+  // A held word opens its definition instead of turning the page on release.
+  if (handleWordHold()) return;
   ReaderActivity::loop();
+  if (showDictionaryMessage && (millis() - dictionaryMessageTime) >= ReaderUtils::BOOKMARK_MESSAGE_DURATION_MS) {
+    showDictionaryMessage = false;
+    requestUpdate();
+  }
   indexInBackground();
 }
 
@@ -539,47 +549,131 @@ void TxtReaderActivity::renderBook() {
   saveProgress();
 }
 
+int TxtReaderActivity::lineX(GfxRenderer& renderer, const DisplayLine& line) const {
+  const char* text = line.text.c_str();
+  int x = cachedOrientedMarginLeft;
+  uint8_t effectiveAlignment = cachedParagraphAlignment;
+  // A leading RTL run turns left/justified lines into right-aligned ones.
+  if ((effectiveAlignment == CrossPointSettings::LEFT_ALIGN ||
+       effectiveAlignment == CrossPointSettings::JUSTIFIED) &&
+      BidiUtils::startsWithRtl(text, BidiUtils::RTL_PARAGRAPH_PROBE_DEPTH)) {
+    effectiveAlignment = CrossPointSettings::RIGHT_ALIGN;
+  }
+
+  // Apply text alignment; a paragraph's first line is laid out `indent` narrower.
+  switch (effectiveAlignment) {
+    case CrossPointSettings::LEFT_ALIGN:
+    default:
+      x += line.indent;
+      break;
+    case CrossPointSettings::CENTER_ALIGN: {
+      const int textWidth = renderer.getTextAdvanceX(cachedFontId, text, EpdFontFamily::REGULAR);
+      x = cachedOrientedMarginLeft + line.indent + (viewportWidth - line.indent - textWidth) / 2;
+      break;
+    }
+    case CrossPointSettings::RIGHT_ALIGN: {
+      const int textWidth = renderer.getTextAdvanceX(cachedFontId, text, EpdFontFamily::REGULAR);
+      x = cachedOrientedMarginLeft + viewportWidth - textWidth;
+      break;
+    }
+    case CrossPointSettings::JUSTIFIED:
+      x += line.indent;
+      break;
+  }
+  return x;
+}
+
+std::unique_ptr<ReaderWordPage> TxtReaderActivity::makeWordPage(GfxRenderer& renderer) {
+  if (!initialized || currentPageLines.empty()) return nullptr;
+  std::vector<TxtReaderWordPage::Line> lines;
+  lines.reserve(currentPageLines.size());
+  const int lineHeight = renderer.getLineHeight(cachedFontId);
+  int y = cachedOrientedMarginTop;
+  for (const auto& line : currentPageLines) {
+    if (!line.text.empty()) lines.push_back({line.text, lineX(renderer, line), y});
+    y += lineHeight;
+  }
+  if (lines.empty()) return nullptr;
+  return makeUniqueNoThrow<TxtReaderWordPage>(std::move(lines));
+}
+
+bool TxtReaderActivity::openDictionaryWordSelect() {
+  if (SETTINGS.dictionaryName[0] == '\0') {
+    showDictionaryMessage = true;
+    dictionaryMessageTime = millis();
+    requestUpdate();
+    return false;
+  }
+  std::unique_ptr<ReaderWordPage> page;
+  {
+    RenderLock lock;
+    page = makeWordPage(renderer);
+  }
+  if (!page) return false;
+  startActivityForResult(std::make_unique<DictionaryWordSelectActivity>(
+                             renderer, mappedInput, std::move(page), cachedOrientedMarginLeft,
+                             cachedOrientedMarginTop),
+                         [this](const ActivityResult&) { requestUpdate(); });
+  return true;
+}
+
+bool TxtReaderActivity::handleWordHold() {
+  int x = 0;
+  int y = 0;
+  if (!initialized || isAtEndOfBook() || !SETTINGS.touchReaderControls || !mappedInput.hasTouch() ||
+      !mappedInput.peekScreenLongPress(x, y)) {
+    return false;
+  }
+  const auto zone = ReaderUtils::touchZoneAt(renderer, x, y, /*rtlBook=*/false);
+  const bool zoneHoldActions = ReaderUtils::touchZoneHoldActions();
+  if (ReaderTouchZones::zoneOwnsHold(zone, zoneHoldActions)) return false;
+
+  // The hit test runs on the reader's own page before anything is pushed, so
+  // a hold on blank space changes nothing on screen.
+  std::unique_ptr<ReaderWordPage> page;
+  std::vector<DictionaryPageWords::WordBox> words;
+  uint16_t rowCount = 0;
+  int hit = -1;
+  {
+    RenderLock lock;
+    page = makeWordPage(renderer);
+    if (!page) return false;
+    const int fontId = SETTINGS.getReaderFontId();
+    page->extractWords(renderer, fontId, 0, 0, words, rowCount);
+    hit = DictionaryPageWords::wordNear(words, x, y, renderer.getLineHeight(fontId));
+  }
+  switch (ReaderTouchZones::holdAction(zone, zoneHoldActions, hit >= 0, SETTINGS.dictionaryName[0] != '\0')) {
+    case ReaderTouchZones::HoldAction::None:
+      return false;
+    case ReaderTouchZones::HoldAction::NoDictionary:
+      mappedInput.suppressScreenContact();
+      showDictionaryMessage = true;
+      dictionaryMessageTime = millis();
+      requestUpdate();
+      return true;
+    case ReaderTouchZones::HoldAction::Lookup:
+      break;
+  }
+  mappedInput.suppressScreenContact();
+  auto lookup = makeUniqueNoThrow<DictionaryWordSelectActivity>(renderer, mappedInput, std::move(page), 0, 0,
+                                                                std::move(words), rowCount, hit);
+  if (!lookup) {
+    LOG_ERR("TRS", "OOM: DictionaryWordSelectActivity");
+    return true;
+  }
+  startActivityForResult(std::move(lookup), [this](const ActivityResult&) { requestUpdate(); });
+  return true;
+}
+
 void TxtReaderActivity::renderPage(GfxRenderer& renderer) {
   const int lineHeight = renderer.getLineHeight(cachedFontId);
-  const int contentWidth = viewportWidth;
 
   // Render text lines with alignment
   auto renderLines = [&]() {
     int y = cachedOrientedMarginTop;
     for (const auto& line : currentPageLines) {
       if (!line.text.empty()) {
-        const char* text = line.text.c_str();
-        int x = cachedOrientedMarginLeft;
-        uint8_t effectiveAlignment = cachedParagraphAlignment;
-        // A leading RTL run turns left/justified lines into right-aligned ones.
-        if ((effectiveAlignment == CrossPointSettings::LEFT_ALIGN ||
-             effectiveAlignment == CrossPointSettings::JUSTIFIED) &&
-            BidiUtils::startsWithRtl(text, BidiUtils::RTL_PARAGRAPH_PROBE_DEPTH)) {
-          effectiveAlignment = CrossPointSettings::RIGHT_ALIGN;
-        }
-
-        // Apply text alignment; a paragraph's first line is laid out `indent` narrower.
-        switch (effectiveAlignment) {
-          case CrossPointSettings::LEFT_ALIGN:
-          default:
-            x += line.indent;
-            break;
-          case CrossPointSettings::CENTER_ALIGN: {
-            const int textWidth = renderer.getTextAdvanceX(cachedFontId, text, EpdFontFamily::REGULAR);
-            x = cachedOrientedMarginLeft + line.indent + (contentWidth - line.indent - textWidth) / 2;
-            break;
-          }
-          case CrossPointSettings::RIGHT_ALIGN: {
-            const int textWidth = renderer.getTextAdvanceX(cachedFontId, text, EpdFontFamily::REGULAR);
-            x = cachedOrientedMarginLeft + contentWidth - textWidth;
-            break;
-          }
-          case CrossPointSettings::JUSTIFIED:
-            x += line.indent;
-            break;
-        }
-
-        renderer.drawText(cachedFontId, x, y, text);
+        renderer.drawText(cachedFontId, lineX(renderer, line), y, line.text.c_str());
       }
       y += lineHeight;
     }
@@ -603,6 +697,10 @@ void TxtReaderActivity::renderPage(GfxRenderer& renderer) {
     }
   } else {
     ReaderUtils::displayAdaptive(renderer, refreshPolicy);
+  }
+
+  if (showDictionaryMessage) {
+    GUI.drawPopup(renderer, tr(STR_DICT_NO_DICT_SET));
   }
 }
 
@@ -704,6 +802,9 @@ void TxtReaderActivity::openMenu() {
             break;
           case TxtReaderMenuActivity::MenuAction::GO_TO_PERCENT:
             openPercentSelection();
+            break;
+          case TxtReaderMenuActivity::MenuAction::DICTIONARY:
+            openDictionaryWordSelect();
             break;
           case TxtReaderMenuActivity::MenuAction::REFRESH_SCREEN: {
             RenderLock lock;

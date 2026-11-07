@@ -1,12 +1,12 @@
 #pragma once
 
-#include <Epub/Page.h>
 #include <I18n.h>
 
 #include <memory>
 #include <vector>
 
 #include "DictionaryPageWords.h"
+#include "ReaderWordPage.h"
 #include "activities/Activity.h"
 #include "util/Dictionary.h"
 
@@ -23,7 +23,7 @@ class DictionaryWordSelectActivity final : public Activity {
   using WordBox = DictionaryPageWords::WordBox;
 
   explicit DictionaryWordSelectActivity(GfxRenderer& renderer, MappedInputManager& mappedInput,
-                                        std::unique_ptr<Page> page, int marginLeft, int marginTop)
+                                        std::unique_ptr<ReaderWordPage> page, int marginLeft, int marginTop)
       : Activity("DictionaryWordSelect", renderer, mappedInput),
         page(std::move(page)),
         marginLeft(marginLeft),
@@ -31,9 +31,9 @@ class DictionaryWordSelectActivity final : public Activity {
 
   // Direct mode: `words` were extracted from `page` and words[selected] is the
   // word to look up.
-  DictionaryWordSelectActivity(GfxRenderer& renderer, MappedInputManager& mappedInput, std::unique_ptr<Page> page,
-                               int marginLeft, int marginTop, std::vector<WordBox>&& words, uint16_t rowCount,
-                               int selected)
+  DictionaryWordSelectActivity(GfxRenderer& renderer, MappedInputManager& mappedInput,
+                               std::unique_ptr<ReaderWordPage> page, int marginLeft, int marginTop,
+                               std::vector<WordBox>&& words, uint16_t rowCount, int selected)
       : Activity("DictionaryWordSelect", renderer, mappedInput),
         page(std::move(page)),
         marginLeft(marginLeft),
@@ -57,7 +57,7 @@ class DictionaryWordSelectActivity final : public Activity {
   bool drawHighlightWithSnapshot();
   void drawHints() const;
 
-  std::unique_ptr<Page> page;
+  std::unique_ptr<ReaderWordPage> page;
   const int marginLeft;
   const int marginTop;
   const bool direct = false;

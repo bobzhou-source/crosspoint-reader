@@ -37,7 +37,7 @@ void DictionaryWordSelectActivity::onEnter() {
   // fast path (drawHighlightWithSnapshot skips the read), keeping the
   // full-repaint path as the fallback.
   snapshot = makeUniqueNoThrow<uint8_t[]>(SNAPSHOT_CAPACITY);
-  DictionaryPageWords::extract(renderer, *page, fontId, marginLeft, marginTop, words, rowCount);
+  if (page) page->extractWords(renderer, fontId, marginLeft, marginTop, words, rowCount);
   // Start on the middle row's word nearest mid-screen instead of top-left:
   // any word on the page is then at most half a page of moves away.
   if (!words.empty()) {
@@ -192,11 +192,12 @@ void DictionaryWordSelectActivity::loop() {
 
   if (words.empty()) return;
 
-  // Touch: a touch-down moves the highlight to the touched word (differential
-  // repaint), a tap on a word selects and looks it up in one go.
+  // Touch: the highlight follows the finger from the first frame of contact
+  // (and while dragging), so a press visibly selects; a tap on a word then
+  // looks it up on release.
   int tx = 0;
   int ty = 0;
-  if (mappedInput.wasScreenTouchDown(tx, ty)) {
+  if (mappedInput.isScreenTouchHeld(tx, ty)) {
     const int hit = DictionaryPageWords::wordAt(words, tx, ty, lineHeight);
     if (hit >= 0 && hit != selected) {
       selected = hit;
@@ -296,9 +297,9 @@ void DictionaryWordSelectActivity::drawPage() {
   renderer.clearScreen();
   auto* fcm = renderer.getFontCacheManager();
   auto scope = fcm->createPrewarmScope();
-  page->render(renderer, fontId, marginLeft, marginTop);
+  if (page) page->render(renderer, fontId, marginLeft, marginTop);
   scope.endScanAndPrewarm();
-  page->render(renderer, fontId, marginLeft, marginTop);
+  if (page) page->render(renderer, fontId, marginLeft, marginTop);
 }
 
 void DictionaryWordSelectActivity::render(RenderLock&&) {

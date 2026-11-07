@@ -347,8 +347,10 @@ class CrossPointSettings : public PersistableStore<CrossPointSettings> {
   // Master reader-touch toggle on boards with a touch controller.
   uint8_t touchReaderControls = TOUCH_READER_ON;
   // Which gestures turn the page in each direction (PAGE_TURN_GESTURE).
-  uint8_t pageTurnGesture = SWIPE_ONLY;
-  uint8_t previousPageGesture = SWIPE_ONLY;
+  // Tap is on by default; pre-schema SWIPE_ONLY files are upgraded once on load
+  // (see PageTurnGestureMigration.h), and an explicit later choice is kept.
+  uint8_t pageTurnGesture = TAP_AND_SWIPE;
+  uint8_t previousPageGesture = TAP_AND_SWIPE;
   // Reader menu open gesture (SHOW_READER_MENU: off / center tap / bottom-edge
   // up-swipe). Only surfaced on home-key boards, where Home is the capacitive
   // key and the bottom edge is free; elsewhere it stays at the Tap default.

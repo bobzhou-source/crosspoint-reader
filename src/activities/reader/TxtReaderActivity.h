@@ -12,6 +12,8 @@
 #include "CrossPointSettings.h"
 #include "ReaderActivity.h"
 
+class ReaderWordPage;
+
 class TxtReaderActivity final : public ReaderActivity {
  public:
   // One display line of the current page and its first-line indent in pixels.
@@ -49,6 +51,9 @@ class TxtReaderActivity final : public ReaderActivity {
   bool cjkParagraphs = false;
   int firstLineIndent = 0;
   bool initialized = false;
+  // "No dictionary selected" note after a hold or the menu's Dictionary entry.
+  bool showDictionaryMessage = false;
+  unsigned long dictionaryMessageTime = 0UL;
 
   // Retained source handle and 8KB page window, shared by indexing and page renders.
   TxtPagination::SourceWindow sourceWindow;
@@ -72,6 +77,16 @@ class TxtReaderActivity final : public ReaderActivity {
 
   void renderPage(GfxRenderer& renderer);
   void initializeReader(GfxRenderer& renderer);
+  // Screen x of a display line under the current alignment and RTL rule.
+  int lineX(GfxRenderer& renderer, const DisplayLine& line) const;
+  // A snapshot of the displayed lines and their positions, for the dictionary
+  // picker and hold lookup. Requires the render lock.
+  std::unique_ptr<ReaderWordPage> makeWordPage(GfxRenderer& renderer);
+  // Opens the picker on the current page; false when there is no page yet.
+  bool openDictionaryWordSelect();
+  // Press and hold on a word: look it up directly. True when the hold was
+  // taken (lookup or "no dictionary" note).
+  bool handleWordHold();
   // Lays out the page at `offset` into `outLines`.
   bool loadPageAtOffset(const GfxRenderer& renderer, size_t offset, std::vector<DisplayLine>& outLines,
                         size_t& nextOffset);

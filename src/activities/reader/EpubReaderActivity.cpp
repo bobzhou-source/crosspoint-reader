@@ -31,6 +31,7 @@
 #include "CrossPointSettings.h"
 #include "CrossPointState.h"
 #include "DictionaryWordSelectActivity.h"
+#include "ReaderWordPage.h"
 #include "EpubPictureViewerActivity.h"
 #include "EpubReaderBookmarksActivity.h"
 #include "EpubReaderChapterSelectionActivity.h"
@@ -367,8 +368,13 @@ void EpubReaderActivity::openDictionaryWordSelect() {
   int marginLeft = 0;
   int marginTop = 0;
   pageTextMargins(marginLeft, marginTop);
+  auto view = makeUniqueNoThrow<EpubReaderWordPage>(std::move(page));
+  if (!view) {
+    LOG_ERR("ERA", "OOM: EpubReaderWordPage");
+    return;
+  }
   startActivityForResult(
-      std::make_unique<DictionaryWordSelectActivity>(renderer, mappedInput, std::move(page), marginLeft, marginTop),
+      std::make_unique<DictionaryWordSelectActivity>(renderer, mappedInput, std::move(view), marginLeft, marginTop),
       [this](const ActivityResult&) { requestUpdate(); });
 }
 
@@ -382,7 +388,7 @@ bool EpubReaderActivity::handleWordHold() {
 
   // The hit test runs on the reader's own page before anything is pushed, so
   // a hold on blank space changes nothing on screen.
-  std::unique_ptr<Page> page;
+  std::unique_ptr<ReaderWordPage> page;
   std::vector<DictionaryPageWords::WordBox> words;
   uint16_t rowCount = 0;
   int hit = -1;
@@ -390,11 +396,13 @@ bool EpubReaderActivity::handleWordHold() {
   int marginTop = 0;
   {
     RenderLock lock;  // the font cache and section file are shared with the render task
-    page = section->loadPage(section->currentPage);
+    auto loaded = section->loadPage(section->currentPage);
+    if (!loaded) return false;
+    page = makeUniqueNoThrow<EpubReaderWordPage>(std::move(loaded));
     if (!page) return false;
     pageTextMargins(marginLeft, marginTop);
     const int fontId = SETTINGS.getReaderFontId();
-    DictionaryPageWords::extract(renderer, *page, fontId, marginLeft, marginTop, words, rowCount);
+    page->extractWords(renderer, fontId, marginLeft, marginTop, words, rowCount);
     hit = DictionaryPageWords::wordNear(words, x, y, renderer.getLineHeight(fontId));
   }
   switch (ReaderTouchZones::holdAction(zone, zoneHoldActions, hit >= 0, SETTINGS.dictionaryName[0] != '\0')) {
