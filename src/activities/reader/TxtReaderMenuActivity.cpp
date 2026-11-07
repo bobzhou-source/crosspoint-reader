@@ -15,11 +15,20 @@
 namespace fui = freeink::ui;
 
 TxtReaderMenuActivity::TxtReaderMenuActivity(GfxRenderer& renderer, MappedInputManager& mappedInput,
-                                             std::string title, const Status& status)
+                                             std::string title, const Status& status, const boomerang::Row& breakRow)
     : UiListActivity("TxtReaderMenu", renderer, mappedInput), title(std::move(title)), status(status) {
   const auto add = [this](const MenuAction action, const StrId label) {
-    if (menuItemCount < MAX_MENU_ITEMS) menuItems[menuItemCount++] = {action, label};
+    if (menuItemCount < MAX_MENU_ITEMS) menuItems[menuItemCount++] = {action, label, {}};
   };
+  if (!breakRow.backToTitle.empty()) {
+    // A Quick Break opened this book: the way back is the first thing wanted.
+    if (menuItemCount < MAX_MENU_ITEMS) {
+      menuItems[menuItemCount++] = {MenuAction::QUICK_BREAK, StrId::STR_BACK_TO,
+                                    std::string(tr(STR_BACK_TO)) + " " + breakRow.backToTitle};
+    }
+  } else if (breakRow.quickBreak) {
+    add(MenuAction::QUICK_BREAK, StrId::STR_QUICK_BREAK);
+  }
   add(MenuAction::CONTENTS, StrId::STR_SELECT_CHAPTER);
   add(MenuAction::READING_STATS, StrId::STR_READING_STATS);
   add(MenuAction::GO_TO_PAGE, StrId::STR_GO_TO_PAGE);
@@ -31,7 +40,9 @@ TxtReaderMenuActivity::TxtReaderMenuActivity(GfxRenderer& renderer, MappedInputM
 
   for (size_t i = 0; i < menuItemCount; i++) {
     fui::ListItem item;
-    item.label = I18N.get(menuItems[i].labelId);
+    // The Quick Break row carries its own label; its std::string lives in
+    // menuItems, which is not mutated after construction.
+    item.label = menuItems[i].label.empty() ? I18N.get(menuItems[i].labelId) : menuItems[i].label.c_str();
     item.actionValue = static_cast<int16_t>(i);
     menuRowItems[i] = item;
   }

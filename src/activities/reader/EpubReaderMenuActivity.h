@@ -5,6 +5,7 @@
 #include <string>
 #include <vector>
 
+#include "Boomerang.h"
 #include "activities/UiListActivity.h"
 #include "components/OptionPopup.h"
 
@@ -30,19 +31,29 @@ class EpubReaderMenuActivity final : public UiListActivity {
     SYNC,
     DELETE_CACHE,
     DICTIONARY,
-    READING_STATS
+    READING_STATS,
+    // Quick Break: leave this book for one unread Inbox item, or come back to the
+    // book the break was taken from. One action covers both directions; the
+    // reader decides which by the live break state.
+    QUICK_BREAK
   };
 
   struct MenuItem {
     MenuAction action;
     StrId labelId;
+    // Row label override, for the context-dependent "Back to <book>" row. Empty
+    // means the localized labelId is used.
+    std::string label;
   };
 
-  static void buildMenuItems(std::vector<MenuItem>& items, bool hasFootnotes, bool hasBookmarks);
+  // The Quick Break row as this reader should draw it (see boomerang::Row).
+  static void buildMenuItems(std::vector<MenuItem>& items, bool hasFootnotes, bool hasBookmarks,
+                             const boomerang::Row& breakRow = {});
 
   explicit EpubReaderMenuActivity(GfxRenderer& renderer, MappedInputManager& mappedInput, const std::string& title,
                                   const int currentPage, const int totalPages, const int bookProgressPercent,
-                                  const uint8_t currentOrientation, const bool hasFootnotes, bool hasBookmarks);
+                                  const uint8_t currentOrientation, const bool hasFootnotes, bool hasBookmarks,
+                                  const boomerang::Row& breakRow = {});
 
   void render(RenderLock&&) override;
   bool handleHomeGesture() override;
@@ -52,7 +63,7 @@ class EpubReaderMenuActivity final : public UiListActivity {
   // fixed-capacity array avoids any heap allocation for the row list. Labels
   // are set once in the constructor (buildMenuRowItems()); buildScreen()
   // only refreshes rows whose values reflect live state.
-  static constexpr size_t MAX_MENU_ITEMS = 19;
+  static constexpr size_t MAX_MENU_ITEMS = 20;
   freeink::ui::ListItem menuRowItems[MAX_MENU_ITEMS]{};
   void buildMenuRowItems();
 

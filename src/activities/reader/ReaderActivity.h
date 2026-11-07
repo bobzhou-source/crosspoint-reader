@@ -8,6 +8,7 @@
 #include <utility>
 
 #include "EndOfBookOptions.h"
+#include "Boomerang.h"
 #include "activities/Activity.h"
 
 struct AnnotationEntry;
@@ -63,6 +64,22 @@ class ReaderActivity : public Activity {
   bool handleEndOfBookMenu(bool suppressConfirmRelease = false);
   bool handleEndOfBookPageTurn(bool prevTriggered, bool nextTriggered);
   void clearEndOfBookOptionsIfNeeded();
+
+  // Quick Break (the "Substack boomerang"). Opening one records this book as the
+  // return target -- the page itself is already saved by normal progress -- and
+  // opens one unread Inbox item; when that item ends the reader comes back here.
+  bool boomerangBreakActive() const;
+  bool isInboxBook() const;
+  std::string boomerangReturnTitle() const;
+  // False when this book is the Inbox itself or nothing unread is waiting there.
+  bool startBoomerangBreak();
+  // Back to the recorded book, unless this already is it or it disappeared.
+  bool returnFromBoomerang();
+  // Auto-return: the Inbox item a break opened has just reached its end.
+  bool handleBoomerangEndOfBook();
+  // How this reader's menu should draw its Quick Break row: the way back while a
+  // break is open, otherwise the way out when the Inbox has something unread.
+  boomerang::Row boomerangRow();
   void disableFastInitialRefresh();
 
  public:

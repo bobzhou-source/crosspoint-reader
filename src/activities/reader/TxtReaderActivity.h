@@ -108,6 +108,10 @@ class TxtReaderActivity final : public ReaderActivity {
 
   void renderStatusBar() const;
   size_t estimatedBytesPerPage() const;
+  // Micro-checkpoint countdown for the page on screen ("2p to break"), recomputed
+  // whenever a page is laid out. Empty when no countdown is due.
+  std::string pacingHint;
+  void updatePacingHint();
   int displayedPageNumber() const;
   // Exact once indexing is complete, an estimate before.
   int displayedPageCount() const;
