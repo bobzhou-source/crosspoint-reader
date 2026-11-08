@@ -3,10 +3,11 @@
 Each EPUB in the card's /books/Inbox and /books/Books gets one 192-byte ICPT
 record whose vector is computed here exactly as the firmware ConceptEngine
 computes it: the int8 Platonic H-Net in `platonic-hnet.bin` (plus the optional
-`engram.bin` table) when the model exists, otherwise the model-free byte-trigram
-hash encoder. Inputs are capped at 256 bytes. The integer forward runs on numpy
-when it is installed (milliseconds per book) and in pure Python otherwise
-(about a second per book); both give identical bytes.
+`engram.bin` table, with its unigram and bigram span lookups) when the model
+exists, otherwise the model-free byte-trigram hash encoder. Inputs are capped
+at 256 bytes. The integer forward runs on numpy when it is installed
+(milliseconds per book) and in pure Python otherwise (about a second per
+book); both give identical bytes.
 """
 from __future__ import annotations
 
@@ -36,6 +37,8 @@ STATE_NAME = ".inbox-concepts.json"
 STATE_VERSION = 1
 INDEXED_SHELVES = ("books/Inbox", "books/Books")
 FALLBACK_ENCODER = "fallback-trigram-v1"
+# Part of the model encoder's identity, so vectors from an older forward are recomputed.
+ENCODER_REVISION = "bigram-engram-v1"
 
 MODEL_MAGIC = 0x504C484E  # "PLHN"
 MODEL_HEADER = struct.Struct("<IHHHBBBBffffH")
@@ -52,6 +55,9 @@ ENGRAM_HEADER = struct.Struct("<IIIIf")
 ENGRAM_HEADER_BYTES = 512
 ENGRAM_SLOT_BYTES = 64
 ENGRAM_DELTA_DIMS = 24
+# Bigram Engram: chunk c >= 1 also looks up the span chunk[c-1] + chunk[c] when it is at most this many
+# bytes, adding half that slot's delta only when the slot's stored span hash equals the span's FNV-1a 64.
+BIGRAM_MAX_BYTES = 18
 MAX_ENGRAM_BYTES = 64 * 1024 * 1024
 
 INDEX_MAGIC = 0x49435054  # "ICPT"
@@ -208,6 +214,15 @@ class Engram:
         return [_requantize(value, self.amount)
                 for value in struct.unpack_from(f"<{ENGRAM_DELTA_DIMS}b", self.data, offset)]
 
+    def bigram_delta(self, span: bytes) -> list[int] | None:
+        """Half the slot's delta at activation scale when the slot holds exactly this span, else None."""
+        span_hash = fnv1a64(span)
+        offset = ENGRAM_HEADER_BYTES + (span_hash % self.slots) * ENGRAM_SLOT_BYTES
+        if span_hash == 0 or struct.unpack_from("<Q", self.data, offset)[0] != span_hash:
+            return None
+        return [_requantize(value >> 1, self.amount)
+                for value in struct.unpack_from(f"<{ENGRAM_DELTA_DIMS}b", self.data, offset + 8)]
+
 
 def _utf8_length(byte: int) -> int:
     return 1 if byte < 0x80 else 4 if byte >= 0xF0 else 3 if byte >= 0xE0 else 2 if byte >= 0xC0 else 1
@@ -281,8 +296,20 @@ class PlatonicHNet:
     def _forward(self, text: bytes) -> tuple[list[tuple[int, int]], list[int]]:
         return self._forward_numpy(text) if _np is not None else self._forward_python(text)
 
-    def _deltas(self, text: bytes, spans: list[tuple[int, int]]) -> list[list[int]] | None:
-        return [self.engram.delta(text[start:end]) for start, end in spans] if self.engram is not None else None
+    def _deltas(self, text: bytes, spans: list[tuple[int, int]]) -> list[list[list[int]]] | None:
+        """Per chunk, the Engram deltas added in order (each saturated): the unigram slot's, then the
+        bigram span's (previous chunk + this one) when that span is short enough and its slot matches."""
+        if self.engram is None:
+            return None
+        deltas = []
+        for number, (start, end) in enumerate(spans):
+            adds = [self.engram.delta(text[start:end])]
+            if number and end - spans[number - 1][0] <= BIGRAM_MAX_BYTES:
+                bigram = self.engram.bigram_delta(text[spans[number - 1][0]:end])
+                if bigram is not None:
+                    adds.append(bigram)
+            deltas.append(adds)
+        return deltas
 
     def _forward_python(self, text: bytes) -> tuple[list[tuple[int, int]], list[int]]:
         states = [self.embed[byte] for byte in text]
@@ -298,8 +325,8 @@ class PlatonicHNet:
             reciprocal = (65536 + (end - start) // 2) // (end - start)
             pooled = [_sat8((sum(column) * reciprocal + 32768) >> 16) for column in zip(*states[start:end])]
             concept = _matvec(pooled, self.chunk_proj, self.proj_shift)
-            if deltas is not None:
-                concept[:ENGRAM_DELTA_DIMS] = [_sat8(value + add) for value, add in zip(concept, deltas[number])]
+            for add in deltas[number] if deltas is not None else ():
+                concept[:ENGRAM_DELTA_DIMS] = [_sat8(value + delta) for value, delta in zip(concept, add)]
             concepts.append(concept)
         for _ in range(CORE_LOOPS):
             concepts = self.core(concepts)
@@ -322,7 +349,11 @@ class PlatonicHNet:
         deltas = self._deltas(text, spans)
         if deltas is not None:
             concepts[:, :ENGRAM_DELTA_DIMS] = _np.clip(
-                concepts[:, :ENGRAM_DELTA_DIMS] + _np.array(deltas, dtype=_np.int64), -127, 127)
+                concepts[:, :ENGRAM_DELTA_DIMS] + _np.array([adds[0] for adds in deltas], dtype=_np.int64), -127, 127)
+            for number, adds in enumerate(deltas):
+                if len(adds) > 1:
+                    concepts[number, :ENGRAM_DELTA_DIMS] = _np.clip(
+                        concepts[number, :ENGRAM_DELTA_DIMS] + _np.array(adds[1], dtype=_np.int64), -127, 127)
         for _ in range(CORE_LOOPS):
             concepts = self.core.numpy(concepts)
         return spans, normalize127(concepts.sum(axis=0).tolist())
@@ -464,7 +495,7 @@ def _encoder_identity(models_dir: Path) -> tuple[str, PlatonicHNet | None]:
     if not model_path.is_file() or model_path.is_symlink():
         return FALLBACK_ENCODER, None
     model_data = bounded_read(model_path, MAX_MODEL_BYTES)
-    identity = f"{MODEL_NAME}:{hashlib.sha256(model_data).hexdigest()}"
+    identity = f"{MODEL_NAME}:{hashlib.sha256(model_data).hexdigest()}+{ENCODER_REVISION}"
     engram = None
     engram_path = models_dir / ENGRAM_NAME
     if engram_path.is_file() and not engram_path.is_symlink():

@@ -18,7 +18,9 @@ The configured novel shelf (``~/papyrix/novels-epub``) and local shelf (``~/papy
 copied the same way as the cloud books, into ``/books/Novels`` and ``/books/Books``; the
 ``<book>.pre-hooks.epub`` backups that ``reader-send hooks`` leaves beside an enriched book are
 never copied. With ``crossfire`` the imported annotations also produce one Cross-Fire card in
-``/books/Inbox``. The run ends with the Inbox cleanup plan, which is a dry run unless
+``/books/Inbox``. The models folder (``~/papyrix/models``) is mirrored to ``/models``: ``platonic-hnet.bin``,
+``engram.bin``, ``inbox-concepts.idx``, ``cspw.bin`` and ``story-graph.idx`` (the last built from the card's
+books when no prebuilt one is there). The run ends with the Inbox cleanup plan, which is a dry run unless
 ``"inbox_cleanup": true`` is set in ``card.json``.
 
 It never ejects and never stages firmware, and it deletes no book unless that cleanup opt-in is
@@ -286,6 +288,16 @@ def _run(cache, config, volume, client_factory, key_provider, notify, log, batch
                 result["errors"].append(f"{name}: {error}")
             if shelf["errors"] and result["status"] == "ok":
                 result["status"] = "error"
+        models = result["shelves"]["models"]
+        if models is not None:
+            graph = models.get("story_graph")
+            if graph is not None and graph["prebuilt"]:
+                log("story graph: prebuilt story-graph.idx kept")
+            elif graph is not None:
+                log(f"story graph: {graph['entities']} entities from {graph['books']} books, "
+                    f"extracted {graph['extracted']}, unreadable {graph['unreadable']}, pending {graph['pending']}")
+            if models.get("missing"):
+                log(f"models missing from the Mac folder: {', '.join(models['missing'])}")
     result["cleanup"] = _cleanup(cache, config, volume, log)
     for item in result["unverified"]:
         log(f"not acknowledged (card copy did not verify): {item['id']}")
