@@ -57,6 +57,7 @@
 #include "util/AnnotationExport.h"
 #include "util/BookmarkUtil.h"
 #include "util/ButtonNavigator.h"
+#include "util/ConceptEngine.h"
 #include "util/DictionaryRegistry.h"
 #include "util/ScreenshotUtil.h"
 
@@ -376,9 +377,10 @@ void EpubReaderActivity::openDictionaryWordSelect() {
     LOG_ERR("ERA", "OOM: EpubReaderWordPage");
     return;
   }
-  startActivityForResult(
-      std::make_unique<DictionaryWordSelectActivity>(renderer, mappedInput, std::move(view), marginLeft, marginTop),
-      [this](const ActivityResult&) { requestUpdate(); });
+  auto lookup =
+      std::make_unique<DictionaryWordSelectActivity>(renderer, mappedInput, std::move(view), marginLeft, marginTop);
+  lookup->setReadingPosition(ConceptEngine::epubPosition(currentSpineIndex, section->currentPage));
+  startActivityForResult(std::move(lookup), [this](const ActivityResult&) { requestUpdate(); });
 }
 
 bool EpubReaderActivity::handleWordHold() {
@@ -431,6 +433,7 @@ bool EpubReaderActivity::handleWordHold() {
     LOG_ERR("ERA", "OOM: DictionaryWordSelectActivity");
     return true;
   }
+  lookup->setReadingPosition(ConceptEngine::epubPosition(currentSpineIndex, section->currentPage));
   startActivityForResult(std::move(lookup), [this](const ActivityResult&) { requestUpdate(); });
   return true;
 }

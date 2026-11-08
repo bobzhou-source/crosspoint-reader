@@ -37,12 +37,25 @@ const char* pick(const Candidate* candidates, const size_t count, const uint32_t
     }
   }
   if (best < 0) return nullptr;
+  if (const char* matched = preferConceptMatch(candidates, count, best)) return matched;
   size_t target = roll % bucketSize;
   for (size_t i = 0; i < count; ++i) {
     if (rank(candidates[i]) != best) continue;
     if (target-- == 0) return candidates[i].path;
   }
   return nullptr;
+}
+
+const char* preferConceptMatch(const Candidate* candidates, const size_t count, const int bucket) {
+  if (!candidates) return nullptr;
+  const char* chosen = nullptr;
+  int32_t bestDot = CONCEPT_PREFER_MIN_DOT - 1;
+  for (size_t i = 0; i < count; ++i) {
+    if (candidates[i].conceptDot <= bestDot || rank(candidates[i]) != bucket) continue;
+    bestDot = candidates[i].conceptDot;
+    chosen = candidates[i].path;
+  }
+  return chosen;
 }
 
 }  // namespace surprise

@@ -12,6 +12,7 @@
 #include <string_view>
 
 #include "BookProgress.h"
+#include "ConceptEngine.h"
 #include "SurpriseMe.h"
 
 namespace surprise {
@@ -83,9 +84,31 @@ void scanLibrary(Pool& pool) {
   }
   index.close();
 }
+
+// Fills conceptDot for the Inbox items that inbox-concepts.idx describes.
+void scoreInboxConcepts(Pool& pool, const int8_t* contextVec) {
+  if (!Storage.exists(ConceptEngine::SHELF_PATH)) return;
+  int8_t latest[ConceptEngine::DIM];
+  if (!contextVec) {
+    if (!ConceptEngine::latestEpisodicVector(latest)) return;
+    contextVec = latest;
+  }
+  uint64_t hashes[MAX_CANDIDATES];
+  int32_t dots[MAX_CANDIDATES];
+  size_t slots[MAX_CANDIDATES];
+  size_t inbox = 0;
+  for (size_t i = 0; i < pool.count; ++i) {
+    if (pool.items[i].origin != Origin::Inbox) continue;
+    hashes[inbox] = ConceptEngine::fnv1a64(pool.paths[i]);
+    slots[inbox++] = i;
+  }
+  if (inbox == 0 || ConceptEngine::scoreShelf(contextVec, hashes, inbox, dots) == 0) return;
+  // scoreShelf reports a missing record as INT32_MIN, which is NO_CONCEPT.
+  for (size_t i = 0; i < inbox; ++i) pool.items[slots[i]].conceptDot = dots[i];
+}
 }  // namespace
 
-bool findBook(std::string& outPath) {
+bool findBook(std::string& outPath, const int8_t* currentContextVec) {
   auto pool = makeUniqueNoThrow<Pool>();
   if (!pool) {
     LOG_ERR("SRP", "OOM: surprise candidates");
@@ -94,6 +117,7 @@ bool findBook(std::string& outPath) {
   // Inbox first: those are the short reads a reader can finish in one sitting.
   scanInbox(*pool);
   scanLibrary(*pool);
+  scoreInboxConcepts(*pool, currentContextVec);
   const char* chosen = pick(pool->items, pool->count, esp_random());
   if (!chosen) return false;
   outPath = chosen;

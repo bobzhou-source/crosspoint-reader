@@ -6,14 +6,19 @@
 #include <freertos/FreeRTOS.h>
 #include <freertos/task.h>
 
+#include <algorithm>
 #include <climits>
 #include <cstdlib>
+#include <string_view>
 
 #include "CrossPointSettings.h"
+#include "CrossPointState.h"
 #include "DictionaryDefinitionActivity.h"
 #include "ReaderUtils.h"
 #include "components/UITheme.h"
+#include "util/ConceptEngine.h"
 #include "util/DictionaryRegistry.h"
+#include "util/HtmlToPlainText.h"
 
 namespace {
 
@@ -22,6 +27,48 @@ constexpr unsigned long WORD_REPEAT_START_MS = 500;
 constexpr unsigned long WORD_REPEAT_INTERVAL_MS = 500;
 
 void indexBuildYield(void*) { vTaskDelay(1); }
+
+// Sense ranking and "Related" echoes read the words around the lookup; the
+// episode recorded for later echoes is a wider window (about the encoder's
+// 256-byte input).
+constexpr int CONTEXT_WORDS = 8;
+constexpr int EPISODE_WORDS = 24;
+
+std::string escapeHtml(std::string_view text) {
+  std::string out;
+  out.reserve(text.size());
+  for (const char c : text) {
+    if (c == '&') {
+      out += "&amp;";
+    } else if (c == '<') {
+      out += "&lt;";
+    } else if (c == '>') {
+      out += "&gt;";
+    } else {
+      out += c;
+    }
+  }
+  return out;
+}
+
+// "★ " where the reader font draws U+2605; the built-in fonts stop at Latin
+// and general punctuation, so they get "» " instead of a missing glyph.
+const char* senseMarker(const GfxRenderer& renderer, const int fontId) {
+  const auto& fonts = renderer.getFontMap();
+  const auto family = fonts.find(fontId);
+  return family != fonts.end() && family->second.hasCodepoint(0x2605) ? "\xE2\x98\x85 " : "\xC2\xBB ";
+}
+
+// A held word without its surrounding ASCII punctuation, for the Engram slot.
+std::string_view bareWord(std::string_view word) {
+  const auto punct = [](const char c) {
+    return static_cast<unsigned char>(c) < 0x80 && !((c >= '0' && c <= '9') || (c >= 'A' && c <= 'Z') ||
+                                                     (c >= 'a' && c <= 'z') || c == '-' || c == '\'');
+  };
+  while (!word.empty() && punct(word.front())) word.remove_prefix(1);
+  while (!word.empty() && punct(word.back())) word.remove_suffix(1);
+  return word;
+}
 
 }  // namespace
 
@@ -111,6 +158,7 @@ void DictionaryWordSelectActivity::performLookup() {
     popup = Popup::None;
     Dictionary& dict = router.dictionary();
     const char* shown = usedPrevious ? previous : run;
+    addConceptNotes(definition, dict.definitionsAreHtml());
     startActivityForResult(std::make_unique<DictionaryDefinitionActivity>(
                                renderer, mappedInput, std::move(headword), std::move(definition),
                                dict.definitionsAreHtml(), run[0] ? &dict : nullptr, shown, matchMask),
@@ -122,6 +170,28 @@ void DictionaryWordSelectActivity::performLookup() {
                              }
                            });
     return;
+  }
+  // No dictionary knows the word: the Engram table may still hold a one-line
+  // gloss for it (slang, idioms, compounds).
+  if (miss == DictionaryRouter::Miss::NotFound) {
+    const WordBox& held = words[selected];
+    const std::string_view word =
+        held.cjkBytes ? std::string_view(held.text, held.cjkBytes) : bareWord(held.text ? held.text : "");
+    std::string gloss = ConceptEngine::lookupEngramGloss(word);
+    if (!gloss.empty()) {
+      popup = Popup::None;
+      addConceptNotes(gloss, false);
+      startActivityForResult(
+          std::make_unique<DictionaryDefinitionActivity>(renderer, mappedInput, std::string(word), std::move(gloss)),
+          [this](const ActivityResult&) {
+            if (direct) {
+              finish();
+            } else {
+              requestUpdate();
+            }
+          });
+      return;
+    }
   }
   // Name the failure: a genuine miss is "Not found"; a word that WAS found but
   // couldn't be read is a real error — and we distinguish decompression from a
@@ -153,6 +223,57 @@ void DictionaryWordSelectActivity::performLookup() {
   }
   popupTime = millis();
   requestUpdate();
+}
+
+// The words within `radius` of the selected one, in reading order. CJK
+// characters join without spaces.
+std::string DictionaryWordSelectActivity::contextAround(const int radius) const {
+  std::string text;
+  if (words.empty()) return text;
+  const int first = std::max(0, selected - radius);
+  const int last = std::min(static_cast<int>(words.size()) - 1, selected + radius);
+  for (int i = first; i <= last; ++i) {
+    if (!words[i].text) continue;
+    const bool cjk = words[i].cjkBytes != 0;
+    if (!text.empty() && !(cjk && i > first && words[i - 1].cjkBytes)) text += ' ';
+    if (cjk) {
+      text.append(words[i].text, words[i].cjkBytes);
+    } else {
+      text += words[i].text;
+    }
+  }
+  return text;
+}
+
+// Concept-engine extras for a definition about to be shown: the sense that
+// fits the passage marked at the top, a "Related:" echo of the closest page
+// read before (or Inbox item) at cosine >= 0.65, and this passage recorded
+// for later echoes.
+void DictionaryWordSelectActivity::addConceptNotes(std::string& definition, const bool html) {
+  const std::string context = contextAround(CONTEXT_WORDS);
+  int8_t contextVec[ConceptEngine::DIM];
+  ConceptEngine::encodeText(context, contextVec);
+  const char* marker = senseMarker(renderer, fontId);
+  if (html) {
+    // Styled HTML keeps its markup: the best sense is repeated above it.
+    const std::string best = ConceptEngine::bestDictionarySense(contextVec, htmlToPlainText(definition));
+    if (!best.empty()) definition = "<p><b>" + escapeHtml(marker) + escapeHtml(best) + "</b></p>" + definition;
+  } else {
+    definition = ConceptEngine::rankDictionarySenses(contextVec, definition, marker);
+  }
+
+  const std::string& bookPath = APP_STATE.openEpubPath;
+  const uint64_t book = ConceptEngine::fnv1a64(bookPath);
+  for (const auto& match : ConceptEngine::queryEpisodicAndShelf(contextVec, 4)) {
+    if (match.dot < ConceptEngine::RELATED_MIN_DOT) break;
+    if (match.pathHash == book && (match.shelf || !hasReadingPosition || match.page == readingPosition)) continue;
+    const std::string line = "Related: " + ConceptEngine::describeMatch(match);
+    definition += html ? "<p>" + escapeHtml(line) + "</p>" : "\n\n" + line;
+    break;
+  }
+  if (hasReadingPosition && !bookPath.empty()) {
+    ConceptEngine::appendEpisodicPage(bookPath, readingPosition, contextAround(EPISODE_WORDS));
+  }
 }
 
 void DictionaryWordSelectActivity::loop() {

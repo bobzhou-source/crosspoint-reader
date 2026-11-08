@@ -48,6 +48,14 @@ class DictionaryWordSelectActivity final : public Activity {
   void loop() override;
   void render(RenderLock&&) override;
 
+  // Where the page sits in the open book (ConceptEngine::epubPosition for
+  // EPUB, the page index for TXT). Set before start; without it lookups are
+  // not recorded in the episodic index.
+  void setReadingPosition(uint32_t position) {
+    readingPosition = position;
+    hasReadingPosition = true;
+  }
+
  private:
   enum class Popup : uint8_t { None, Busy, NotFound, Error };
 
@@ -57,6 +65,8 @@ class DictionaryWordSelectActivity final : public Activity {
   void drawPage();
   bool drawHighlightWithSnapshot();
   void drawHints() const;
+  std::string contextAround(int radius) const;
+  void addConceptNotes(std::string& definition, bool html);
 
   std::unique_ptr<ReaderWordPage> page;
   const int marginLeft;
@@ -69,6 +79,8 @@ class DictionaryWordSelectActivity final : public Activity {
   std::vector<WordBox> words;
   int selected = 0;
   uint16_t rowCount = 0;
+  uint32_t readingPosition = 0;
+  bool hasReadingPosition = false;
   unsigned long lastHorizontalMoveTime = 0;
 
   // Every installed dictionary is a lookup candidate (see DictionaryRouter);
