@@ -170,6 +170,17 @@ void moveFinishedBookToReadFolder(const std::string& srcPath, const std::string&
   }
 }
 
+// The story-graph spoiler cutoff of the shown page: its visible-text offset
+// survives font and layout changes (about 1024 codepoints a page while a
+// partial build has no offset for it yet).
+uint32_t storyCutoff(const Section* section, const int spineIndex) {
+  if (!section) return ConceptEngine::epubPosition(spineIndex, 0);
+  const int page = std::max(0, section->currentPage);
+  const uint32_t offset = section->getVisibleTextOffsetForPage(static_cast<uint16_t>(std::min(page, 0xFFFF)))
+                              .value_or(static_cast<uint32_t>(page) * 1024u);
+  return ConceptEngine::epubStoryCutoff(spineIndex, offset);
+}
+
 }  // namespace
 
 EpubReaderActivity::~EpubReaderActivity() {
@@ -379,7 +390,8 @@ void EpubReaderActivity::openDictionaryWordSelect() {
   }
   auto lookup =
       std::make_unique<DictionaryWordSelectActivity>(renderer, mappedInput, std::move(view), marginLeft, marginTop);
-  lookup->setReadingPosition(ConceptEngine::epubPosition(currentSpineIndex, section->currentPage));
+  lookup->setReadingPosition(ConceptEngine::epubPosition(currentSpineIndex, section->currentPage),
+                             storyCutoff(section.get(), currentSpineIndex));
   startActivityForResult(std::move(lookup), [this](const ActivityResult&) { requestUpdate(); });
 }
 
@@ -433,7 +445,8 @@ bool EpubReaderActivity::handleWordHold() {
     LOG_ERR("ERA", "OOM: DictionaryWordSelectActivity");
     return true;
   }
-  lookup->setReadingPosition(ConceptEngine::epubPosition(currentSpineIndex, section->currentPage));
+  lookup->setReadingPosition(ConceptEngine::epubPosition(currentSpineIndex, section->currentPage),
+                             storyCutoff(section.get(), currentSpineIndex));
   startActivityForResult(std::move(lookup), [this](const ActivityResult&) { requestUpdate(); });
   return true;
 }

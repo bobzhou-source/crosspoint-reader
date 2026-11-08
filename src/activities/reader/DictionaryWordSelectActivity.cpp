@@ -33,6 +33,8 @@ void indexBuildYield(void*) { vTaskDelay(1); }
 // 256-byte input).
 constexpr int CONTEXT_WORDS = 8;
 constexpr int EPISODE_WORDS = 24;
+// "Story: ..." refreshers are a few dozen words.
+constexpr size_t STORY_BYTES = 512;
 
 std::string escapeHtml(std::string_view text) {
   std::string out;
@@ -146,6 +148,7 @@ void DictionaryWordSelectActivity::performLookup() {
 
   std::string definition;
   std::string headword;
+  std::string storyWord;
   uint8_t matchMask = 0;
   bool usedPrevious = false;
   DictionaryRouter::Miss miss = DictionaryRouter::Miss::NoDictionary;
@@ -158,7 +161,7 @@ void DictionaryWordSelectActivity::performLookup() {
     popup = Popup::None;
     Dictionary& dict = router.dictionary();
     const char* shown = usedPrevious ? previous : run;
-    addConceptNotes(definition, dict.definitionsAreHtml());
+    addConceptNotes(definition, dict.definitionsAreHtml(), weaveStory(storyWord));
     startActivityForResult(std::make_unique<DictionaryDefinitionActivity>(
                                renderer, mappedInput, std::move(headword), std::move(definition),
                                dict.definitionsAreHtml(), run[0] ? &dict : nullptr, shown, matchMask),
@@ -171,18 +174,26 @@ void DictionaryWordSelectActivity::performLookup() {
                            });
     return;
   }
-  // No dictionary knows the word: the Engram table may still hold a one-line
-  // gloss for it (slang, idioms, compounds).
+  // No dictionary knows the word: a character, place or concept of the story
+  // gets its spoiler-safe refresher; otherwise the Engram table may still hold
+  // a one-line gloss for it (slang, idioms, compounds).
   if (miss == DictionaryRouter::Miss::NotFound) {
     const WordBox& held = words[selected];
-    const std::string_view word =
-        held.cjkBytes ? std::string_view(held.text, held.cjkBytes) : bareWord(held.text ? held.text : "");
-    std::string gloss = ConceptEngine::lookupEngramGloss(word);
-    if (!gloss.empty()) {
+    std::string shownWord(held.cjkBytes ? std::string_view(held.text, held.cjkBytes)
+                                        : bareWord(held.text ? held.text : ""));
+    const std::string story = weaveStory(storyWord);
+    std::string note;
+    if (!story.empty()) {
+      shownWord = storyWord;
+    } else {
+      note = ConceptEngine::lookupEngramGloss(shownWord);
+    }
+    if (!story.empty() || !note.empty()) {
       popup = Popup::None;
-      addConceptNotes(gloss, false);
+      // The refresher goes in as a note, not as text to sense-rank.
+      addConceptNotes(note, false, story);
       startActivityForResult(
-          std::make_unique<DictionaryDefinitionActivity>(renderer, mappedInput, std::string(word), std::move(gloss)),
+          std::make_unique<DictionaryDefinitionActivity>(renderer, mappedInput, std::move(shownWord), std::move(note)),
           [this](const ActivityResult&) {
             if (direct) {
               finish();
@@ -245,11 +256,65 @@ std::string DictionaryWordSelectActivity::contextAround(const int radius) const 
   return text;
 }
 
+// The spoiler-safe "Story: ..." refresher for the held word at this reading
+// position, or empty; `matched` gets the surface form the story graph knew.
+// CJK names are tried as the longest runs through the held character (萧炎
+// from a hold on 萧 or on 炎), Latin ones with a neighbouring word first
+// ("Xiao Yan").
+std::string DictionaryWordSelectActivity::weaveStory(std::string& matched) const {
+  matched.clear();
+  if (!hasReadingPosition || words.empty()) return {};
+  const char* book = APP_STATE.openEpubPath.c_str();
+  char story[STORY_BYTES];
+  const auto tryWord = [&](const std::string_view candidate) {
+    if (candidate.empty() || !ConceptEngine::weaveEntityRefresher(candidate.data(), candidate.size(), book,
+                                                                  storyCutoff, story, sizeof(story))) {
+      return false;
+    }
+    matched.assign(candidate);
+    return true;
+  };
+  const WordBox& held = words[selected];
+  if (held.cjkBytes) {
+    char run[CjkDictionary::RUN_BYTES];
+    char previous[CjkDictionary::RUN_BYTES];
+    DictionaryPageWords::heldCjkRuns(words, selected, run, previous);
+    // A run from the character before the held one must keep the held one.
+    for (const char* start : {static_cast<const char*>(previous), static_cast<const char*>(run)}) {
+      const size_t minCharacters = start == previous ? 2 : 1;
+      size_t ends[CjkDictionary::MAX_CHARACTERS];
+      size_t characters = 0;
+      for (size_t at = 0; start[at] != '\0' && characters < CjkDictionary::MAX_CHARACTERS;) {
+        uint32_t cp = 0;
+        at += CjkDictionary::characterBytes(start + at, cp);
+        ends[characters++] = at;
+      }
+      for (size_t n = characters; n >= minCharacters && n > 0; --n) {
+        if (tryWord(std::string_view(start, ends[n - 1]))) return story;
+      }
+    }
+    return {};
+  }
+  const auto latinAt = [this](const int i) {
+    if (i < 0 || i >= static_cast<int>(words.size()) || !words[i].text || words[i].cjkBytes) return std::string_view();
+    return bareWord(words[i].text);
+  };
+  const std::string_view word = latinAt(selected);
+  if (word.empty()) return {};
+  const std::string_view after = latinAt(selected + 1);
+  const std::string_view before = latinAt(selected - 1);
+  if (!after.empty() && tryWord(std::string(word) + ' ' + std::string(after))) return story;
+  if (!before.empty() && tryWord(std::string(before) + ' ' + std::string(word))) return story;
+  if (tryWord(word)) return story;
+  return {};
+}
+
 // Concept-engine extras for a definition about to be shown: the sense that
-// fits the passage marked at the top, a "Related:" echo of the closest page
-// read before (or Inbox item) at cosine >= 0.65, and this passage recorded
-// for later echoes.
-void DictionaryWordSelectActivity::addConceptNotes(std::string& definition, const bool html) {
+// fits the passage marked at the top, the story refresher (if any), a
+// "Related:" echo of the closest page read before (or Inbox item) at cosine
+// >= 0.65, and this passage recorded for later echoes.
+void DictionaryWordSelectActivity::addConceptNotes(std::string& definition, const bool html,
+                                                   const std::string& story) {
   const std::string context = contextAround(CONTEXT_WORDS);
   int8_t contextVec[ConceptEngine::DIM];
   ConceptEngine::encodeText(context, contextVec);
@@ -261,14 +326,21 @@ void DictionaryWordSelectActivity::addConceptNotes(std::string& definition, cons
   } else {
     definition = ConceptEngine::rankDictionarySenses(contextVec, definition, marker);
   }
+  const auto appendNote = [&](const std::string& line) {
+    if (html) {
+      definition += "<p>" + escapeHtml(line) + "</p>";
+    } else {
+      definition += definition.empty() ? line : "\n\n" + line;
+    }
+  };
+  if (!story.empty()) appendNote(story);
 
   const std::string& bookPath = APP_STATE.openEpubPath;
   const uint64_t book = ConceptEngine::fnv1a64(bookPath);
   for (const auto& match : ConceptEngine::queryEpisodicAndShelf(contextVec, 4)) {
     if (match.dot < ConceptEngine::RELATED_MIN_DOT) break;
     if (match.pathHash == book && (match.shelf || !hasReadingPosition || match.page == readingPosition)) continue;
-    const std::string line = "Related: " + ConceptEngine::describeMatch(match);
-    definition += html ? "<p>" + escapeHtml(line) + "</p>" : "\n\n" + line;
+    appendNote("Related: " + ConceptEngine::describeMatch(match));
     break;
   }
   if (hasReadingPosition && !bookPath.empty()) {

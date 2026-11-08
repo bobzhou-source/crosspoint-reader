@@ -49,10 +49,13 @@ class DictionaryWordSelectActivity final : public Activity {
   void render(RenderLock&&) override;
 
   // Where the page sits in the open book (ConceptEngine::epubPosition for
-  // EPUB, the page index for TXT). Set before start; without it lookups are
-  // not recorded in the episodic index.
-  void setReadingPosition(uint32_t position) {
+  // EPUB, the page index for TXT) and its layout-independent story cutoff
+  // (ConceptEngine::epubStoryCutoff / txtStoryCutoff), the spoiler gate for
+  // story refreshers. Set before start; without it lookups are not recorded
+  // in the episodic index and no story refresher is shown.
+  void setReadingPosition(uint32_t position, uint32_t cutoff) {
     readingPosition = position;
+    storyCutoff = cutoff;
     hasReadingPosition = true;
   }
 
@@ -66,7 +69,8 @@ class DictionaryWordSelectActivity final : public Activity {
   bool drawHighlightWithSnapshot();
   void drawHints() const;
   std::string contextAround(int radius) const;
-  void addConceptNotes(std::string& definition, bool html);
+  std::string weaveStory(std::string& matched) const;
+  void addConceptNotes(std::string& definition, bool html, const std::string& story);
 
   std::unique_ptr<ReaderWordPage> page;
   const int marginLeft;
@@ -80,6 +84,7 @@ class DictionaryWordSelectActivity final : public Activity {
   int selected = 0;
   uint16_t rowCount = 0;
   uint32_t readingPosition = 0;
+  uint32_t storyCutoff = 0;
   bool hasReadingPosition = false;
   unsigned long lastHorizontalMoveTime = 0;
 
