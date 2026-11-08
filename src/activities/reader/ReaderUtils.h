@@ -233,10 +233,13 @@ inline HalDisplay::RefreshMode refreshModeFor(const AdaptiveRefreshPolicy::Refre
 // regionClearAvailable: renderer.prepareRegionClear() succeeded for this
 // frame, so the answer may be Refresh::Region (a fast frame plus
 // renderer.clearRegion(decision.region)).
+// elapsedMs: how long the previous frame stayed on the panel (0 when unknown),
+// so the policy can relax the ghosting debt that dwell lets settle.
 inline AdaptiveRefreshPolicy::Decision decideRefreshWithRegion(const GfxRenderer& renderer,
                                                                AdaptiveRefreshPolicy& policy, const bool hasImage,
                                                                const bool visibleGrayscale,
-                                                               const bool regionClearAvailable) {
+                                                               const bool regionClearAvailable,
+                                                               const uint32_t elapsedMs = 0) {
   AdaptiveRefreshPolicy::Inputs inputs;
   inputs.frame = renderer.measureFrameChange();
   inputs.hasImage = hasImage;
@@ -247,20 +250,24 @@ inline AdaptiveRefreshPolicy::Decision decideRefreshWithRegion(const GfxRenderer
   inputs.regionClearAvailable = regionClearAvailable;
   inputs.screenWidth = static_cast<uint16_t>(renderer.getScreenWidth());
   inputs.screenHeight = static_cast<uint16_t>(renderer.getScreenHeight());
+  inputs.elapsedMs = elapsedMs;
   const auto decision = policy.decide(inputs);
-  LOG_DBG("READER", "Refresh %s: reason=%u debt=%lu fast=%u changed=%lu exact=%d",
+  LOG_DBG("READER", "Refresh %s: reason=%u debt=%lu fast=%u changed=%lu exact=%d dwell=%lu",
           decision.refresh == AdaptiveRefreshPolicy::Refresh::Clear    ? "clear"
           : decision.refresh == AdaptiveRefreshPolicy::Refresh::Region ? "region"
                                                                        : "fast",
           static_cast<unsigned>(decision.reason), static_cast<unsigned long>(policy.debtPixels()),
           static_cast<unsigned>(policy.fastSinceClear()), static_cast<unsigned long>(inputs.frame.changedPixels),
-          inputs.frame.historyValid ? 1 : 0);
+          inputs.frame.historyValid ? 1 : 0, static_cast<unsigned long>(elapsedMs));
   return decision;
 }
 
 inline AdaptiveRefreshPolicy::Refresh decideRefresh(const GfxRenderer& renderer, AdaptiveRefreshPolicy& policy,
-                                                    const bool hasImage, const bool visibleGrayscale) {
-  return decideRefreshWithRegion(renderer, policy, hasImage, visibleGrayscale, /*regionClearAvailable=*/false).refresh;
+                                                    const bool hasImage, const bool visibleGrayscale,
+                                                    const uint32_t elapsedMs = 0) {
+  return decideRefreshWithRegion(renderer, policy, hasImage, visibleGrayscale, /*regionClearAvailable=*/false,
+                                 elapsedMs)
+      .refresh;
 }
 
 // One helper, blocking or deferred: the async form starts the refresh and
@@ -269,8 +276,8 @@ inline AdaptiveRefreshPolicy::Refresh decideRefresh(const GfxRenderer& renderer,
 // renderer.waitRefreshComplete() and must rebuild the differential baseline
 // before the next page turn (the tiled grayscale cleanup does).
 inline void displayAdaptive(const GfxRenderer& renderer, AdaptiveRefreshPolicy& policy, const bool hasImage = false,
-                            const bool async = false) {
-  const auto refresh = decideRefresh(renderer, policy, hasImage, /*visibleGrayscale=*/false);
+                            const bool async = false, const uint32_t elapsedMs = 0) {
+  const auto refresh = decideRefresh(renderer, policy, hasImage, /*visibleGrayscale=*/false, elapsedMs);
   if (async) {
     renderer.displayBufferAsync(refreshModeFor(refresh));
   } else {
@@ -284,8 +291,9 @@ inline void displayAdaptive(const GfxRenderer& renderer, AdaptiveRefreshPolicy& 
 // go out as one waveform — displaying the base separately makes the gray pass
 // re-drive the whole text body (a visible flash). Other panels display
 // normally. Only call when textAntiAliasingVisible() holds.
-inline void displayAdaptiveGrayscaleBase(const GfxRenderer& renderer, AdaptiveRefreshPolicy& policy) {
-  const auto refresh = decideRefresh(renderer, policy, /*hasImage=*/false, /*visibleGrayscale=*/true);
+inline void displayAdaptiveGrayscaleBase(const GfxRenderer& renderer, AdaptiveRefreshPolicy& policy,
+                                         const uint32_t elapsedMs = 0) {
+  const auto refresh = decideRefresh(renderer, policy, /*hasImage=*/false, /*visibleGrayscale=*/true, elapsedMs);
   if (renderer.grayscaleCapabilities().base == HalDisplay::GrayscaleBase::Combined) {
     renderer.displayGrayscaleBase(refreshModeFor(refresh));
   } else {
