@@ -88,10 +88,11 @@ void scanLibrary(Pool& pool) {
 // Fills conceptDot for the Inbox items that inbox-concepts.idx describes.
 void scoreInboxConcepts(Pool& pool, const int8_t* contextVec) {
   if (!Storage.exists(ConceptEngine::SHELF_PATH)) return;
-  int8_t latest[ConceptEngine::DIM];
+  int8_t context[ConceptEngine::DIM];
   if (!contextVec) {
-    if (!ConceptEngine::latestEpisodicVector(latest)) return;
-    contextVec = latest;
+    // The page read last at length this session, else the newest episodic page.
+    if (!ConceptEngine::readingContext(context)) return;
+    contextVec = context;
   }
   uint64_t hashes[MAX_CANDIDATES];
   int32_t dots[MAX_CANDIDATES];

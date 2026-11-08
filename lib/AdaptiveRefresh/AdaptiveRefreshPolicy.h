@@ -48,6 +48,29 @@
 //     other clear reasons are unchanged.
 // With elapsedMs == 0, no tiles and the default readout, every decision,
 // debt and clear row is the content-v2 rule exactly.
+//
+// LiquidRefresh CfC v2 (Hasani et al., arXiv:2106.13898): a 16-unit
+// closed-form continuous-time cell over 8 screen/image inputs,
+//   h_t = exp(-f(x_t) dt) * h_{t-1} + (1 - exp(-f(x_t) dt)) * tanh(W_g x_t + b_g),
+//   f(x) = softplus(W_f x + b_f) per second,
+// with three linear readouts over h: y0 the refresh gate, y1 the dither
+// contrast gain and y2 the error-diffusion bleed. Units 0-5 model reversible
+// text charge (rapid turns charge them, reading dwell relaxes them), units
+// 6-11 image sticking (an image's viewing dwell polarizes them, text relaxes
+// them slowly), units 12-15 are free. The int8 tables are fitted offline
+// (verification/rc10/fit_liquid_cfc_v2.py) and exported into the .cpp.
+//   - recordImageExposure() steps the cell over an image's viewing dwell and
+//     remembers the tiles it covered. decide() steps it over the text page's
+//     own dwell (exposed time is not counted twice) and answers
+//     Reason::ImageSticking when y0 >= 0 AND the page changes tiles the image
+//     covered. Without an exposure that reason never fires, so every
+//     content-v2 / LiquidRefresh v1 decision above is unchanged.
+//   - computeImageDitherParams() probes the cell with an image's edge and
+//     mid-gray density (no state change) and returns y1, y2 for the decoders.
+//   - y0's readout (16 weights + bias) learns by e-prop: a 16-dim eligibility
+//     trace e = gamma*lambda*e + h over the fast turns since the last clear;
+//     recordManualRefresh() moves w += eta * (1 - p) * e, bounded around the
+//     fitted readout. It is persisted next to the v1 readout (LQRF v2).
 class AdaptiveRefreshPolicy {
  public:
   // Clear maps to the app's HALF refresh (FULL stays a manual/GfxRenderer promotion).
@@ -64,7 +87,8 @@ class AdaptiveRefreshPolicy {
     External,        // a renderer-level clear promotion is already queued
     InvalidFrame,    // framebuffer unreadable or zero-sized panel metrics
     PolarityChange,  // output inversion flipped: the next refresh rewrites everything
-    SafetyCap        // kSafetyCap fast refreshes in a row; bound only, not the normal rule
+    SafetyCap,       // kSafetyCap fast refreshes in a row; bound only, not the normal rule
+    ImageSticking    // CfC v2: the page overwrites a polarized image (y0 >= 0)
   };
 
   // Who asked for a Requested/External clear. Bookkeeping for the usage log
@@ -221,11 +245,64 @@ class AdaptiveRefreshPolicy {
   // Eligibility trace decay (gamma * lambda) and learning rate, thousandths.
   static constexpr int32_t kTraceDecayPermille = 750;
   static constexpr int32_t kLearnRatePermille = 50;
-  // Learned-state file: 32 bytes, "LQRF" on disk (little-endian magic).
-  static constexpr size_t kLearnedStateBytes = 32;
+  // Learned-state file: 64 bytes, "LQRF" on disk (little-endian magic). v2
+  // keeps the v1 layout in its first 28 bytes and adds the CfC readout; a
+  // 32-byte v1 file still loads (the CfC readout then stays the fitted one).
+  static constexpr size_t kLearnedStateBytes = 64;
+  static constexpr size_t kLearnedStateV1Bytes = 32;
   static constexpr uint32_t kLearnedStateMagic = 0x4652514Cu;
-  static constexpr uint16_t kLearnedStateVersion = 1;
+  static constexpr uint16_t kLearnedStateVersion = 2;
   static constexpr char kLearnedStatePath[] = "/.crosspoint/liquid-refresh.bin";
+
+  // --- LiquidRefresh CfC v2 constants -------------------------------------
+  static constexpr uint8_t kCfcInputs = 8;
+  static constexpr uint8_t kCfcUnits = 16;
+  static constexpr uint8_t kCfcOutputs = 3;
+  // Inputs, Q7 (128 = 1.0): share of the screen the frame changes, fast-turn
+  // intensity (1 at dt -> 0, 0 from kFastTurnMs), image area, dither (mid-gray)
+  // density, image-to-text overlap (area x share of its tiles the page
+  // changes), night output, edge density (1.0 at kCfcEdgeFullPermille) and
+  // mid-gray density.
+  enum CfcInput : uint8_t {
+    kCfcChanged,
+    kCfcFastTurn,
+    kCfcImageArea,
+    kCfcDither,
+    kCfcOverlap,
+    kCfcInverted,
+    kCfcEdge,
+    kCfcMidGray
+  };
+  static constexpr uint8_t kCfcChargeFirst = 0;  // units 0-5: reversible text charge
+  static constexpr uint8_t kCfcStickFirst = 6;   // units 6-11: image sticking
+  static constexpr uint8_t kCfcGroupUnits = 6;
+  static constexpr uint16_t kCfcEdgeFullPermille = 250;
+  // Dwell the dither probe integrates an image over, and the longest step.
+  static constexpr uint32_t kCfcDitherProbeMs = 6000;
+  static constexpr uint32_t kCfcMaxStepMs = 600000;
+  // y1, y2 -> Q8 parameters: 256 + Y / 64, clamped.
+  static constexpr uint16_t kContrastGainMinQ8 = 240;
+  static constexpr uint16_t kContrastGainMaxQ8 = 312;
+  static constexpr uint16_t kErrorBleedMinQ8 = 160;
+  static constexpr uint16_t kErrorBleedMaxQ8 = 256;
+  // e-prop: trace decay (gamma * lambda, thousandths), learning rate, and how
+  // far the learned y0 readout may move from the fitted one (1/16 units).
+  static constexpr int32_t kCfcTraceDecayPermille = 750;
+  static constexpr int32_t kCfcLearnRate = 16;
+  static constexpr int16_t kCfcReadoutDrift = 48;
+
+  struct DitherParams {
+    uint16_t contrastGainQ8 = 256;  // 256 = 1.0x around mid-gray 128
+    uint16_t errorBleedQ8 = 256;    // 256 = full error diffusion
+    bool operator==(const DitherParams&) const = default;
+  };
+  // The learnable y0 readout: weights and bias in 1/16 units.
+  struct CfcReadout {
+    int8_t w[kCfcUnits];
+    int16_t b;
+    bool operator==(const CfcReadout&) const = default;
+  };
+  static const CfcReadout& cfcFittedReadout();
 
   // Readout weights, thousandths. The default makes z the plain debt ratio.
   enum LiquidWeight : uint8_t { kReadoutDebt, kReadoutPeak, kReadoutStreak, kReadoutBias };
@@ -258,6 +335,7 @@ class AdaptiveRefreshPolicy {
   // already known to show the restored page (allowFastInitialRefresh).
   explicit AdaptiveRefreshPolicy(bool initialClearRequired = true) : AdaptiveRefreshPolicy(initialClearRequired, Config{}) {}
   explicit AdaptiveRefreshPolicy(bool initialClearRequired, const Config& config) : config_(config) {
+    resetLearnedState();
     reset(initialClearRequired);
   }
 
@@ -306,10 +384,35 @@ class AdaptiveRefreshPolicy {
   // consumed by the next commit(). Inputs::elapsedMs, when set, wins.
   void recordTileTransitions(const uint16_t tileChanged[kTileCount], uint32_t elapsedMs);
   // The user asked for a refresh (m = 1): the clear came too late. Moves the
-  // readout along the eligibility trace of the fast turns since the last
-  // clear. Valid before or after the manual clear is committed. False when no
-  // fast turn was traced.
+  // v1 readout along its eligibility trace and the CfC y0 readout along its
+  // 16-dim e-prop trace of the fast turns since the last clear. Valid before
+  // or after the manual clear is committed. False when no fast turn was traced.
   bool recordManualRefresh();
+
+  // CfC v2: an image stayed on the panel for dwellMs (picture viewer closed,
+  // or the reader turns away from a page with pictures). areaPermille: its
+  // share of the screen; ditherPermille: its dithered/mid-gray share;
+  // coveredTileMask: bit (row * kTileCols + col) per tile it covered, 0 =
+  // unknown (every tile). Call before the next decide(); the step is booked
+  // at once and decide() does not count dwellMs again.
+  void recordImageExposure(uint32_t dwellMs, uint16_t areaPermille, uint16_t ditherPermille,
+                           uint64_t coveredTileMask = 0);
+  // y1, y2 for an image about to be dithered, from the current cell state and
+  // the image's edge density (strong horizontal transitions) and mid-gray
+  // density, both in permille of its pixels. Pure.
+  DitherParams computeImageDitherParams(uint16_t edgeDensityPermille, uint16_t midGrayPermille) const;
+  // Tiles (8x6 over a screenWidth x screenHeight logical screen) `rect` touches.
+  static uint64_t tileMaskFor(Rect rect, uint16_t screenWidth, uint16_t screenHeight);
+  int16_t cfcHiddenQ8(uint8_t unit) const { return unit < kCfcUnits ? cfcHiddenQ8_[unit] : 0; }
+  // Mean of the charge (0-5) and image-sticking (6-11) units, Q8.
+  int16_t cfcChargeQ8() const { return cfcGroupMean(kCfcChargeFirst); }
+  int16_t cfcStickQ8() const { return cfcGroupMean(kCfcStickFirst); }
+  // y0 of the last decide(), 1/4096 units: the gate opens at >= 0.
+  int32_t cfcRefreshLogit() const { return cfcLogit_; }
+  int16_t cfcTraceQ8(uint8_t unit) const { return unit < kCfcUnits ? cfcTraceQ8_[unit] : 0; }
+  CfcReadout cfcReadout() const;
+  uint32_t cfcUpdates() const { return cfcUpdates_; }
+  uint64_t imageTileMask() const { return lastImageTileMask_; }
   // Learned readout persistence (kLearnedStatePath). No I/O: the caller owns
   // the file. save returns kLearnedStateBytes, or 0 when len is too small;
   // load rejects a short, foreign or corrupt buffer and keeps the state.
@@ -353,6 +456,11 @@ class AdaptiveRefreshPolicy {
   void clampReadout();
   ClearRecord labelFor(const Inputs& in, Reason reason) const;
   RegionFallback regionFor(const Inputs& in, bool debtDue, Rect& region) const;
+  bool cfcDecide(const Inputs& in);
+  void cfcCommit(Refresh displayed);
+  bool cfcLearn();
+  void resetCfcEpisode();
+  int16_t cfcGroupMean(uint8_t first) const;
 
   Config config_;
   uint32_t debt_ = 0;            // weighted changed pixels since the last clear (saturating)
@@ -403,4 +511,20 @@ class AdaptiveRefreshPolicy {
   };
   Liquid liquid_{};
   LiquidReadout readout_;
+
+  // LiquidRefresh CfC v2 state (Q8 = 256 per 1.0). Episodic fields are reset
+  // by reset() and by every committed clear; the readout survives both.
+  int16_t cfcHiddenQ8_[kCfcUnits] = {};   // h, the cell state on the panel
+  int16_t cfcPendingQ8_[kCfcUnits] = {};  // h after this frame, set by decide()
+  int16_t cfcTraceQ8_[kCfcUnits] = {};    // e-prop eligibility trace of y0's weights
+  int16_t cfcTraceBiasQ8_ = 0;            // ... and of its bias
+  int8_t cfcReadoutW0_[kCfcUnits] = {};   // y0 readout, learnable (set by the ctor)
+  int16_t cfcReadoutB0_ = 0;
+  uint64_t lastImageTileMask_ = 0;        // tiles of images recorded since the last clear
+  uint32_t cfcExposedMs_ = 0;             // exposure dwell decide() must not count again
+  uint32_t cfcUpdates_ = 0;               // e-prop updates applied (saturating)
+  int32_t cfcLogit_ = 0;                  // y0 of the last decide()
+  uint16_t cfcImageAreaPermille_ = 0;     // largest image area recorded since the last clear
+  uint8_t cfcTraceTurns_ = 0;             // fast turns in the trace (saturating)
+  bool cfcInverted_ = false;              // night output at the last decide()
 };

@@ -337,7 +337,9 @@ void DictionaryWordSelectActivity::addConceptNotes(std::string& definition, cons
 
   const std::string& bookPath = APP_STATE.openEpubPath;
   const uint64_t book = ConceptEngine::fnv1a64(bookPath);
-  for (const auto& match : ConceptEngine::queryEpisodicAndShelf(contextVec, 4)) {
+  // A story refresher already ties the word to this book: only the small
+  // episodic index is worth a scan then, not the Inbox shelf.
+  for (const auto& match : ConceptEngine::queryEpisodicAndShelf(contextVec, 4, story.empty())) {
     if (match.dot < ConceptEngine::RELATED_MIN_DOT) break;
     if (match.pathHash == book && (match.shelf || !hasReadingPosition || match.page == readingPosition)) continue;
     appendNote("Related: " + ConceptEngine::describeMatch(match));

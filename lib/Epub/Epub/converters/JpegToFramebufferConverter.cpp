@@ -10,6 +10,7 @@
 #include <cstdlib>
 #include <memory>
 #include <new>
+#include <optional>
 
 #include "DirectPixelWriter.h"
 #include "DitherUtils.h"
@@ -54,6 +55,8 @@ struct JpegContext {
   int16_t* diffusionDown{nullptr};
   int16_t* diffusionCarry{nullptr};
   int diffusionCarryRows{0};
+  // CfC v2 dither head (contrast gain, error bleed) for the smooth path.
+  smooth_resample::DitherShaper* shaper{nullptr};
 
   uint32_t lastYieldMs{0};  // throttle state for yieldDuringDecode()
 };
@@ -218,7 +221,9 @@ int jpegDrawCallback(JPEGDRAW* pDraw) {
                                          [row, blockX](const int sx) { return static_cast<int>(row[sx - blockX]); });
         });
         const int outX = cfgX + dstX;
-        const uint8_t level = smooth_resample::diffuse(gray, ctx->diffusionDown, dstX, dstX == dstXStart, carry);
+        const bool spanStart = dstX == dstXStart;
+        const uint8_t level = smooth_resample::diffuse(ctx->shaper->shape(gray, spanStart), ctx->diffusionDown, dstX,
+                                                       spanStart, carry, ctx->shaper->bleedQ8());
         pw.writePixel(outX, level);
         if (caching) cw.writePixel(outX, level);
       }
@@ -530,12 +535,14 @@ bool JpegToFramebufferConverter::decodeToFramebuffer(const std::string& imagePat
 
   // Smooth path scratch (zeroed); without it the decode falls back to Bayer.
   std::unique_ptr<int16_t[]> diffusion;
+  std::optional<smooth_resample::DitherShaper> shaper;
   if (config.useExactDimensions && config.useDithering) {
     diffusion = makeUniqueNoThrow<int16_t[]>(static_cast<size_t>(destWidth + maxBlockDstRows));
     if (diffusion) {
       ctx.diffusionDown = diffusion.get();
       ctx.diffusionCarry = ctx.diffusionDown + destWidth;
       ctx.diffusionCarryRows = maxBlockDstRows;
+      ctx.shaper = &shaper.emplace();
     }
   }
 

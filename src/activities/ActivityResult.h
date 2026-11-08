@@ -73,9 +73,19 @@ struct BenchmarkResult {
   BenchmarkOutcome outcome = BenchmarkOutcome::Cancelled;
 };
 
+// How long the picture viewer showed a picture, and over how much of the
+// screen: the reader books it as image exposure for its refresh policy.
+struct PictureViewerResult {
+  uint32_t dwellMs = 0;
+  uint16_t areaPermille = 0;    // 0 = no picture was shown
+  uint16_t ditherPermille = 0;  // mid-gray (dithered) share of the picture
+  uint64_t tileMask = 0;        // AdaptiveRefreshPolicy tiles; 0 = all
+};
+
 using ResultVariant =
     std::variant<std::monostate, WifiResult, KeyboardResult, MenuResult, ChapterResult, PercentResult, IntervalResult,
-                 PageResult, ProgressChangeResult, NetworkModeResult, FootnoteResult, FilePathResult, BenchmarkResult>;
+                 PageResult, ProgressChangeResult, NetworkModeResult, FootnoteResult, FilePathResult, BenchmarkResult,
+                 PictureViewerResult>;
 
 struct ActivityResult {
   bool isCancelled = false;

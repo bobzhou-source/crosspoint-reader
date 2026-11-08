@@ -189,6 +189,7 @@ void TxtReaderActivity::loop() {
     showDictionaryMessage = false;
     requestUpdate();
   }
+  recordDwellContext();
   indexInBackground();
 }
 
@@ -700,18 +701,45 @@ void TxtReaderActivity::renderPage(GfxRenderer& renderer) {
   renderLines();
   renderStatusBar();
 
+  const uint32_t frameDwellMs = takeFrameDwellMs();
   if (ReaderUtils::textAntiAliasingVisible(renderer)) {
-    ReaderUtils::displayAdaptiveGrayscaleBase(renderer, refreshPolicy, takeFrameDwellMs());
+    ReaderUtils::displayAdaptiveGrayscaleBase(renderer, refreshPolicy, frameDwellMs);
     if (!ReaderUtils::renderAntiAliased(renderer, [&renderLines]() { renderLines(); })) {
       markBenchmarkRenderFailed();
     }
   } else {
-    ReaderUtils::displayAdaptive(renderer, refreshPolicy, /*hasImage=*/false, /*async=*/false, takeFrameDwellMs());
+    ReaderUtils::displayAdaptive(renderer, refreshPolicy, /*hasImage=*/false, /*async=*/false, frameDwellMs);
   }
+  noteFrameDwell(frameDwellMs);
 
   if (showDictionaryMessage) {
     GUI.drawPopup(renderer, tr(STR_DICT_NO_DICT_SET));
   }
+}
+
+void TxtReaderActivity::noteFrameDwell(const uint32_t dwellMs) {
+  if (isBenchmarkActivity()) return;
+  const int page = std::clamp(displayedPageNumber() - 1, 0, 0xFFFF);
+  auto& shown = dwellQueue.frameShown(dwellMs, static_cast<uint32_t>(page), millis());
+  for (const auto& line : currentPageLines) {
+    if (line.text.empty()) continue;
+    if (!shown.append(line.text) || !shown.append(" ")) break;
+  }
+}
+
+void TxtReaderActivity::recordDwellContext() {
+  if (isBenchmarkActivity() || shouldYieldBackgroundIndexing()) return;
+  ConceptEngine::PageDwellQueue::Page page;
+  {
+    // Never wait on a render; a turn still on its way (displayedOffset lags)
+    // goes first.
+    RenderLock lock(RenderLock::Mode::Try);
+    if (!lock.ownsLock() || displayedOffset != currentOffset ||
+        !dwellQueue.take(page, millis(), ConceptEngine::DWELL_SETTLE_MS)) {
+      return;
+    }
+  }
+  ConceptEngine::recordPageDwell(bookPath, page.index, page.slice(), page.dwellMs);
 }
 
 size_t TxtReaderActivity::estimatedBytesPerPage() const {

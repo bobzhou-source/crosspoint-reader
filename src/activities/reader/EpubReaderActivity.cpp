@@ -181,6 +181,18 @@ uint32_t storyCutoff(const Section* section, const int spineIndex) {
   return ConceptEngine::epubStoryCutoff(spineIndex, offset);
 }
 
+// The opening words of `page`, for its reading-context slice.
+void appendPageText(ConceptEngine::PageDwellQueue::Page& slice, const Page& page) {
+  for (const auto& element : page.elements) {
+    if (element->getTag() != TAG_PageLine) continue;
+    const auto* block = static_cast<const PageLine*>(element.get())->getBlock();
+    if (!block || !block->valid()) continue;
+    for (uint16_t i = 0; i < block->wordCount(); i++) {
+      if (!slice.append({block->wordText(i), block->wordTextLen(i)}) || !slice.append(" ")) return;
+    }
+  }
+}
+
 }  // namespace
 
 EpubReaderActivity::~EpubReaderActivity() {
@@ -475,12 +487,22 @@ bool EpubReaderActivity::openPictureViewer(const size_t index) {
   }
   pendingManualTurn = 0;
   // The section stays loaded underneath, so returning re-renders this page
-  // without re-paginating. The page replaces a grayscale picture, so it comes
-  // back with a clearing refresh rather than a differential one.
-  startActivityForResult(std::move(viewer), [this](const ActivityResult&) {
+  // without re-paginating. The viewer's picture is booked as image exposure
+  // (its dwell, area, dither share and tiles); LiquidRefresh's CfC gate then
+  // decides whether the returning page clears. Nothing shown (an error
+  // message): clear as before.
+  startActivityForResult(std::move(viewer), [this](const ActivityResult& result) {
     {
       RenderLock lock;
-      refreshPolicy.requestClear(AdaptiveRefreshPolicy::ClearSource::Image);
+      // The viewer covered the page's own pictures; its exposure replaces theirs.
+      shownPictureAreaPermille = 0;
+      shownPictureTiles = 0;
+      const auto* seen = std::get_if<PictureViewerResult>(&result.data);
+      if (seen && seen->areaPermille != 0) {
+        refreshPolicy.recordImageExposure(seen->dwellMs, seen->areaPermille, seen->ditherPermille, seen->tileMask);
+      } else {
+        refreshPolicy.requestClear(AdaptiveRefreshPolicy::ClearSource::Image);
+      }
     }
     requestUpdate();
   });
@@ -564,6 +586,8 @@ void EpubReaderActivity::loop() {
       idlePrewarmNextPage();
     }
   }
+
+  recordDwellContext();
 
   {
     RenderLock lock(RenderLock::Mode::Try);
@@ -1921,6 +1945,43 @@ bool EpubReaderActivity::inputPending() const {
          gpio.isTouchTapCandidate(nx, ny, heldMs) || gpio.rawInputActive();
 }
 
+void EpubReaderActivity::noteFrameDwell(const uint32_t dwellMs, const Page* page) {
+  if (isBenchmarkActivity() || !section) return;
+  auto& shown =
+      dwellQueue.frameShown(dwellMs, ConceptEngine::epubPosition(currentSpineIndex, section->currentPage), millis());
+  if (page) appendPageText(shown, *page);
+}
+
+void EpubReaderActivity::recordDwellContext() {
+  if (isBenchmarkActivity() || inputPending()) return;
+  ConceptEngine::PageDwellQueue::Page page;
+  {
+    // Never wait on a render; a turn still on its way (shown != current) goes
+    // first, and the page now up must have finished its display and settled.
+    RenderLock lock(RenderLock::Mode::Try);
+    const uint32_t now = millis();
+    if (!lock.ownsLock() || !section || shownSpineIndex != currentSpineIndex || shownPage != section->currentPage ||
+        now - lastRenderCompleteMs < ConceptEngine::DWELL_SETTLE_MS ||
+        !dwellQueue.take(page, now, ConceptEngine::DWELL_SETTLE_MS)) {
+      return;
+    }
+    if (page.slice().empty()) {
+      // A prerendered body carried no text: read the page back while it is
+      // still in the loaded section.
+      const int spine = static_cast<int>(page.index >> 16) - 1;
+      const int pageInSection = static_cast<int>(page.index & 0xFFFF);
+      if (spine != currentSpineIndex || section->isBuilding() ||
+          pageInSection >= static_cast<int>(section->pageCount)) {
+        return;
+      }
+      const auto loaded = section->loadPage(pageInSection);
+      if (!loaded) return;
+      appendPageText(page, *loaded);
+    }
+  }
+  ConceptEngine::recordPageDwell(bookPath, page.index, page.slice(), page.dwellMs);
+}
+
 void EpubReaderActivity::idlePrewarmNextPage() {
   const auto next = page_prerender::nextPageAfter(currentSpineIndex, section->currentPage, section->pageCount,
                                                   epub->getSpineItemsCount());
@@ -2140,8 +2201,18 @@ void EpubReaderActivity::renderContents(std::unique_ptr<Page> page, const int or
   benchmark::intervalMs(benchmark::EventType::Phase, tPrewarm, tBwRender,
                         static_cast<uint32_t>(benchmark::Phase::BwRender), prerenderDetail);
 
+  const uint32_t frameDwellMs = takeFrameDwellMs();
+  // The page being replaced showed pictures for that dwell: book the image
+  // exposure (LiquidRefresh CfC v2) before the policy decides this page.
+  if (shownPictureAreaPermille != 0) {
+    refreshPolicy.recordImageExposure(frameDwellMs, shownPictureAreaPermille, kInlinePictureDitherPermille,
+                                      shownPictureTiles);
+    shownPictureAreaPermille = 0;
+    shownPictureTiles = 0;
+  }
   const auto decision = ReaderUtils::decideRefreshWithRegion(renderer, refreshPolicy, pageHasImages, needsAnyGrayscale,
-                                                             regionClearAvailable, takeFrameDwellMs());
+                                                             regionClearAvailable, frameDwellMs);
+  noteFrameDwell(frameDwellMs, page.get());
   const auto refresh = decision.refresh;
   const bool regionClear = refresh == AdaptiveRefreshPolicy::Refresh::Region;
   const auto refreshMode = ReaderUtils::refreshModeFor(refresh);
@@ -2190,7 +2261,21 @@ void EpubReaderActivity::renderContents(std::unique_ptr<Page> page, const int or
   }
   // Image pages leave residue (gray waveforms, dithered fills) that FAST text
   // refreshes do not settle; by default the next page clears it.
-  if (pageHasImages) refreshPolicy.imagePageShown(pictureRect(*page, orientedMarginLeft, orientedMarginTop));
+  if (pageHasImages) {
+    const AdaptiveRefreshPolicy::Rect pictures = pictureRect(*page, orientedMarginLeft, orientedMarginTop);
+    refreshPolicy.imagePageShown(pictures);
+    const uint32_t screenW = static_cast<uint32_t>(renderer.getScreenWidth());
+    const uint32_t screenH = static_cast<uint32_t>(renderer.getScreenHeight());
+    if (screenW != 0 && screenH != 0) {
+      // Unknown picture bounds count as a full-screen picture.
+      const uint64_t covered = pictures.empty() ? uint64_t{screenW} * screenH
+                                                : uint64_t{static_cast<uint32_t>(pictures.w)} * pictures.h;
+      const uint64_t permille = covered * 1000 / (uint64_t{screenW} * screenH);
+      shownPictureAreaPermille = static_cast<uint16_t>(permille > 1000 ? 1000 : permille == 0 ? 1 : permille);
+      shownPictureTiles = AdaptiveRefreshPolicy::tileMaskFor(pictures, static_cast<uint16_t>(screenW),
+                                                             static_cast<uint16_t>(screenH));
+    }
+  }
   const auto tDisplay = millis();
   benchmark::intervalMs(benchmark::EventType::Phase, tBwRender, tDisplay,
                         static_cast<uint32_t>(benchmark::Phase::Display));

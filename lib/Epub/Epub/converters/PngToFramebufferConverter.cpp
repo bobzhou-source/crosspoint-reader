@@ -11,6 +11,7 @@
 #include <cstdlib>
 #include <memory>
 #include <new>
+#include <optional>
 
 #include "DirectPixelWriter.h"
 #include "DitherUtils.h"
@@ -55,6 +56,7 @@ struct PngContext {
   int32_t invScaleY{0};
   uint8_t* smoothRow{nullptr};
   uint8_t* smoothPrev{nullptr};
+  smooth_resample::DitherShaper* shaper{nullptr};  // CfC v2 dither head, set with smoothSum
   uint32_t* smoothSum{nullptr};
   int16_t* smoothDown{nullptr};
   int smoothRows{0};
@@ -255,7 +257,9 @@ void emitSmoothRow(PngContext* ctx, const int dstY, Value&& value) {
   const bool caching = beginOutputRow(ctx, dstY, outY, pw, cw);
   int carry = 0;
   for (int dstX = 0; dstX < ctx->dstWidth; dstX++) {
-    const uint8_t level = smooth_resample::diffuse(value(dstX), ctx->smoothDown, dstX, dstX == 0, carry);
+    const bool spanStart = dstX == 0;
+    const uint8_t level = smooth_resample::diffuse(ctx->shaper->shape(value(dstX), spanStart), ctx->smoothDown, dstX,
+                                                   spanStart, carry, ctx->shaper->bleedQ8());
     const int outX = ctx->config->x + dstX;
     if (outX >= ctx->screenWidth) continue;
     pw.writePixel(outX, level);
@@ -535,6 +539,7 @@ bool PngToFramebufferConverter::decodeToFramebuffer(const std::string& imagePath
   // the error row, then two resampled rows. Without it the decode falls back
   // to point sampling and Bayer.
   std::unique_ptr<uint32_t[]> smooth;
+  std::optional<smooth_resample::DitherShaper> shaper;
   if (config.useExactDimensions && config.useDithering && !retainAlpha && ctx.dstWidth > 0 && ctx.dstHeight > 0) {
     smooth = makeUniqueNoThrow<uint32_t[]>(static_cast<size_t>(ctx.dstWidth) * 2);
     if (smooth) {
@@ -546,6 +551,7 @@ bool PngToFramebufferConverter::decodeToFramebuffer(const std::string& imagePath
       ctx.smoothDown = reinterpret_cast<int16_t*>(ctx.smoothSum + ctx.dstWidth);
       ctx.smoothRow = reinterpret_cast<uint8_t*>(ctx.smoothDown + ctx.dstWidth);
       ctx.smoothPrev = ctx.smoothRow + ctx.dstWidth;
+      ctx.shaper = &shaper.emplace();
     }
   }
 

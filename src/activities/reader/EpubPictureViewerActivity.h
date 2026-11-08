@@ -13,10 +13,13 @@
 // (not the page-size .pxc) is decoded once at screen resolution, fit to the
 // screen in the reading orientation, and shown in grayscale. A direction
 // button turns the picture a quarter (and back). The decoded frame is kept
-// next to the source as a .pxv2 (.pxv2r turned) so reopening skips the decode.
+// next to the source as a .pxv3 (.pxv3r turned) so reopening skips the decode;
+// v3 frames carry the CfC v2 dither head (contrast gain, error bleed).
 // A tap, the Back swipe, or Back/Confirm returns to the page, which the reader
 // re-renders from its still-loaded section; a tap only counts once the frame
 // is up (see page_picture::ViewerCloseGate), so a double tap opens cleanly.
+// Closing reports a PictureViewerResult (dwell, area, dither, tiles) so the
+// reader's refresh policy can book the image exposure.
 class EpubPictureViewerActivity final : public Activity {
  public:
   EpubPictureViewerActivity(GfxRenderer& renderer, MappedInputManager& mappedInput, std::string imagePath);
@@ -36,8 +39,16 @@ class EpubPictureViewerActivity final : public Activity {
   std::atomic<uint32_t> shownAtMs{0};
   uint32_t gateShownAtMs = 0;
   page_picture::ViewerCloseGate closeGate;
+  // Exposure of the shown picture (render task writes, loop reads under the
+  // render lock): when it first went up, its screen share, mid-gray share and
+  // reader-orientation tiles (0 = all, e.g. when turned).
+  uint32_t exposureStartMs = 0;
+  uint16_t exposureAreaPermille = 0;
+  uint16_t exposureDitherPermille = 0;
+  uint64_t exposureTiles = 0;
 
   void showMessage(const char* message);
   void paint(bool rotate);
   void markShown();
+  void finishWithExposure();
 };

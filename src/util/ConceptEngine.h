@@ -133,15 +133,79 @@ std::string lookupEngramGloss(std::string_view word, const char* engramPath = EN
 bool appendEpisodicPage(std::string_view bookPath, uint32_t pageIndex, std::string_view pageText);
 bool appendEpisodicVector(std::string_view bookPath, uint32_t pageIndex, const int8_t vec[DIM]);
 
-// Best matches across episodic.idx and inbox-concepts.idx, highest first.
+// Best matches across episodic.idx and, with `includeShelf`, inbox-concepts.idx,
+// highest first.
 std::vector<Match> queryEpisodicAndShelf(std::string_view queryText, size_t maxResults = 3);
-std::vector<Match> queryEpisodicAndShelf(const int8_t queryVec[DIM], size_t maxResults = 3);
+std::vector<Match> queryEpisodicAndShelf(const int8_t queryVec[DIM], size_t maxResults = 3, bool includeShelf = true);
 
 // Vector of the most recently recorded episodic page.
 bool latestEpisodicVector(int8_t outVec[DIM]);
 // For each path hash, the dot of its inbox-concepts.idx vector with `query`;
 // INT32_MIN where the shelf has no record. Returns how many were found.
 size_t scoreShelf(const int8_t queryVec[DIM], const uint64_t* pathHashes, size_t count, int32_t* outDots);
+
+// ---- Reading context -----------------------------------------------------------
+
+// A page left after CONTEXT_DWELL_MS becomes the current reading context; one
+// left after EPISODE_DWELL_MS is also recorded in episodic.idx. Both use the
+// page's first DWELL_SLICE_BYTES of text. The encode waits until the next
+// page has stayed up DWELL_SETTLE_MS, so a quick follow-up turn goes first.
+constexpr uint32_t CONTEXT_DWELL_MS = 10000;
+constexpr uint32_t EPISODE_DWELL_MS = 20000;
+constexpr uint32_t DWELL_SETTLE_MS = 400;
+constexpr size_t DWELL_SLICE_BYTES = 200;
+
+// The in-memory reading context (RAM only: gone after a reboot). Main task.
+void setCurrentContext(const int8_t vec[DIM]);
+bool currentContext(int8_t outVec[DIM]);
+void clearCurrentContext();
+// The current context, else the newest episodic page: what Surprise Me and
+// Quick Break rank the Inbox shelf against.
+bool readingContext(int8_t outVec[DIM]);
+
+// Main task: the reader left page `pageIndex` (an episodic position) of
+// `bookPath` after `dwellMs`. Encodes `slice` into the current context from
+// CONTEXT_DWELL_MS and appends it to episodic.idx from EPISODE_DWELL_MS.
+// False when the dwell was too short or the slice empty (nothing changed).
+bool recordPageDwell(std::string_view bookPath, uint32_t pageIndex, std::string_view slice, uint32_t dwellMs);
+
+// Hands pages read at length from a reader's render task to its main task,
+// with no allocation or I/O on the render side. Not synchronized itself: both
+// sides hold the activity's render lock.
+class PageDwellQueue {
+ public:
+  struct Page {
+    uint32_t index = 0;    // episodic position (epubPosition, or a TXT page index)
+    uint32_t dwellMs = 0;  // how long it stayed on the panel
+    uint16_t length = 0;
+    char text[DWELL_SLICE_BYTES] = {};
+    // Empty when the render had no page text at hand (a prerendered body).
+    std::string_view slice() const { return {text, length}; }
+    // Appends to the slice, cut on a code point boundary at
+    // DWELL_SLICE_BYTES. False once the slice is full.
+    bool append(std::string_view more);
+  };
+
+  // Render task: page `index` just went up, `dwellMs` after the frame before
+  // it. Queues the page that frame showed when it stayed CONTEXT_DWELL_MS or
+  // longer (replacing an older queued one), then returns the new page with an
+  // empty slice to fill.
+  Page& frameShown(uint32_t dwellMs, uint32_t index, uint32_t nowMs);
+  // Main task: moves out the queued page once the frame after it has stayed
+  // up `settleMs`. False when nothing is queued or it is too soon.
+  bool take(Page& out, uint32_t nowMs, uint32_t settleMs);
+
+ private:
+  Page shown;
+  Page queued;
+  uint32_t shownAtMs = 0;
+  bool hasShown = false;
+  bool hasQueued = false;
+};
+
+// The longest prefix of `text` of at most `maxBytes` that does not split a
+// UTF-8 code point.
+std::string_view utf8Prefix(std::string_view text, size_t maxBytes);
 
 // "<label> p.<N>" (episodic, "ch.<S> p.<N>" for EPUB positions) or "<label>"
 // (shelf).

@@ -1118,9 +1118,10 @@ bool appendEpisodicPage(std::string_view bookPath, const uint32_t pageIndex, std
   return appendEpisodicVector(bookPath, pageIndex, vec);
 }
 
-std::vector<Match> queryEpisodicAndShelf(const int8_t queryVec[DIM], const size_t maxResults) {
+std::vector<Match> queryEpisodicAndShelf(const int8_t queryVec[DIM], const size_t maxResults, const bool includeShelf) {
   std::vector<Match> top;
   for (const bool shelf : {false, true}) {
+    if (shelf && !includeShelf) break;
     scanIndex(shelf ? paths.shelf : paths.episodic, [&](uint32_t, const uint8_t* record) {
       const int32_t score = recordDot(record, queryVec);
       if (top.size() < maxResults || score > top.back().dot) {
@@ -1166,6 +1167,71 @@ size_t scoreShelf(const int8_t queryVec[DIM], const uint64_t* pathHashes, const 
     return matched < count;
   });
   return matched;
+}
+
+namespace {
+int8_t currentContextVec[DIM];
+bool hasCurrentContext = false;
+}  // namespace
+
+void setCurrentContext(const int8_t vec[DIM]) {
+  memcpy(currentContextVec, vec, DIM);
+  hasCurrentContext = true;
+}
+
+bool currentContext(int8_t outVec[DIM]) {
+  if (!hasCurrentContext) return false;
+  memcpy(outVec, currentContextVec, DIM);
+  return true;
+}
+
+void clearCurrentContext() { hasCurrentContext = false; }
+
+bool readingContext(int8_t outVec[DIM]) { return currentContext(outVec) || latestEpisodicVector(outVec); }
+
+bool recordPageDwell(std::string_view bookPath, const uint32_t pageIndex, std::string_view slice,
+                     const uint32_t dwellMs) {
+  if (dwellMs < CONTEXT_DWELL_MS || slice.empty()) return false;
+  int8_t vec[DIM];
+  encodeText(slice, vec);
+  setCurrentContext(vec);
+  if (dwellMs >= EPISODE_DWELL_MS && !bookPath.empty()) appendEpisodicVector(bookPath, pageIndex, vec);
+  return true;
+}
+
+std::string_view utf8Prefix(std::string_view text, const size_t maxBytes) {
+  if (text.size() <= maxBytes) return text;
+  size_t n = maxBytes;
+  while (n > 0 && continuation(static_cast<uint8_t>(text[n]))) --n;
+  return text.substr(0, n);
+}
+
+PageDwellQueue::Page& PageDwellQueue::frameShown(const uint32_t dwellMs, const uint32_t index, const uint32_t nowMs) {
+  if (hasShown && dwellMs >= CONTEXT_DWELL_MS) {
+    queued = shown;
+    queued.dwellMs = dwellMs;
+    hasQueued = true;
+  }
+  shown.index = index;
+  shown.dwellMs = 0;
+  shown.length = 0;
+  shownAtMs = nowMs;
+  hasShown = true;
+  return shown;
+}
+
+bool PageDwellQueue::Page::append(std::string_view more) {
+  const std::string_view part = utf8Prefix(more, DWELL_SLICE_BYTES - length);
+  if (!part.empty()) memcpy(text + length, part.data(), part.size());
+  length = static_cast<uint16_t>(length + part.size());
+  return part.size() == more.size() && length < DWELL_SLICE_BYTES;
+}
+
+bool PageDwellQueue::take(Page& out, const uint32_t nowMs, const uint32_t settleMs) {
+  if (!hasQueued || nowMs - shownAtMs < settleMs) return false;
+  out = queued;
+  hasQueued = false;
+  return true;
 }
 
 std::string describeMatch(const Match& match) {

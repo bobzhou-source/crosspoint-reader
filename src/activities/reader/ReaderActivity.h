@@ -1,6 +1,7 @@
 #pragma once
 
 #include <AdaptiveRefreshPolicy.h>
+#include <Epub/converters/SmoothResample.h>
 
 #include <atomic>
 #include <memory>
@@ -24,6 +25,8 @@ class ReaderActivity : public Activity {
   // one) and restarts that clock; the refresh policy relaxes ghosting debt over
   // it. Call once per page frame, right before deciding its refresh.
   uint32_t takeFrameDwellMs();
+  // smooth_resample::DitherProvider: this policy's CfC dither head.
+  static smooth_resample::DitherParams ditherFor(void* context, uint16_t edgePermille, uint16_t midGrayPermille);
   // Main task, from loop(): writes liquid-refresh.bin when a manual refresh
   // taught the refresh policy since the last save.
   void saveLearnedRefresh();

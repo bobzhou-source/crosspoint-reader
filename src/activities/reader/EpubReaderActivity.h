@@ -19,6 +19,7 @@
 #include "ReaderActivity.h"
 #include "ReaderToolbarUi.h"
 #include "components/OptionPopup.h"
+#include "util/ConceptEngine.h"
 
 struct AnnotationEntry;
 
@@ -60,6 +61,9 @@ class EpubReaderActivity : public ReaderActivity {
   // page, in place of rendering the page body again. Built, presented and
   // invalidated only under the RenderLock.
   PagePrerender prerender;
+  // Pages read at length, from renderContents() to loop(): see noteFrameDwell.
+  // Guarded by the render lock.
+  ConceptEngine::PageDwellQueue dwellQueue;
   // The layout the current section was loaded with (set whenever renderBook()
   // creates the section) and the oriented margins the last page render drew
   // at: what a prerendered successor in the same section must share.
@@ -127,6 +131,12 @@ class EpubReaderActivity : public ReaderActivity {
   std::vector<PagePicture> currentPagePictures;
   int currentPageLinkMarginLeft = 0;
   int currentPageLinkMarginTop = 0;
+  // Pictures on the frame now on screen (render task): their share of the
+  // screen and tiles, booked as image exposure when the next frame replaces it.
+  // Inline pictures are dithered grays; their pixel stats are not kept.
+  static constexpr uint16_t kInlinePictureDitherPermille = 600;
+  uint16_t shownPictureAreaPermille = 0;
+  uint64_t shownPictureTiles = 0;
   struct SavedPosition {
     int spineIndex;
     int pageNumber;
@@ -256,6 +266,14 @@ class EpubReaderActivity : public ReaderActivity {
   bool prerenderPage(const Page& page, int spineIndex, int pageIndex, uint32_t sectionPageCount,
                      const ReaderRenderSpec& spec);
   void prerenderNextSectionPage(int nextSpineIndex);
+  // Render task, right after the refresh decision for the page now going up:
+  // queues the page before it when it stayed ConceptEngine::CONTEXT_DWELL_MS,
+  // and keeps this page's opening text (none for a prerendered body: `page`
+  // null, loaded later if it is ever needed).
+  void noteFrameDwell(uint32_t dwellMs, const Page* page);
+  // loop(): encodes a queued page into the reading context once the screen
+  // has settled (off the page-turn path).
+  void recordDwellContext();
   void renderStatusBar() const;
   void applyOrientation(uint8_t orientation);
   void applyInitialOrientation() override;

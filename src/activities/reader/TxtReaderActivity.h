@@ -11,6 +11,7 @@
 
 #include "CrossPointSettings.h"
 #include "ReaderActivity.h"
+#include "util/ConceptEngine.h"
 
 class ReaderWordPage;
 
@@ -54,6 +55,15 @@ class TxtReaderActivity final : public ReaderActivity {
   // "No dictionary selected" note after a hold or the menu's Dictionary entry.
   bool showDictionaryMessage = false;
   unsigned long dictionaryMessageTime = 0UL;
+
+  // Pages read at length, from renderPage() to loop(): see noteFrameDwell.
+  ConceptEngine::PageDwellQueue dwellQueue;
+  // Render task, once a page is up: queues the page before it when it stayed
+  // ConceptEngine::CONTEXT_DWELL_MS, and keeps this page's opening text.
+  void noteFrameDwell(uint32_t dwellMs);
+  // loop(): encodes a queued page into the reading context once the screen
+  // has settled (off the page-turn path).
+  void recordDwellContext();
 
   // Retained source handle and 8KB page window, shared by indexing and page renders.
   TxtPagination::SourceWindow sourceWindow;

@@ -13,6 +13,8 @@ ClearCause clearCause(const AdaptiveRefreshPolicy::ClearRecord& record) {
       return ClearCause::Debt;
     case Reason::SafetyCap:
       return ClearCause::SafetyCap;
+    case Reason::ImageSticking:
+      return ClearCause::ImageSticking;
     case Reason::PolarityChange:
       return ClearCause::Polarity;
     case Reason::InvalidFrame:

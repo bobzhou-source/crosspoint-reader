@@ -1,6 +1,7 @@
 #include "ReaderActivity.h"
 
 #include <Benchmark.h>
+#include <Epub/converters/SmoothResample.h>
 #include <FontCacheManager.h>
 #include <FsHelpers.h>
 #include <HalStorage.h>
@@ -58,6 +59,14 @@ uint32_t ReaderActivity::takeFrameDwellMs() {
   lastFrameMs = now;
   lastFrameShown = true;
   return dwell;
+}
+
+// Render task (picture decodes run inside page renders, under the render lock).
+smooth_resample::DitherParams ReaderActivity::ditherFor(void* context, const uint16_t edgePermille,
+                                                        const uint16_t midGrayPermille) {
+  const auto params =
+      static_cast<ReaderActivity*>(context)->refreshPolicy.computeImageDitherParams(edgePermille, midGrayPermille);
+  return {params.contrastGainQ8, params.errorBleedQ8};
 }
 
 // Main task: snapshot the readout under the render lock, write it outside.
@@ -132,6 +141,9 @@ void ReaderActivity::onEnter() {
     RenderLock lock;
     // Benchmarks measure the compiled policy, never what this card learned.
     if (!isBenchmarkActivity()) refresh_policy_store::loadLearned(refreshPolicy);
+    // Exact-size picture decodes (page pictures, the viewer) take their
+    // contrast gain and error bleed from this policy's CfC dither head.
+    smooth_resample::setDitherProvider(&ReaderActivity::ditherFor, this);
     loaded = loadBook();
   }
   if (!loaded) {
@@ -178,6 +190,8 @@ void ReaderActivity::onExit() {
     benchmark::point(benchmark::EventType::RunStep, benchmarkPhase, *benchmarkCompleted, benchmarkTarget,
                      static_cast<uint32_t>(outcome));
   }
+  // Exit runs under the render lock, so no decode is using the provider.
+  if (smooth_resample::ditherProviderContext == this) smooth_resample::setDitherProvider(nullptr, nullptr);
   Activity::onExit();
 
   // Keep rebuildable font buffers from pinning the heap between reading sessions.
@@ -284,6 +298,8 @@ bool ReaderActivity::startBoomerangBreak() {
   }
   const std::string breakBook = findInboxBreakBook();
   if (breakBook.empty()) {
+    // The row's cheap probe was wrong (everything there is read): drop the row.
+    forgetInboxBreakBook();
     return false;
   }
   // The source page/offset is already in progress.bin: every reader saves it as it
@@ -332,9 +348,10 @@ bool ReaderActivity::handleBoomerangEndOfBook() {
 boomerang::Row ReaderActivity::boomerangRow() {
   boomerang::Row row;
   const std::string breakPath = APP_STATE.boomerangReturnPath;
-  // The Inbox is probed only when the row could point that way: a Quick Break row
-  // that can do nothing is worse than none.
-  const bool hasItem = breakPath.empty() && !isInboxBook() && !findInboxBreakBook().empty();
+  // The Inbox is probed only when the row could point that way, and then through
+  // a once-per-boot check: More must open without scanning the card. Pressing
+  // the row runs the real scan and hides it if nothing unread is left.
+  const bool hasItem = breakPath.empty() && !isInboxBook() && hasInboxBreakBook();
   switch (boomerang::planBreakRow(bookPath, breakPath, isInboxBook(), hasItem)) {
     case boomerang::BreakRowKind::BackToBook:
       row.backToTitle = boomerangReturnTitle();

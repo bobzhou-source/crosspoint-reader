@@ -2,6 +2,7 @@
 
 #include <cmath>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <vector>
 
@@ -960,4 +961,202 @@ TEST(LiquidRefresh, PolicyClearsEndTheTraceAndBadStateIsRejected) {
   EXPECT_EQ(other.liquidReadout(), readout);
   other.resetLearnedState();
   EXPECT_EQ(other.liquidReadout(), Policy::LiquidReadout{});
+}
+
+namespace {
+
+// The card's policy file (refresh-policy.json): what the CfC was fitted under.
+Policy::Config cardConfig() {
+  Policy::Config c;
+  c.clearThresholdPermille = 10000;
+  c.nightClearThresholdPermille = 8000;
+  c.safetyCap = 48;
+  c.weightGrayscalePermille = c.weightImagePermille = c.weightGrayscaleImageExtraPermille = 0;
+  c.frameChargePermille = 0;
+  c.clearAfterImage = false;
+  return c;
+}
+
+uint32_t fnv1a(const uint8_t* p, size_t n) {
+  uint32_t h = 2166136261u;
+  while (n--) h = (h ^ *p++) * 16777619u;
+  return h;
+}
+
+// A text page after a recorded image: refresh, reason and y0 for `dwellMs`.
+Policy::Decision textAfterImage(uint32_t dwellMs, uint16_t areaPermille, uint64_t tiles = 0,
+                                const uint16_t* changedTiles = nullptr) {
+  Policy p(false, cardConfig());
+  EXPECT_EQ(step(p, dwell(300, 30000)).refresh, Refresh::Fast);
+  p.recordImageExposure(dwellMs, areaPermille, 600, tiles);
+  if (changedTiles) p.recordTileTransitions(changedTiles, 0);
+  return step(p, dwell(300, dwellMs + 400));
+}
+
+}  // namespace
+
+TEST(LiquidCfc, TextChargeRisesWithRapidTurnsAndRelaxesOverAReadingDwell) {
+  Policy p(false, cardConfig());
+  EXPECT_EQ(p.cfcChargeQ8(), 0);
+  int16_t previous = 0;
+  for (int i = 0; i < 6; ++i) {
+    ASSERT_EQ(step(p, dwell(400, 600)).refresh, Refresh::Fast) << i;
+    EXPECT_GT(p.cfcChargeQ8(), previous) << "turn " << i;
+    previous = p.cfcChargeQ8();
+  }
+  EXPECT_GT(previous, 128) << "six 0.6 s turns charge the cell past half scale";
+  step(p, dwell(400, 30000));
+  EXPECT_LT(p.cfcChargeQ8(), previous / 2) << "a 30 s read relaxes the charge";
+  for (uint8_t u = 0; u < Policy::kCfcUnits; ++u) {
+    EXPECT_GE(p.cfcHiddenQ8(u), -256);
+    EXPECT_LE(p.cfcHiddenQ8(u), 256);
+  }
+}
+
+TEST(LiquidCfc, ImageStickingGrowsWithViewingDwellAndRelaxesUnderText) {
+  int16_t previous = -1;
+  for (const uint32_t ms : {500u, 2000u, 4000u, 8000u, 16000u, 40000u}) {
+    Policy p(false, cardConfig());
+    p.recordImageExposure(ms, 500, 600);
+    EXPECT_GT(p.cfcStickQ8(), previous) << ms;
+    previous = p.cfcStickQ8();
+    EXPECT_NE(p.imageTileMask(), 0u) << "an unknown footprint covers every tile";
+  }
+  EXPECT_GT(previous, 64);
+
+  Policy p(false, cardConfig());
+  p.recordImageExposure(15000, 60, 600);
+  int16_t stick = p.cfcStickQ8();
+  EXPECT_GT(stick, 0);
+  for (int i = 0; i < 4; ++i) {
+    ASSERT_EQ(step(p, dwell(300, 30000)).refresh, Refresh::Fast) << "a 6% picture does not force a clear";
+    EXPECT_LT(p.cfcStickQ8(), stick) << "text page " << i;
+    stick = p.cfcStickQ8();
+  }
+}
+
+TEST(LiquidCfc, ALargeLongViewedImageClearsTheTextPageThatOverwritesIt) {
+  for (const uint32_t ms : {4000u, 8000u, 16000u, 40000u}) {
+    for (const uint16_t area : {250, 400, 900}) {
+      const auto d = textAfterImage(ms, area);
+      EXPECT_EQ(d.refresh, Refresh::Clear) << ms << " ms, " << area << " permille";
+      EXPECT_EQ(d.reason, Reason::ImageSticking) << ms << " ms, " << area << " permille";
+    }
+    for (const uint16_t area : {20, 50}) {
+      const auto d = textAfterImage(ms, area);
+      EXPECT_EQ(d.refresh, Refresh::Fast) << ms << " ms, " << area << " permille";
+    }
+  }
+
+  // The clear ends the episode: the next text page is fast again.
+  Policy p(false, cardConfig());
+  p.recordImageExposure(20000, 700, 800);
+  const auto cleared = step(p, dwell(300, 20400));
+  ASSERT_EQ(cleared.reason, Reason::ImageSticking);
+  EXPECT_GE(p.cfcRefreshLogit(), 0);
+  EXPECT_EQ(p.imageTileMask(), 0u);
+  EXPECT_EQ(step(p, dwell(300, 30000)).refresh, Refresh::Fast);
+}
+
+TEST(LiquidCfc, OnlyTextChangingTilesThePictureCoveredCanStickClear) {
+  EXPECT_EQ(Policy::tileMaskFor({0, 0, 100, 80}, 800, 480), 1u);
+  EXPECT_EQ(Policy::tileMaskFor({700, 400, 100, 80}, 800, 480), uint64_t{1} << 47);
+  EXPECT_EQ(Policy::tileMaskFor({0, 0, 800, 480}, 800, 480), ~uint64_t{0} >> (64 - Policy::kTileCount));
+  EXPECT_EQ(Policy::tileMaskFor({0, 0, 0, 80}, 800, 480), 0u);
+
+  // A picture in the top-left quarter; the next page changes text elsewhere.
+  const uint64_t topLeft = Policy::tileMaskFor({0, 0, 400, 240}, 800, 480);
+  uint16_t elsewhere[Policy::kTileCount];
+  for (uint8_t i = 0; i < Policy::kTileCount; ++i) elsewhere[i] = (topLeft >> i) & 1 ? 0 : 300;
+  EXPECT_EQ(textAfterImage(40000, 250, topLeft, elsewhere).refresh, Refresh::Fast);
+  uint16_t over[Policy::kTileCount];
+  for (auto& t : over) t = 300;
+  const auto d = textAfterImage(40000, 250, topLeft, over);
+  EXPECT_EQ(d.refresh, Refresh::Clear);
+  EXPECT_EQ(d.reason, Reason::ImageSticking);
+}
+
+TEST(LiquidCfc, DitherHeadTightensBleedAndOpensContrastOnLineDiagrams) {
+  Policy p(false, cardConfig());
+  const auto photo = p.computeImageDitherParams(0, 800);
+  const auto diagram = p.computeImageDitherParams(250, 100);
+  EXPECT_LT(diagram.errorBleedQ8, photo.errorBleedQ8);
+  EXPECT_GT(diagram.contrastGainQ8, photo.contrastGainQ8);
+  EXPECT_GE(photo.errorBleedQ8, 240) << "continuous-tone photos keep (nearly) full diffusion";
+  EXPECT_LE(diagram.errorBleedQ8, 200);
+  for (const auto& d : {photo, diagram}) {
+    EXPECT_GE(d.contrastGainQ8, Policy::kContrastGainMinQ8);
+    EXPECT_LE(d.contrastGainQ8, Policy::kContrastGainMaxQ8);
+    EXPECT_GE(d.errorBleedQ8, Policy::kErrorBleedMinQ8);
+    EXPECT_LE(d.errorBleedQ8, Policy::kErrorBleedMaxQ8);
+  }
+  // Edge density saturates at kCfcEdgeFullPermille, and the query is pure.
+  EXPECT_EQ(p.computeImageDitherParams(Policy::kCfcEdgeFullPermille, 100), p.computeImageDitherParams(1000, 100));
+  EXPECT_EQ(p.computeImageDitherParams(0, 800), photo);
+  EXPECT_EQ(p.cfcStickQ8(), 0);
+
+  // Panel gray debt from a long image view opens the contrast further.
+  Policy worn(false, cardConfig());
+  worn.recordImageExposure(20000, 700, 800);
+  EXPECT_GT(worn.computeImageDitherParams(120, 100).contrastGainQ8, p.computeImageDitherParams(120, 100).contrastGainQ8);
+}
+
+TEST(LiquidCfc, EpropLearnsTheGateReadoutAndLqrfV2KeepsIt) {
+  Policy p(false);
+  const auto fitted = p.cfcReadout();
+  EXPECT_EQ(fitted, Policy::cfcFittedReadout());
+  for (int i = 0; i < 6; ++i) ASSERT_EQ(step(p, dwell(100, 600)).refresh, Refresh::Fast) << i;
+  bool traced = false;
+  for (uint8_t u = 0; u < Policy::kCfcUnits; ++u) traced |= p.cfcTraceQ8(u) != 0;
+  EXPECT_TRUE(traced);
+  manualClear(p);
+  ASSERT_TRUE(p.recordManualRefresh());
+  EXPECT_EQ(p.cfcUpdates(), 1u);
+  EXPECT_NE(p.cfcReadout(), fitted);
+  EXPECT_GT(p.cfcReadout().b, fitted.b) << "a late clear pushes the gate's bias open";
+  for (uint8_t u = 0; u < Policy::kCfcUnits; ++u) EXPECT_EQ(p.cfcTraceQ8(u), 0) << "the trace was consumed";
+
+  // Many complaints: every weight stays within the drift bound of the fit.
+  annoy(p, 200);
+  const auto learned = p.cfcReadout();
+  for (uint8_t u = 0; u < Policy::kCfcUnits; ++u) {
+    EXPECT_LE(std::abs(learned.w[u] - fitted.w[u]), Policy::kCfcReadoutDrift) << int(u);
+  }
+  EXPECT_LE(std::abs(learned.b - fitted.b), Policy::kCfcReadoutDrift);
+
+  uint8_t buf[Policy::kLearnedStateBytes];
+  ASSERT_EQ(Policy::kLearnedStateBytes, 64u);
+  ASSERT_EQ(p.saveLearnedState(buf, sizeof buf), Policy::kLearnedStateBytes);
+  Policy restored(false);
+  ASSERT_TRUE(restored.loadLearnedState(buf, sizeof buf));
+  EXPECT_EQ(restored.cfcReadout(), learned);
+  EXPECT_EQ(restored.cfcUpdates(), p.cfcUpdates());
+  EXPECT_EQ(restored.liquidReadout(), p.liquidReadout());
+  restored.reset();  // a new book keeps what was learned
+  EXPECT_EQ(restored.cfcReadout(), learned);
+  restored.resetLearnedState();
+  EXPECT_EQ(restored.cfcReadout(), fitted);
+  EXPECT_EQ(restored.cfcUpdates(), 0u);
+
+  // A v1 (rc10 LiquidRefresh) 32-byte file still loads: its v1 readout, the
+  // fitted CfC readout.
+  uint8_t v1[Policy::kLearnedStateV1Bytes];
+  std::memcpy(v1, buf, 28);
+  const uint16_t version = 1;
+  const uint16_t bytes = Policy::kLearnedStateV1Bytes;
+  std::memcpy(v1 + 4, &version, 2);
+  std::memcpy(v1 + 6, &bytes, 2);
+  const uint32_t check = fnv1a(v1, 28);
+  std::memcpy(v1 + 28, &check, 4);
+  Policy upgraded(false);
+  ASSERT_TRUE(upgraded.loadLearnedState(v1, sizeof v1));
+  EXPECT_EQ(upgraded.liquidReadout(), p.liquidReadout());
+  EXPECT_EQ(upgraded.liquidUpdates(), p.liquidUpdates());
+  EXPECT_EQ(upgraded.cfcReadout(), fitted);
+  EXPECT_EQ(upgraded.cfcUpdates(), 0u);
+  v1[10] ^= 0x01;
+  EXPECT_FALSE(Policy(false).loadLearnedState(v1, sizeof v1));
+
+  // A v2 header cut to the v1 size is rejected.
+  EXPECT_FALSE(Policy(false).loadLearnedState(buf, Policy::kLearnedStateV1Bytes));
 }

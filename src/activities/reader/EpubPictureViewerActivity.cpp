@@ -1,9 +1,11 @@
 #include "EpubPictureViewerActivity.h"
 
+#include <AdaptiveRefreshPolicy.h>
 #include <Epub/PagePicture.h>
 #include <Epub/converters/DirectPixelWriter.h>
 #include <Epub/converters/ImageDecoderFactory.h>
 #include <Epub/converters/ImageDimsProbe.h>
+#include <Epub/converters/SmoothResample.h>
 #include <HalDisplay.h>
 #include <HalStorage.h>
 #include <I18n.h>
@@ -28,15 +30,18 @@ static_assert(page_picture::MAX_SOURCE_DIMENSION == ImageToFramebufferDecoder::M
 // header has not turned up by then.
 constexpr size_t MAX_PROBE_BYTES = 1024 * 1024;
 constexpr size_t PROBE_CHUNK_BYTES = 128;
+// Mid-gray share assumed for a frame replayed from its cache (no decode stats).
+constexpr uint16_t CACHED_FRAME_DITHER_PERMILLE = 600;
 // Rows of the decoded frame read per SD access when replaying a plane.
 constexpr size_t REPLAY_READ_BYTES = 4096;
 
 // The full-screen frame lives beside the source image in the book cache (and
 // goes with it when the cache is deleted). A distinct extension: page caches
-// are always "<stem>.pxc". Version 2 is the smoothed, error-diffused frame;
-// the turned layout has its own file so toggling does not re-decode.
+// are always "<stem>.pxc". Version 3 is the smoothed, error-diffused frame
+// shaped by the CfC v2 dither head; the turned layout has its own file so
+// toggling does not re-decode.
 std::string viewCachePath(const std::string& imagePath, const bool rotate) {
-  return imagePath + (rotate ? ".pxv2r" : ".pxv2");
+  return imagePath + (rotate ? ".pxv3r" : ".pxv3");
 }
 
 bool probeSourceDimensions(const std::string& path, uint32_t& width, uint32_t& height) {
@@ -115,9 +120,12 @@ EpubPictureViewerActivity::EpubPictureViewerActivity(GfxRenderer& renderer, Mapp
 void EpubPictureViewerActivity::onEnter() {
   Activity::onEnter();
   readerOrientation = renderer.getOrientation();
-  // Version-1 frames (point-sampled, Bayer-dithered) are never read again.
-  const std::string legacy = imagePath + ".pxv";
-  if (Storage.exists(legacy.c_str())) Storage.remove(legacy.c_str());
+  // Earlier frames (v1 point-sampled/Bayer, v2 without the dither head) are
+  // never read again.
+  for (const char* stale : {".pxv", ".pxv2", ".pxv2r"}) {
+    const std::string legacy = imagePath + stale;
+    if (Storage.exists(legacy.c_str())) Storage.remove(legacy.c_str());
+  }
   requestUpdate();
 }
 
@@ -149,11 +157,30 @@ void EpubPictureViewerActivity::loop() {
     rotated = !rotated;
     requestUpdate();
   } else if (mappedInput.wasAnyReleased() || (touchMayClose && (tapped || backSwipe))) {
-    finish();
+    finishWithExposure();
   }
 }
 
-void EpubPictureViewerActivity::markShown() { shownAtMs = std::max<uint32_t>(1, millis()); }
+void EpubPictureViewerActivity::markShown() {
+  const uint32_t now = std::max<uint32_t>(1, millis());
+  if (exposureStartMs == 0 && exposureAreaPermille != 0) exposureStartMs = now;
+  shownAtMs = now;
+}
+
+void EpubPictureViewerActivity::finishWithExposure() {
+  PictureViewerResult seen;
+  {
+    RenderLock lock;
+    if (exposureStartMs != 0 && exposureAreaPermille != 0) {
+      seen.dwellMs = std::max<uint32_t>(1, millis()) - exposureStartMs;
+      seen.areaPermille = exposureAreaPermille;
+      seen.ditherPermille = exposureDitherPermille;
+      seen.tileMask = exposureTiles;
+    }
+  }
+  setResult(std::move(seen));
+  finish();
+}
 
 void EpubPictureViewerActivity::showMessage(const char* message) {
   renderer.setOrientation(readerOrientation);
@@ -212,6 +239,7 @@ void EpubPictureViewerActivity::paint(const bool rotate) {
   }
   renderer.clearScreen();
   bool frameCached = haveFrame && drawFromViewCache(renderer, cachePath, fit);
+  uint16_t ditherPermille = CACHED_FRAME_DITHER_PERMILLE;
   if (!frameCached) {
     renderer.clearScreen();
     RenderConfig config;
@@ -229,11 +257,29 @@ void EpubPictureViewerActivity::paint(const bool rotate) {
       showMessage(decoder->lastDecodeTooLarge() ? tr(STR_PICTURE_TOO_LARGE) : tr(STR_FILE_OPEN_FAILED));
       return;
     }
+    ditherPermille = smooth_resample::lastMidGrayPermille;
     HalFile written;
     frameCached = openViewCache(cachePath, fit, written);
     if (frameCached) written.close();
   }
   renderer.preserveImagePolarity(fit.x, fit.y, fit.width, fit.height);
+  {
+    const uint32_t screenW = static_cast<uint32_t>(renderer.getScreenWidth());
+    const uint32_t screenH = static_cast<uint32_t>(renderer.getScreenHeight());
+    if (screenW != 0 && screenH != 0 && fit.width > 0 && fit.height > 0) {
+      const uint64_t permille = uint64_t{static_cast<uint32_t>(fit.width)} * static_cast<uint32_t>(fit.height) * 1000 /
+                                (uint64_t{screenW} * screenH);
+      exposureAreaPermille = static_cast<uint16_t>(permille > 1000 ? 1000 : permille == 0 ? 1 : permille);
+      exposureDitherPermille = ditherPermille;
+      // A turned picture's tiles are in the turned frame: count all of them.
+      exposureTiles = fit.rotate ? 0
+                                 : AdaptiveRefreshPolicy::tileMaskFor(
+                                       AdaptiveRefreshPolicy::Rect{static_cast<int16_t>(fit.x), static_cast<int16_t>(fit.y),
+                                                                   static_cast<int16_t>(fit.width),
+                                                                   static_cast<int16_t>(fit.height)},
+                                       static_cast<uint16_t>(screenW), static_cast<uint16_t>(screenH));
+    }
+  }
   LOG_DBG("PIC", "%ux%u -> %dx%d at %d,%d%s", sourceWidth, sourceHeight, fit.width, fit.height, fit.x, fit.y,
           fit.rotate ? " (rotated)" : "");
 

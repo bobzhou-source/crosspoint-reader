@@ -57,15 +57,18 @@ bool loadLearned(AdaptiveRefreshPolicy& policy) {
   uint8_t bytes[AdaptiveRefreshPolicy::kLearnedStateBytes];
   HalFile file;
   if (!Storage.exists(path)) return false;
-  if (!Storage.openFileForRead("RPOL", path, file) || file.size() != sizeof(bytes) ||
-      file.read(bytes, sizeof(bytes)) != static_cast<int>(sizeof(bytes)) ||
-      !policy.loadLearnedState(bytes, sizeof(bytes))) {
+  // A 32-byte v1 file (rc10 LiquidRefresh v1) still loads its readout.
+  const bool opened = Storage.openFileForRead("RPOL", path, file);
+  const size_t size = opened ? file.size() : 0;
+  if (!opened || (size != sizeof(bytes) && size != AdaptiveRefreshPolicy::kLearnedStateV1Bytes) ||
+      file.read(bytes, size) != static_cast<int>(size) || !policy.loadLearnedState(bytes, size)) {
     LOG_ERR("RPOL", "Ignoring %s: unreadable or invalid", path);
     return false;
   }
   const auto& w = policy.liquidReadout().w;
-  LOG_INF("RPOL", "Liquid refresh readout loaded: debt=%d peak=%d streak=%d bias=%d updates=%lu", w[0], w[1], w[2],
-          w[3], static_cast<unsigned long>(policy.liquidUpdates()));
+  LOG_INF("RPOL", "Liquid refresh readout loaded: debt=%d peak=%d streak=%d bias=%d updates=%lu cfc_updates=%lu", w[0],
+          w[1], w[2], w[3], static_cast<unsigned long>(policy.liquidUpdates()),
+          static_cast<unsigned long>(policy.cfcUpdates()));
   return true;
 }
 

@@ -320,3 +320,19 @@ TEST(RefreshClearRows, RowsShareTheRecorderQueueCapAndFileLimit) {
   EXPECT_EQ(writer.event(footer, /*terminal=*/true), Writer::Result::Written);
   EXPECT_LE(writer.bytes(), Writer::MAX_BYTES);
 }
+
+TEST(RefreshClearRows, CfcImageStickingClearHasItsOwnCause) {
+  Recorder recorder;
+  Policy policy = attached(recorder);
+  auto text = page(300);
+  text.elapsedMs = 30000;
+  ASSERT_EQ(step(policy, text), Refresh::Fast);
+  policy.recordImageExposure(40000, 600, 600);
+  text.elapsedMs = 40400;
+  const auto decision = policy.decide(text);
+  ASSERT_EQ(decision.reason, Policy::Reason::ImageSticking);
+  policy.commit(decision.refresh);
+  const auto rows = recorder.drain();
+  ASSERT_EQ(rows.size(), 1u);
+  EXPECT_EQ(rows[0].data[0], static_cast<uint32_t>(ClearCause::ImageSticking));
+}

@@ -18,7 +18,8 @@ enum class ClearCause : uint8_t {
   Overlay = 7,       // a closing overlay promoted the repaint (option popup, night toggle)
   Polarity = 8,      // output inversion flipped
   InvalidFrame = 9,  // framebuffer metrics unreadable
-  Requested = 10     // another reader request (reopen without fast resume, picture fallback, ...)
+  Requested = 10,    // another reader request (reopen without fast resume, picture fallback, ...)
+  ImageSticking = 11  // LiquidRefresh CfC v2: the page overwrote a polarized picture
 };
 
 // Slot 5 bit flags.

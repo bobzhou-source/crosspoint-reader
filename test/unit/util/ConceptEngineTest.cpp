@@ -308,6 +308,7 @@ class ConceptEngineTest : public ::testing::Test {
 
   void TearDown() override {
     ce::unloadModel();
+    ce::clearCurrentContext();
     ce::setPaths(ce::Paths{});
     fs::remove_all(dir);
   }
@@ -586,6 +587,115 @@ TEST_F(ConceptEngineTest, ShelfRecordsJoinQueriesAndScores) {
   EXPECT_EQ(dots[1], INT32_MIN);
   EXPECT_GT(dots[2], dots[0]);
   EXPECT_EQ(dots[2], ce::dot(query, baking.vec.data()));
+}
+
+TEST_F(ConceptEngineTest, QueryCanLeaveOutTheShelf) {
+  IcptRecord sailing{ce::fnv1a64("/books/Inbox/sailing.epub"), 0, 1700000000, "Learning to Sail", {}};
+  ce::encodeText("wind fills the sails as the boat heels", sailing.vec.data());
+  writeFile(shelfPath, makeIcpt({sailing}));
+  ASSERT_TRUE(ce::appendEpisodicPage("/books/Moby Dick.epub", 3, "harpoons and whales"));
+
+  int8_t query[128];
+  ce::encodeText("wind fills the sails as the boat heels", query);
+  const auto all = ce::queryEpisodicAndShelf(query, 3);
+  ASSERT_EQ(all.size(), 2u);
+  EXPECT_TRUE(all[0].shelf);
+
+  const auto episodicOnly = ce::queryEpisodicAndShelf(query, 3, /*includeShelf=*/false);
+  ASSERT_EQ(episodicOnly.size(), 1u);
+  EXPECT_FALSE(episodicOnly[0].shelf);
+  EXPECT_EQ(episodicOnly[0].label, "Moby Dick");
+}
+
+TEST_F(ConceptEngineTest, CurrentContextWinsOverNewestEpisodicPage) {
+  int8_t out[128];
+  EXPECT_FALSE(ce::currentContext(out));
+  EXPECT_FALSE(ce::readingContext(out));
+
+  ASSERT_TRUE(ce::appendEpisodicPage("/books/a.txt", 1, "electrons orbit the nucleus"));
+  int8_t episodic[128];
+  ce::encodeText("electrons orbit the nucleus", episodic);
+  ASSERT_TRUE(ce::readingContext(out));
+  EXPECT_EQ(memcmp(out, episodic, 128), 0);
+
+  int8_t current[128];
+  ce::encodeText("knead the dough and let the bread rise", current);
+  ce::setCurrentContext(current);
+  ASSERT_TRUE(ce::currentContext(out));
+  EXPECT_EQ(memcmp(out, current, 128), 0);
+  ASSERT_TRUE(ce::readingContext(out));
+  EXPECT_EQ(memcmp(out, current, 128), 0);
+
+  ce::clearCurrentContext();
+  EXPECT_FALSE(ce::currentContext(out));
+}
+
+TEST_F(ConceptEngineTest, PageDwellSetsContextThenRecordsEpisode) {
+  const std::string_view slice = "the whale breached beside the harpoon boat";
+  int8_t out[128];
+  int8_t expected[128];
+  ce::encodeText(slice, expected);
+
+  EXPECT_FALSE(ce::recordPageDwell("/books/m.epub", 7, slice, ce::CONTEXT_DWELL_MS - 1));
+  EXPECT_FALSE(ce::currentContext(out));
+  EXPECT_FALSE(ce::recordPageDwell("/books/m.epub", 7, "", ce::EPISODE_DWELL_MS));
+  EXPECT_FALSE(ce::currentContext(out));
+
+  EXPECT_TRUE(ce::recordPageDwell("/books/m.epub", 7, slice, ce::CONTEXT_DWELL_MS));
+  ASSERT_TRUE(ce::currentContext(out));
+  EXPECT_EQ(memcmp(out, expected, 128), 0);
+  EXPECT_FALSE(fs::exists(episodicPath));
+
+  EXPECT_TRUE(ce::recordPageDwell("/books/m.epub", 7, slice, ce::EPISODE_DWELL_MS));
+  ASSERT_TRUE(fs::exists(episodicPath));
+  EXPECT_EQ(fs::file_size(episodicPath), 16u + 192);
+  ASSERT_TRUE(ce::latestEpisodicVector(out));
+  EXPECT_EQ(memcmp(out, expected, 128), 0);
+}
+
+TEST(ConceptEngineDwell, QueuesOnlyPagesLookedAtLongEnough) {
+  ce::PageDwellQueue queue;
+  ce::PageDwellQueue::Page page;
+  EXPECT_TRUE(queue.frameShown(0, 1, 1000).append("first page"));
+  EXPECT_FALSE(queue.take(page, 999999, 0));  // the first frame has no predecessor
+
+  queue.frameShown(ce::CONTEXT_DWELL_MS - 1, 2, 2000).append("second page");
+  EXPECT_FALSE(queue.take(page, 999999, 0));  // page 1 was only glanced at
+
+  queue.frameShown(ce::CONTEXT_DWELL_MS + 5, 3, 30000);
+  EXPECT_FALSE(queue.take(page, 30000 + ce::DWELL_SETTLE_MS - 1, ce::DWELL_SETTLE_MS));
+  ASSERT_TRUE(queue.take(page, 30000 + ce::DWELL_SETTLE_MS, ce::DWELL_SETTLE_MS));
+  EXPECT_EQ(page.index, 2u);
+  EXPECT_EQ(page.dwellMs, ce::CONTEXT_DWELL_MS + 5);
+  EXPECT_EQ(page.slice(), "second page");
+  EXPECT_FALSE(queue.take(page, 999999, 0));  // taken once
+
+  // Page 3 carried no text (a prerendered body): it queues with an empty slice.
+  queue.frameShown(ce::EPISODE_DWELL_MS, 4, 60000);
+  ASSERT_TRUE(queue.take(page, 60000 + ce::DWELL_SETTLE_MS, ce::DWELL_SETTLE_MS));
+  EXPECT_EQ(page.index, 3u);
+  EXPECT_TRUE(page.slice().empty());
+}
+
+TEST(ConceptEngineDwell, SliceStopsAtCapOnCodePointBoundary) {
+  EXPECT_EQ(ce::utf8Prefix("abc", 5), "abc");
+  EXPECT_EQ(ce::utf8Prefix("a\xC3\xA9", 2), "a");
+  EXPECT_EQ(ce::utf8Prefix("\xE4\xB8\x96\xE7\x95\x8C", 4), "\xE4\xB8\x96");
+
+  ce::PageDwellQueue queue;
+  auto& shown = queue.frameShown(0, 1, 0);
+  const std::string word = "\xE4\xB8\x96\xE7\x95\x8C";  // 6 bytes, two code points
+  size_t appended = 0;
+  while (shown.append(word)) ++appended;
+  EXPECT_EQ(appended, ce::DWELL_SLICE_BYTES / word.size());
+  // 200 bytes hold 33 whole words; the 2 left are too few for the next code
+  // point, so the 34th word adds nothing rather than a broken sequence.
+  const auto slice = shown.slice();
+  EXPECT_EQ(slice.size(), 33u * 6);
+  EXPECT_EQ(slice.substr(slice.size() - 3), "\xE7\x95\x8C");
+  // ASCII still fills the last 2 bytes ("xy"); then the slice is full.
+  EXPECT_FALSE(shown.append("xyz"));
+  EXPECT_EQ(shown.slice().size(), ce::DWELL_SLICE_BYTES);
 }
 
 TEST(ConceptEnginePositions, PacksEpubSpineAndPage) {
