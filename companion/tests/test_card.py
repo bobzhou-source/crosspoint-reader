@@ -1,16 +1,21 @@
 import json
 import io
+import math
 import plistlib
+import random
+import struct
 import subprocess
 import tempfile
 import unittest
 import os
+import zipfile
 from pathlib import Path
 from unittest.mock import patch
 
 from reader_send import cache as cache_module
 from reader_send import card as card_module
 from reader_send import cli
+from reader_send import concept_index
 from reader_send.cache import Cache
 from reader_send.card import (BOOK_INBOX, FIRMWARE_CONFIG_KEYS, FIRMWARE_NAME, FIRMWARE_ORIGIN, CardVolume,
                               _validate_reader_sync_config, provision_reader_sync, resolve_card,
@@ -489,7 +494,9 @@ class CardBooksTest(unittest.TestCase):
     def test_the_default_shelves_only_include_existing_sources(self):
         with patch.object(card_module, "default_novels_dir", return_value=self.root / "novels"), \
              patch.object(card_module, "default_books_dir", return_value=self.root / "books"), \
-             patch.object(card_module, "default_dictionaries_dir", return_value=self.root / "dictionaries"):
+             patch.object(card_module, "default_dictionaries_dir", return_value=self.root / "dictionaries"), \
+             patch.object(card_module, "default_models_dir", return_value=self.root / "models"), \
+             patch.object(card_module, "default_usage_dir", return_value=self.root / "usage"):
             self.assertEqual(card_module.default_shelves(), {})
             (self.root / "books").mkdir()
             self.assertEqual(card_module.default_shelves(), {"books": self.root / "books"})
@@ -500,6 +507,10 @@ class CardBooksTest(unittest.TestCase):
                              {"novels": self.root / "novels", "books": self.root / "books"})
             (self.root / "dictionaries").mkdir()
             self.assertEqual(card_module.default_shelves()["dictionaries"], self.root / "dictionaries")
+            (self.root / "models").mkdir()
+            (self.root / "usage").mkdir()
+            self.assertEqual((card_module.default_shelves()["models"], card_module.default_shelves()["usage"]),
+                             (self.root / "models", self.root / "usage"))
 
     def test_cli_parses_the_books_option(self):
         args = cli.parser().parse_args(["card", "sync", "--books", str(self.shelf)])
@@ -514,17 +525,21 @@ class CardBooksTest(unittest.TestCase):
             return {"books": {}}
 
         with patch.object(card_module, "default_shelves",
-                          lambda: {"novels": Path("/novels"), "books": Path("/books"), "dictionaries": Path("/dicts")}), \
+                          lambda: {"novels": Path("/novels"), "books": Path("/books"), "dictionaries": Path("/dicts"),
+                                   "models": Path("/models"), "usage": Path("/usage")}), \
                 patch.object(card_module, "load_config", lambda path: self.config), \
                 patch.object(card_module, "sync_card", recorded), \
                 patch("sys.stdout", new_callable=io.StringIO):
             self.assertEqual(cli.main(["--cache-dir", str(self.cache.root), "card", "sync"]), 0)
             self.assertEqual(cli.main(["--cache-dir", str(self.cache.root), "card", "sync",
-                                       "--books", str(self.shelf), "--dictionaries", str(self.root)]), 0)
-        self.assertEqual((calls[0]["novels_dir"], calls[0]["books_dir"], calls[0]["dictionaries_dir"]),
-                         (Path("/novels"), Path("/books"), Path("/dicts")))
-        self.assertEqual((calls[1]["novels_dir"], calls[1]["books_dir"], calls[1]["dictionaries_dir"]),
-                         (Path("/novels"), self.shelf, self.root))
+                                       "--books", str(self.shelf), "--dictionaries", str(self.root),
+                                       "--models", str(self.root / "m"), "--usage", str(self.root / "u")]), 0)
+        self.assertEqual((calls[0]["novels_dir"], calls[0]["books_dir"], calls[0]["dictionaries_dir"],
+                          calls[0]["models_dir"], calls[0]["usage_dir"]),
+                         (Path("/novels"), Path("/books"), Path("/dicts"), Path("/models"), Path("/usage")))
+        self.assertEqual((calls[1]["novels_dir"], calls[1]["books_dir"], calls[1]["dictionaries_dir"],
+                          calls[1]["models_dir"], calls[1]["usage_dir"]),
+                         (Path("/novels"), self.shelf, self.root, self.root / "m", self.root / "u"))
 
 
 class CardDictionariesTest(unittest.TestCase):
@@ -599,6 +614,255 @@ class CardDictionariesTest(unittest.TestCase):
         with self.assertRaisesRegex(ReaderError, "Dictionary source folder not found"):
             sync_card(self.cache, self.config, volume=self.volume, dictionaries_dir=self.root / "nope")
         self.assertEqual(list(self.card.iterdir()), [])
+
+
+def tiny_epub(title: str, body: str) -> bytes:
+    stream = io.BytesIO()
+    with zipfile.ZipFile(stream, "w") as archive:
+        archive.writestr("mimetype", "application/epub+zip")
+        archive.writestr("META-INF/container.xml",
+                         '<?xml version="1.0"?><container><rootfiles>'
+                         '<rootfile full-path="OEBPS/content.opf"/></rootfiles></container>')
+        archive.writestr("OEBPS/content.opf",
+                         f'<package><metadata><dc:title>{title}</dc:title></metadata>'
+                         '<manifest><item id="c1" href="text/one.xhtml"/><item id="c2" href="text/two.xhtml"/></manifest>'
+                         '<spine><itemref idref="c1"/><itemref idref="c2"/></spine></package>')
+        archive.writestr("OEBPS/text/one.xhtml",
+                         f"<html><head><style>p {{}}</style></head><body><p>{body}</p></body></html>")
+        archive.writestr("OEBPS/text/two.xhtml", "<html><body><p>Second &amp; last.</p></body></html>")
+    return stream.getvalue()
+
+
+def tiny_model(seed: int = 7) -> bytes:
+    """A valid PLHN v1 file: random int8 weights, power-of-two scales (embed 2^-5, router 2^-6, proj 2^-6, core 2^-7)."""
+    generator = random.Random(seed)
+    header = concept_index.MODEL_HEADER.pack(concept_index.MODEL_MAGIC, 1, 64, 128, 2, 2, 32, 16,
+                                             2 ** -5, 2 ** -6, 2 ** -6, 2 ** -7, 0)
+    payload = bytes(generator.randrange(-40, 41) & 0xFF for _ in range(concept_index.MODEL_PAYLOAD_BYTES))
+    return header + payload
+
+
+def tiny_engram(slots: int = 64, seed: int = 3) -> bytes:
+    generator = random.Random(seed)
+    header = concept_index.ENGRAM_HEADER.pack(concept_index.ENGRAM_MAGIC, 1, slots, 64, 2 ** -5)
+    sector = header + bytes(512 - len(header))
+    body = b"".join(bytes(8) + bytes(generator.randrange(-9, 10) & 0xFF for _ in range(24)) + bytes(32)
+                    for _ in range(slots))
+    return sector + body
+
+
+class ConceptIndexTest(unittest.TestCase):
+    def test_fnv1a64_matches_the_reference_vectors(self):
+        self.assertEqual(concept_index.fnv1a64(b""), 0xCBF29CE484222325)
+        self.assertEqual(concept_index.fnv1a64(b"a"), 0xAF63DC4C8601EC8C)
+        self.assertEqual(concept_index.fnv1a64(b"foobar"), 0x85944171F73967E8)
+
+    def test_the_contract_sizes(self):
+        self.assertEqual(concept_index.MODEL_HEADER.size, 32)
+        self.assertEqual(concept_index.MODEL_PAYLOAD_BYTES, 94_976)
+        self.assertEqual((concept_index.INDEX_HEADER.size, concept_index.INDEX_RECORD.size), (16, 192))
+
+    def test_the_model_encodes_deterministically_to_a_unit_int8_vector(self):
+        model = concept_index.PlatonicHNet(tiny_model(), concept_index.Engram(tiny_engram()))
+        text = "Platonic engrams: 柏拉图 remembers spans. ".encode("utf-8") * 8  # past the 256-byte input cap
+        vector = model.encode(text)
+        self.assertEqual(vector, model.encode(text + b"ignored past 256 bytes" * 20))
+        self.assertEqual(len(vector), 128)
+        self.assertTrue(all(-127 <= value <= 127 for value in vector))
+        self.assertAlmostEqual(math.sqrt(sum(value * value for value in vector)), 127, delta=6)
+        self.assertNotEqual(vector, concept_index.PlatonicHNet(tiny_model()).encode(text))  # the engram counts
+        self.assertEqual(model.encode(b""), [0] * 128)
+        spans = model.chunks(text)
+        self.assertEqual((spans[0][0], spans[-1][1]), (0, min(len(text), 256)))
+        for start, end in spans:
+            self.assertLessEqual(end - start, 12)
+            self.assertNotEqual(text[start] & 0xC0, 0x80)  # never starts inside a UTF-8 character
+
+    @unittest.skipIf(concept_index._np is None, "numpy is not installed")
+    def test_the_numpy_path_matches_the_pure_python_reference(self):
+        model = concept_index.PlatonicHNet(tiny_model(seed=11), concept_index.Engram(tiny_engram()))
+        for text in ("Short.".encode(), "Mixed 中文 and ASCII text, 🙂 emoji. ".encode("utf-8") * 9, bytes(range(256))):
+            fast = (model.chunks(text), model.encode(text))
+            with patch.object(concept_index, "_np", None):
+                self.assertEqual((model.chunks(text), model.encode(text)), fast)
+
+    def test_a_malformed_model_is_rejected(self):
+        with self.assertRaisesRegex(ReaderError, "truncated"):
+            concept_index.PlatonicHNet(tiny_model()[:-1])
+        with self.assertRaisesRegex(ReaderError, "PLHN"):
+            concept_index.PlatonicHNet(b"XXXX" + tiny_model()[4:])
+
+    def test_the_fallback_encoder_folds_ascii_case(self):
+        vector = concept_index.fallback_encode(b"Hello World")
+        self.assertEqual(vector, concept_index.fallback_encode(b"hello world"))
+        self.assertAlmostEqual(math.sqrt(sum(value * value for value in vector)), 127, delta=6)
+        self.assertEqual(concept_index.fallback_encode(b""), [0] * 128)
+        self.assertEqual(len(concept_index.fallback_encode(b"ab")), 128)
+
+    def test_epub_text_reads_the_title_then_the_spine(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "x.epub"
+            path.write_bytes(tiny_epub("A Title", "First words"))
+            self.assertEqual(concept_index.epub_text(path), ("A Title", b"A Title\nFirst words Second & last."))
+            path.write_bytes(b"not a zip")
+            self.assertEqual(concept_index.epub_text(path), ("x", b"x\n"))
+
+
+class CardModelsTest(unittest.TestCase):
+    def setUp(self):
+        self.temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temporary.cleanup)
+        self.root = Path(self.temporary.name)
+        self.card = self.root / "card"
+        (self.card / "books/Inbox/.trash").mkdir(parents=True)
+        (self.card / "books/Books/Shelf").mkdir(parents=True)
+        (self.card / "books/Inbox/Fresh Article.epub").write_bytes(tiny_epub("Fresh Article", "Inbox body text"))
+        (self.card / "books/Books/Shelf/Old Book.epub").write_bytes(tiny_epub("Old Book", "Shelf body text"))
+        (self.card / "books/Inbox/.trash/Gone.epub").write_bytes(tiny_epub("Gone", "trashed"))
+        self.models = self.root / "models"
+        self.models.mkdir()
+        (self.models / "platonic-hnet.bin").write_bytes(tiny_model())
+        (self.models / "engram.bin").write_bytes(tiny_engram())
+        (self.models / "extra-artifact.idx").write_bytes(b"extra")
+        (self.models / "notes.txt").write_bytes(b"not a model")
+        (self.models / ".hidden.bin").write_bytes(b"hidden")
+        self.volume = CardVolume(self.card, "disk9s1", UUID)
+        self.cache = Cache(self.root / "cache")
+        self.config = CardTest.config(self, self.root)
+
+    def sync(self, **options):
+        return sync_card(self.cache, self.config, volume=self.volume, models_dir=self.models, **options)
+
+    def card_models(self):
+        return sorted(path.name for path in (self.card / "models").iterdir())
+
+    def expected_vector(self, title, body):
+        model = concept_index.PlatonicHNet(tiny_model(), concept_index.Engram(tiny_engram()))
+        return model.encode(f"{title}\n{body} Second & last.".encode("utf-8"))
+
+    def test_models_are_mirrored_once_and_verified(self):
+        result = self.sync()["models"]
+        self.assertEqual(result["errors"], [])
+        self.assertEqual((result["copied"], result["unchanged"]), (4, 0))
+        self.assertEqual(self.card_models(),
+                         ["engram.bin", "extra-artifact.idx", "inbox-concepts.idx", "platonic-hnet.bin"])
+        for name in self.card_models():
+            self.assertEqual(card_module.file_sha256(self.card / "models" / name),
+                             card_module.file_sha256(self.models / name))
+        again = self.sync()["models"]
+        self.assertEqual((again["copied"], again["unchanged"]), (0, 4))
+        self.assertEqual((again["index"]["encoded"], again["index"]["updated"]), (0, False))
+
+    def test_a_changed_model_is_replaced_and_the_index_rebuilt(self):
+        self.sync()
+        for index in (self.models / "inbox-concepts.idx", self.card / "models/inbox-concepts.idx"):
+            os.utime(index, (index.stat().st_atime, index.stat().st_mtime - 60))  # an earlier sync
+        model = self.models / "platonic-hnet.bin"
+        model.write_bytes(tiny_model(seed=8))
+        os.utime(model, (model.stat().st_atime, model.stat().st_mtime + 60))
+        result = self.sync()["models"]
+        self.assertEqual(result["index"]["encoded"], 2)
+        self.assertEqual(sorted(Path(path).name for path in result["copied_paths"]),
+                         ["inbox-concepts.idx", "platonic-hnet.bin"])
+        self.assertEqual((self.card / "models/platonic-hnet.bin").read_bytes(), tiny_model(seed=8))
+
+    def test_a_copy_that_does_not_read_back_is_removed_and_reported(self):
+        original = card_module._copy_replace_atomic
+
+        def corrupting(source, destination):
+            original(source, destination)
+            if destination.name == "engram.bin":
+                data = bytearray(destination.read_bytes())
+                data[-1] ^= 0xFF
+                destination.write_bytes(bytes(data))
+
+        with patch.object(card_module, "_copy_replace_atomic", corrupting):
+            result = self.sync()["models"]
+        self.assertEqual(len(result["errors"]), 1)
+        self.assertIn("engram.bin: readback does not match the source SHA-256; the bad copy was removed",
+                      result["errors"][0])
+        self.assertNotIn("engram.bin", self.card_models())
+        self.assertEqual(result["copied"], 3)
+        self.assertEqual(self.sync()["models"]["copied"], 1)  # retried on the next sync
+
+    def test_the_icpt_index_covers_inbox_and_books(self):
+        result = self.sync()["models"]["index"]
+        self.assertEqual((result["encoder"], result["records"], result["encoded"], result["updated"]),
+                         ("platonic-hnet.bin", 2, 2, True))
+        data = (self.card / "models/inbox-concepts.idx").read_bytes()
+        self.assertEqual(data, (self.models / "inbox-concepts.idx").read_bytes())
+        self.assertEqual(data[:16], struct.pack("<IIII", 0x49435054, 1, 2, 128))
+        self.assertEqual(len(data), 16 + 2 * 192)
+        records = {record["path_hash"]: record for record in concept_index.read_index(data)}
+        inbox = records[concept_index.fnv1a64(b"/books/Inbox/Fresh Article.epub")]
+        shelf = records[concept_index.fnv1a64(b"/books/Books/Shelf/Old Book.epub")]
+        self.assertEqual((inbox["label"], inbox["page_or_chunk"]), ("Fresh Article", 0))
+        self.assertEqual(inbox["timestamp_or_flags"],
+                         int((self.card / "books/Inbox/Fresh Article.epub").stat().st_mtime))
+        self.assertEqual(inbox["vec"], self.expected_vector("Fresh Article", "Inbox body text"))
+        self.assertEqual(shelf["vec"], self.expected_vector("Old Book", "Shelf body text"))
+        self.assertEqual(data[16 + 16:16 + 16 + 48], b"Old Book".ljust(48, b"\0"))  # records sorted by card path
+
+    def test_only_a_new_or_changed_book_is_encoded_again(self):
+        self.sync()
+        (self.card / "books/Inbox/Another.epub").write_bytes(tiny_epub("Another", "more"))
+        result = self.sync()["models"]["index"]
+        self.assertEqual((result["records"], result["encoded"]), (3, 1))
+        (self.card / "books/Inbox/Another.epub").unlink()
+        result = self.sync()["models"]["index"]
+        self.assertEqual((result["records"], result["encoded"], result["updated"]), (2, 0, True))
+
+    def test_without_a_model_the_fallback_encoder_is_used(self):
+        (self.models / "platonic-hnet.bin").unlink()
+        result = self.sync()["models"]
+        self.assertEqual(result["index"]["encoder"], concept_index.FALLBACK_ENCODER)
+        records = concept_index.read_index((self.card / "models/inbox-concepts.idx").read_bytes())
+        record = next(record for record in records if record["label"] == "Fresh Article")
+        self.assertEqual(record["vec"], concept_index.fallback_encode(b"Fresh Article\nInbox body text Second & last."))
+        (self.models / "platonic-hnet.bin").write_bytes(tiny_model())
+        self.assertEqual(self.sync()["models"]["index"]["encoded"], 2)  # a new encoder re-encodes every book
+
+    def test_records_another_exporter_wrote_are_kept(self):
+        foreign = {"path_hash": concept_index.fnv1a64(b"/books/Books/Shelf/Old Book.epub"), "page_or_chunk": 3,
+                   "timestamp_or_flags": 7, "label": "trainer passage", "vec": [1] * 128}
+        novel = {**foreign, "path_hash": concept_index.fnv1a64(b"/books/Novels/x.epub"), "page_or_chunk": 0}
+        (self.models / "inbox-concepts.idx").write_bytes(concept_index.pack_index([foreign, novel]))
+        result = self.sync()["models"]["index"]
+        self.assertEqual((result["kept"], result["books"], result["encoded"]), (2, 1, 1))
+        records = concept_index.read_index((self.models / "inbox-concepts.idx").read_bytes())
+        self.assertEqual([record["label"] for record in records], ["trainer passage", "trainer passage", "Fresh Article"])
+        again = self.sync()["models"]["index"]
+        self.assertEqual((again["kept"], again["books"], again["encoded"], again["updated"]), (2, 1, 0, False))
+
+    def test_a_missing_models_folder_writes_nothing(self):
+        with self.assertRaisesRegex(ReaderError, "Model source folder not found"):
+            sync_card(self.cache, self.config, volume=self.volume, models_dir=self.root / "nope")
+        self.assertFalse((self.card / "models").exists())
+
+    def test_session_logs_and_the_liquid_refresh_table_are_backed_up(self):
+        logs = self.card / "Benchmark/logs"
+        logs.mkdir(parents=True)
+        (logs / "session-aaaa-bbbb-00.jsonl").write_bytes(b'{"e":1}\n')
+        (logs / "notes.txt").write_bytes(b"skip")
+        (self.card / ".crosspoint").mkdir()
+        (self.card / ".crosspoint/liquid-refresh.bin").write_bytes(b"\x01\x02")
+        usage = self.root / "usage"
+        result = sync_card(self.cache, self.config, volume=self.volume, usage_dir=usage)["usage"]
+        self.assertEqual((result["copied"], result["errors"]), (2, []))
+        self.assertEqual(sorted(path.name for path in usage.iterdir()),
+                         ["liquid-refresh.bin", "session-aaaa-bbbb-00.jsonl"])
+        self.assertEqual((usage / "liquid-refresh.bin").read_bytes(), b"\x01\x02")
+        self.assertEqual(sync_card(self.cache, self.config, volume=self.volume, usage_dir=usage)["usage"]["unchanged"], 2)
+        (logs / "session-aaaa-bbbb-00.jsonl").write_bytes(b'{"e":1}\n{"e":2}\n')
+        result = sync_card(self.cache, self.config, volume=self.volume, usage_dir=usage)["usage"]
+        self.assertEqual((result["copied"], result["unchanged"]), (1, 1))
+        self.assertEqual((usage / "session-aaaa-bbbb-00.jsonl").read_bytes(), b'{"e":1}\n{"e":2}\n')
+
+    def test_cli_parses_the_models_and_usage_options(self):
+        args = cli.parser().parse_args(["card", "autosync", "--models", "/m", "--usage", "/u"])
+        self.assertEqual((args.models, args.usage), (Path("/m"), Path("/u")))
+        self.assertIsNone(cli.parser().parse_args(["card", "sync"]).models)
+
 
 
 if __name__ == "__main__":
