@@ -65,7 +65,7 @@ DICTIONARY_SIDECARS = {".idx": ".qidx", ".syn": ".sidx"}
 MODELS_DIR = Path("models")
 MODEL_FILENAMES = ("platonic-hnet.bin", "engram.bin", "inbox-concepts.idx", "cspw.bin", "story-graph.idx",
                    "pe-writer.bin", "writer-clauses.bin")
-# PE-Writer artifacts are header-checked before they reach the card: (magic, u32 LE version at
+# PE-Writer artifacts are header-checked before they reach the card: (magic, u16 LE version at
 # offset 4, minimum size, exact size or None). A file that fails is not copied and is reported.
 MODEL_HEADERS = {
     "pe-writer.bin": (b"PEWR", 1, 32, None),
@@ -860,7 +860,7 @@ def _model_header_problem(path: Path) -> str | None:
         head = handle.read(8)
     if head[:4] != magic:
         return f"{path.name}: magic {head[:4]!r} is not {magic!r}; not copied"
-    found = int.from_bytes(head[4:8], "little")
+    found = int.from_bytes(head[4:6], "little")
     if found != version:
         return f"{path.name}: version {found} is not {version}; not copied"
     return None

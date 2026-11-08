@@ -354,8 +354,8 @@ class CardAutosyncTest(unittest.TestCase):
         models.mkdir()
         (shelf / "Local Book.epub").write_bytes(epub_bytes("local"))
         (models / "cspw.bin").write_bytes(b"CSPW" + bytes(508))
-        (models / "pe-writer.bin").write_bytes(b"PEWR" + (1).to_bytes(4, "little") + bytes(56))
-        (models / "writer-clauses.bin").write_bytes(b"WCLS" + (1).to_bytes(4, "little") + bytes(1_048_600))
+        (models / "pe-writer.bin").write_bytes(b"PEWR" + (1).to_bytes(2, "little") + (128).to_bytes(2, "little") + bytes(56))
+        (models / "writer-clauses.bin").write_bytes(b"WCLS" + (1).to_bytes(2, "little") + (64).to_bytes(2, "little") + bytes(1_048_600))
 
         result = self.run_autosync(books_dir=shelf, models_dir=models)
 

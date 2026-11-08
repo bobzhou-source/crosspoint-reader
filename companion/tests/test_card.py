@@ -749,8 +749,8 @@ class CardModelsTest(unittest.TestCase):
         self.models.mkdir()
         (self.models / "platonic-hnet.bin").write_bytes(tiny_model())
         (self.models / "engram.bin").write_bytes(tiny_engram())
-        (self.models / "pe-writer.bin").write_bytes(b"PEWR" + struct.pack("<I", 1) + bytes(24))
-        (self.models / "writer-clauses.bin").write_bytes(b"WCLS" + struct.pack("<I", 1) + bytes(1_048_600))
+        (self.models / "pe-writer.bin").write_bytes(b"PEWR" + struct.pack("<HH", 1, 128) + bytes(24))
+        (self.models / "writer-clauses.bin").write_bytes(b"WCLS" + struct.pack("<HH", 1, 64) + bytes(1_048_600))
         (self.models / "extra-artifact.idx").write_bytes(b"extra")
         (self.models / "notes.txt").write_bytes(b"not a model")
         (self.models / ".hidden.bin").write_bytes(b"hidden")
@@ -816,8 +816,8 @@ class CardModelsTest(unittest.TestCase):
         self.assertEqual(self.sync()["models"]["copied"], 1)  # retried on the next sync
 
     def test_malformed_writer_models_are_not_copied_and_reported(self):
-        (self.models / "pe-writer.bin").write_bytes(b"PEWX" + struct.pack("<I", 1) + bytes(24))
-        (self.models / "writer-clauses.bin").write_bytes(b"WCLS" + struct.pack("<I", 1) + bytes(100))
+        (self.models / "pe-writer.bin").write_bytes(b"PEWX" + struct.pack("<HH", 1, 128) + bytes(24))
+        (self.models / "writer-clauses.bin").write_bytes(b"WCLS" + struct.pack("<HH", 1, 64) + bytes(100))
         result = self.sync()["models"]
         self.assertEqual(len(result["errors"]), 2)
         self.assertIn("pe-writer.bin: magic b'PEWX' is not b'PEWR'; not copied", result["errors"])
@@ -828,9 +828,9 @@ class CardModelsTest(unittest.TestCase):
         self.assertEqual(result["missing"], ["cspw.bin"])
 
     def test_a_writer_model_with_the_wrong_version_or_too_short_is_rejected(self):
-        (self.models / "pe-writer.bin").write_bytes(b"PEWR" + struct.pack("<I", 2) + bytes(24))
+        (self.models / "pe-writer.bin").write_bytes(b"PEWR" + struct.pack("<HH", 2, 128) + bytes(24))
         self.assertIn("pe-writer.bin: version 2 is not 1; not copied", self.sync()["models"]["errors"])
-        (self.models / "pe-writer.bin").write_bytes(b"PEWR" + struct.pack("<I", 1))
+        (self.models / "pe-writer.bin").write_bytes(b"PEWR" + struct.pack("<HH", 1, 128))
         self.assertIn("pe-writer.bin: size 8 is below the minimum 32 bytes; not copied",
                       self.sync()["models"]["errors"])
 
