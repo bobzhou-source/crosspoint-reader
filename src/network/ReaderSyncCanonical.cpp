@@ -25,13 +25,18 @@
 #endif
 // Which shortest-round-trip float implementation to compile. Both are exact;
 // the smoke harness builds the file once per choice and requires the same
-// bytes from each. Auto-detection picks std::to_chars (libstdc++ 14 on the
-// device); libc++ provides the floating-point overloads without defining
-// __cpp_lib_to_chars, so it is detected separately.
+// bytes from each. The firmware always takes printf/strtod: newlib's
+// correctly rounded _dtoa_r and _strtod_r are linked anyway, while
+// std::to_chars(double) pulls libstdc++'s floating_to_chars.o (Ryu tables,
+// ~124 KB of flash in the rc10 map) into an OTA slot with almost no headroom.
+// Host builds auto-detect std::to_chars; libc++ provides the floating-point
+// overloads without defining __cpp_lib_to_chars, so it is detected separately.
 #if defined(READER_SYNC_PRINTF_FLOAT)
 #  define READER_SYNC_USE_TO_CHARS 0
 #elif !defined(READER_SYNC_USE_TO_CHARS)
-#  if defined(__cpp_lib_to_chars) || defined(_LIBCPP_VERSION)
+#  if !defined(READER_SYNC_HOST_TEST)
+#    define READER_SYNC_USE_TO_CHARS 0
+#  elif defined(__cpp_lib_to_chars) || defined(_LIBCPP_VERSION)
 #    define READER_SYNC_USE_TO_CHARS 1
 #  else
 #    define READER_SYNC_USE_TO_CHARS 0

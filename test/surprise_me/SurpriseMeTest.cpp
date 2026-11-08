@@ -65,3 +65,22 @@ TEST(SurpriseMe, RankBoundaries) {
   EXPECT_EQ(surprise::rank(library("/books/a.epub", 1)), 4);
   EXPECT_EQ(surprise::rank(library("")), -1);
 }
+
+TEST(SurpriseMe, StrongConceptMatchWinsItsBucket) {
+  surprise::Candidate items[4] = {inbox("/books/Inbox/a.epub"), inbox("/books/Inbox/b.epub"),
+                                  inbox("/books/Inbox/c.epub"), library("/books/lib.epub")};
+  items[1].conceptDot = 9000;
+  items[2].conceptDot = 12000;
+  items[3].conceptDot = 16000;  // another bucket: never pulled forward
+  for (uint32_t roll = 0; roll < 4; ++roll) EXPECT_STREQ(surprise::pick(items, 4, roll), "/books/Inbox/c.epub");
+  // Weak matches leave the roll in charge.
+  items[1].conceptDot = surprise::CONCEPT_PREFER_MIN_DOT - 1;
+  items[2].conceptDot = 100;
+  EXPECT_STREQ(surprise::pick(items, 4, 0), "/books/Inbox/a.epub");
+  EXPECT_STREQ(surprise::pick(items, 4, 1), "/books/Inbox/b.epub");
+  EXPECT_EQ(surprise::preferConceptMatch(items, 4, 0), nullptr);
+  // Ties go to the first.
+  items[0].conceptDot = surprise::CONCEPT_PREFER_MIN_DOT;
+  items[1].conceptDot = surprise::CONCEPT_PREFER_MIN_DOT;
+  EXPECT_STREQ(surprise::preferConceptMatch(items, 4, 0), "/books/Inbox/a.epub");
+}
