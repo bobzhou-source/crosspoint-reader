@@ -35,6 +35,8 @@ Each definition is plain text, one line per item: a `(noun)`/`(verb)`/… label,
 
 `card sync` (and `card autosync`) mirror every StarDict folder in `~/papyrix/dictionaries/` (override: `card sync --dictionaries DIR`) to `/dictionaries/<name>/` on the card, copying only missing or changed files (size and modification time) and checking each copy by SHA-256 read-back. A changed `.idx`/`.syn` drops its `.qidx`/`.sidx` sidecar so the reader rebuilds it. A folder the card already keeps under `/.dictionaries/` is updated there. Card files the Mac folder lacks are never removed.
 
+`card sync` (and `card autosync`) also keep the reader's ConceptEngine current from `~/papyrix/models/` (override: `--models DIR`). First they refresh `inbox-concepts.idx` in that folder: an `ICPT` file (16-byte header, then one 192-byte record per EPUB in the card's `/books/Inbox` and `/books/Books`: FNV-1a 64 hash of the card path, mtime, title, and a 128-d int8 vector of the title plus the first spine text, 256 bytes in all). Vectors come from the bit-exact integer forward of `platonic-hnet.bin` (plus `engram.bin` when present), or from the model-free byte-trigram encoder when there is no model; a book is re-encoded only when its size, mtime or the model changes, and records another exporter wrote into the index are kept. Then every `.bin`/`.idx` in the folder is copied to `/models/` when missing or changed (size and modification time), each copy checked by SHA-256 read-back. Each sync also backs up the card's `/Benchmark/logs/session-*.jsonl` and `/.crosspoint/liquid-refresh.bin` into `~/papyrix/verification/refresh-calib/usage/` (override: `--usage DIR`).
+
 ## Fetch, convert, inspect, send
 
 ```sh
