@@ -165,6 +165,8 @@ def autosync(
     novels_dir: Path | None = None,
     books_dir: Path | None = None,
     dictionaries_dir: Path | None = None,
+    models_dir: Path | None = None,
+    usage_dir: Path | None = None,
     crossfire=None,
 ) -> dict:
     log = log or RunLog(None)
@@ -187,13 +189,14 @@ def autosync(
         return {"status": "busy"}
     try:
         return _run(cache, config, volume, client_factory, key_provider, notify, log, batch, passes, wait,
-                    novels_dir, books_dir, dictionaries_dir, crossfire)
+                    novels_dir, books_dir, dictionaries_dir, crossfire, models_dir, usage_dir)
     finally:
         lock.close()
 
 
 def _run(cache, config, volume, client_factory, key_provider, notify, log, batch, passes, wait,
-         novels_dir=None, books_dir=None, dictionaries_dir=None, crossfire=None) -> dict:
+         novels_dir=None, books_dir=None, dictionaries_dir=None, crossfire=None,
+         models_dir=None, usage_dir=None) -> dict:
     expected = config["volume_uuid"]
     log(f"reader card {expected} mounted at {volume.root}; starting delivery")
 
@@ -224,7 +227,7 @@ def _run(cache, config, volume, client_factory, key_provider, notify, log, batch
             result["passes"] = number
             try:
                 outcome = _pass(cache, config, volume, client, batch, log, result["acked"],
-                                novels_dir, books_dir, dictionaries_dir, crossfire)
+                                novels_dir, books_dir, dictionaries_dir, crossfire, models_dir, usage_dir)
             except ReaderError as exc:
                 if is_rate_limited(exc):
                     result["status"] = "rate_limited"
@@ -261,7 +264,8 @@ def _run(cache, config, volume, client_factory, key_provider, notify, log, batch
         try:
             card_result = card.sync_card(cache, config, volume=volume, only_ids=set(),
                                          novels_dir=novels_dir, books_dir=books_dir,
-                                         dictionaries_dir=dictionaries_dir, crossfire=crossfire)
+                                         dictionaries_dir=dictionaries_dir, models_dir=models_dir,
+                                         usage_dir=usage_dir, crossfire=crossfire)
         except (ReaderError, OSError) as exc:
             result["status"] = "error" if result["status"] == "ok" else result["status"]
             result["errors"].append(str(exc))
@@ -271,7 +275,9 @@ def _run(cache, config, volume, client_factory, key_provider, notify, log, batch
         result["card"] = card_result["card"]
         result["shelves"] = {"novels": card_result.get("novels"),
                              "books": card_result["books"].get("shelf"),
-                             "dictionaries": card_result.get("dictionaries")}
+                             "dictionaries": card_result.get("dictionaries"),
+                             "models": card_result.get("models"),
+                             "usage": card_result.get("usage")}
         for name, shelf in result["shelves"].items():
             if shelf is None:
                 continue
@@ -295,7 +301,8 @@ def _run(cache, config, volume, client_factory, key_provider, notify, log, batch
 
 
 def _pass(cache: Cache, config: dict, volume: card.CardVolume, client: CloudClient, batch: int, log,
-          acked: list, novels_dir=None, books_dir=None, dictionaries_dir=None, crossfire=None) -> dict:
+          acked: list, novels_dir=None, books_dir=None, dictionaries_dir=None, crossfire=None,
+          models_dir=None, usage_dir=None) -> dict:
     requests = client.requests
     items = client.items(ready_only=True)
     # Everything this pass sends must fit the per-minute allowance, so plan it first: books already in the
@@ -326,7 +333,7 @@ def _pass(cache: Cache, config: dict, volume: card.CardVolume, client: CloudClie
     card_result = card.sync_card(cache, config, volume=volume,
                                  only_ids={record["id"] for record in by_sha.values()},
                                  novels_dir=novels_dir, books_dir=books_dir, dictionaries_dir=dictionaries_dir,
-                                 crossfire=crossfire)
+                                 models_dir=models_dir, usage_dir=usage_dir, crossfire=crossfire)
     ack_budget = budget - len(pulled["pulled"]) - len(pulled["released"])
     ledger = card._load_ledger(cache, volume.volume_uuid)
     unverified, fresh_proofs = [], {}

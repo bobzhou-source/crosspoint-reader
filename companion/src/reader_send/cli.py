@@ -173,6 +173,12 @@ def parser() -> argparse.ArgumentParser:
                            help="copy the EPUBs of one local shelf folder into /books/Books (default: ~/papyrix/books when it exists)")
     card_sync.add_argument("--dictionaries", type=Path, metavar="DIR",
                            help="mirror each StarDict folder in DIR to /dictionaries/<name> when missing or changed (default: ~/papyrix/dictionaries when it exists)")
+    card_sync.add_argument("--models", type=Path, metavar="DIR",
+                           help="refresh DIR/inbox-concepts.idx for /books/Inbox and /books/Books, then mirror every "
+                                ".bin/.idx in DIR to /models when missing or changed (default: ~/papyrix/models when it exists)")
+    card_sync.add_argument("--usage", type=Path, metavar="DIR",
+                           help="back up /Benchmark/logs/session-*.jsonl and /.crosspoint/liquid-refresh.bin into DIR "
+                                "(default: ~/papyrix/verification/refresh-calib/usage when it exists)")
     card_sync.add_argument("--crossfire", action="store_true",
                            help="after importing annotations, build a Cross-Fire card in /books/Inbox")
     card_status = card_actions.add_parser("status", help="Report whether the exact configured card is mounted; read-only")
@@ -192,6 +198,11 @@ def parser() -> argparse.ArgumentParser:
     card_autosync_parser.add_argument("--no-notify", action="store_true", help="do not post a macOS notification")
     card_autosync_parser.add_argument("--crossfire", action="store_true",
                                       help="after importing annotations, build a Cross-Fire card in /books/Inbox")
+    card_autosync_parser.add_argument("--models", type=Path, metavar="DIR",
+                                      help="model folder mirrored to /models (default: ~/papyrix/models when it exists)")
+    card_autosync_parser.add_argument("--usage", type=Path, metavar="DIR",
+                                      help="session-log and liquid-refresh backup folder (default: "
+                                           "~/papyrix/verification/refresh-calib/usage when it exists)")
     for name, description in (
             ("repack", "Plan daily X digests from the single X-post EPUBs in /books/Inbox; --apply writes them and "
                        "moves the singles to /books/Inbox/.singles-archive/ (never deletes)"),
@@ -521,10 +532,14 @@ def card_command(args, cache: Cache) -> int:
             novels_dir=args.novels if args.novels is not None else shelves.get("novels"),
             books_dir=args.books if args.books is not None else shelves.get("books"),
             dictionaries_dir=args.dictionaries if args.dictionaries is not None else shelves.get("dictionaries"),
+            models_dir=args.models if args.models is not None else shelves.get("models"),
+            usage_dir=args.usage if args.usage is not None else shelves.get("usage"),
             crossfire=True if args.crossfire else None)
         failures = [*result.get("novels", {}).get("errors", []),
                     *result.get("books", {}).get("shelf", {}).get("errors", []),
-                    *result.get("dictionaries", {}).get("errors", [])]
+                    *result.get("dictionaries", {}).get("errors", []),
+                    *result.get("models", {}).get("errors", []),
+                    *result.get("usage", {}).get("errors", [])]
         emit(result)
         return 2 if failures else 0
     if args.card_operation == "autosync":
@@ -534,6 +549,8 @@ def card_command(args, cache: Cache) -> int:
             notify=None if args.no_notify else card_autosync.macos_notification,
             novels_dir=shelves.get("novels"), books_dir=shelves.get("books"),
             dictionaries_dir=shelves.get("dictionaries"),
+            models_dir=args.models if args.models is not None else shelves.get("models"),
+            usage_dir=args.usage if args.usage is not None else shelves.get("usage"),
             crossfire=True if args.crossfire else None)
         emit(result)
         return 2 if result["status"] in {"error", "rate_limited"} else 0

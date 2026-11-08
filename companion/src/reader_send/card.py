@@ -17,7 +17,7 @@ from pathlib import Path
 from .cache import Cache
 from .cloud_annotations import load_annotations, map_annotation
 from .common import ReaderError, atomic_write, bounded_read
-from . import novels
+from . import concept_index, novels
 from .book_hooks import BACKUP_SUFFIX
 
 CONFIG_VERSION = 1
@@ -60,6 +60,12 @@ DICTIONARIES_DIR = Path("dictionaries")
 HIDDEN_DICTIONARIES_DIR = Path(".dictionaries")
 # Lookup sidecars the reader builds next to <stem>.idx / <stem>.syn.
 DICTIONARY_SIDECARS = {".idx": ".qidx", ".syn": ".sidx"}
+# Model artifacts the ConceptEngine loads from /models (platonic-hnet.bin, engram.bin, inbox-concepts.idx).
+MODELS_DIR = Path("models")
+MODEL_SUFFIXES = (".bin", ".idx")
+# Reader telemetry backed up to the Mac on every sync.
+BENCHMARK_LOGS = Path("Benchmark/logs")
+LIQUID_REFRESH = Path(".crosspoint/liquid-refresh.bin")
 
 
 @dataclass(frozen=True)
@@ -88,6 +94,16 @@ def default_dictionaries_dir() -> Path:
     return Path.home() / "papyrix" / "dictionaries"
 
 
+
+def default_models_dir() -> Path:
+    """The Mac folder of ConceptEngine model artifacts mirrored to /models."""
+    return Path.home() / "papyrix" / "models"
+
+
+def default_usage_dir() -> Path:
+    """Where the reader's session logs and liquid-refresh table are backed up for calibration."""
+    return Path.home() / "papyrix" / "verification" / "refresh-calib" / "usage"
+
 def default_shelves() -> dict[str, Path]:
     """Existing Mac shelf sources for the automatic card copy, keyed by card shelf.
 
@@ -105,6 +121,12 @@ def default_shelves() -> dict[str, Path]:
     dictionaries_dir = default_dictionaries_dir()
     if dictionaries_dir.is_dir():
         shelves["dictionaries"] = dictionaries_dir
+    models_dir = default_models_dir()
+    if models_dir.is_dir():
+        shelves["models"] = models_dir
+    usage_dir = default_usage_dir()
+    if usage_dir.is_dir():
+        shelves["usage"] = usage_dir
     return shelves
 
 
@@ -551,6 +573,7 @@ def card_status(config: dict) -> tuple[dict, bool]:
 
 def sync_card(cache: Cache, config: dict, *, volume: CardVolume | None = None, novels_dir: Path | None = None,
               books_dir: Path | None = None, dictionaries_dir: Path | None = None,
+              models_dir: Path | None = None, usage_dir: Path | None = None,
               only_ids: set[str] | None = None, crossfire=None) -> dict:
     volume = volume or resolve_card(config["volume_uuid"])
     if volume.volume_uuid != _canonical_uuid(config["volume_uuid"]):
@@ -560,6 +583,7 @@ def sync_card(cache: Cache, config: dict, *, volume: CardVolume | None = None, n
     novel_plan = _plan_novels(volume, Path(novels_dir)) if novels_dir is not None else None
     book_plan = _plan_books(volume, Path(books_dir)) if books_dir is not None else None
     dictionary_plan = _plan_dictionaries(Path(dictionaries_dir)) if dictionaries_dir is not None else None
+    models_source = _plan_models(Path(models_dir)) if models_dir is not None else None
     annotations_dir = Path(config["annotations_dir"]).expanduser()
     if annotations_dir.exists() and (annotations_dir.is_symlink() or not annotations_dir.is_dir()):
         raise ReaderError(f"Annotation output must be a normal directory: {annotations_dir}")
@@ -611,6 +635,8 @@ def sync_card(cache: Cache, config: dict, *, volume: CardVolume | None = None, n
     book_result = _deliver_shelf(volume, book_plan) if book_plan is not None else None
     dictionary_result = (_deliver_dictionaries(volume, dictionary_plan)
                          if dictionary_plan is not None else None)
+    models_result = _deliver_models(volume, models_source) if models_source is not None else None
+    usage_result = _collect_usage(volume, Path(usage_dir)) if usage_dir is not None else None
     (_, annotation_count, annotation_path, annotation_updated,
      _, native_path, native_updated, crossfire_result) = _annotation_import(volume, config, crossfire)
     result = {
@@ -640,6 +666,10 @@ def sync_card(cache: Cache, config: dict, *, volume: CardVolume | None = None, n
         result["books"]["shelf"] = book_result
     if dictionary_result is not None:
         result["dictionaries"] = dictionary_result
+    if models_result is not None:
+        result["models"] = models_result
+    if usage_result is not None:
+        result["usage"] = usage_result
     return result
 
 
@@ -678,14 +708,32 @@ def _plan_dictionaries(source: Path) -> dict:
     return {"source": str(root), "folders": folders, "errors": errors}
 
 
-def _same_dictionary_copy(source: Path, destination: Path) -> bool:
+def _same_copy(source: Path, destination: Path) -> bool:
     try:
         local, card_copy = source.stat(), destination.lstat()
     except FileNotFoundError:
         return False
-    # Copies carry the Mac mtime; FAT stores it at 2-second resolution.
+    # Copies carry the source mtime; FAT stores it at 2-second resolution.
     return (stat.S_ISREG(card_copy.st_mode) and local.st_size == card_copy.st_size
             and abs(local.st_mtime - card_copy.st_mtime) <= 2)
+
+
+def _copy_verified(source: Path, destination: Path) -> None:
+    """Replace `destination` with `source`, read it back against the source SHA-256, and carry the mtime.
+
+    A copy that does not read back identically is removed and reported as a ReaderError.
+    """
+    expected = file_sha256(source)
+    _copy_replace_atomic(source, destination)
+    if file_sha256(destination) != expected:
+        try:
+            destination.unlink()
+            removed = "; the bad copy was removed"
+        except OSError as exc:
+            removed = f"; could not remove the bad copy: {exc}"
+        raise ReaderError(f"readback does not match the source SHA-256{removed}")
+    local = source.stat()
+    os.utime(destination, (local.st_atime, local.st_mtime))
 
 
 def _deliver_dictionaries(volume: CardVolume, plan: dict) -> dict:
@@ -708,35 +756,88 @@ def _deliver_dictionaries(volume: CardVolume, plan: dict) -> dict:
             continue
         for path in files:
             destination = target / path.name
-            if _same_dictionary_copy(path, destination):
+            if _same_copy(path, destination):
                 unchanged.append(str(destination))
                 continue
             try:
-                expected = file_sha256(path)
-                _copy_replace_atomic(path, destination)
-                readback = file_sha256(destination)
+                _copy_verified(path, destination)
             except (ReaderError, OSError) as exc:
                 errors.append(f"{name}/{path.name}: {exc}")
                 continue
-            if readback != expected:
-                try:
-                    destination.unlink()
-                    removed = "; the bad copy was removed"
-                except OSError as exc:
-                    removed = f"; could not remove the bad copy: {exc}"
-                errors.append(f"{name}/{path.name}: card readback does not match the Mac file{removed}")
-                continue
             sidecar = DICTIONARY_SIDECARS.get(path.suffix)
-            try:
-                if sidecar is not None:
+            if sidecar is not None:
+                try:
                     destination.with_suffix(sidecar).unlink(missing_ok=True)
-                local = path.stat()
-                os.utime(destination, (local.st_atime, local.st_mtime))
-            except OSError as exc:
-                errors.append(f"{name}/{path.name}: copied, but {exc}")
+                except OSError as exc:
+                    errors.append(f"{name}/{path.name}: copied, but {exc}")
             copied.append(str(destination))
     return {"source": plan["source"], "copied": len(copied), "unchanged": len(unchanged),
             "copied_paths": copied, "errors": errors}
+
+
+def _plan_models(source: Path) -> Path:
+    root = Path(source).expanduser()
+    if root.is_symlink() or not root.is_dir():
+        raise ReaderError(f"Model source folder not found: {root}")
+    return root.resolve()
+
+
+def _mirror_files(files: list[Path], target: Path, card_root: Path | None) -> dict:
+    """Copy each file into `target` when missing or changed (size, mtime), verified by SHA-256 read-back."""
+    copied: list[str] = []
+    unchanged: list[str] = []
+    errors: list[str] = []
+    if (_path_has_symlink(card_root, target) if card_root is not None else target.is_symlink()) or (
+            target.exists() and not target.is_dir()):
+        return {"copied": 0, "unchanged": 0, "copied_paths": [],
+                "errors": [f"destination is not a normal directory: {target}"]}
+    for path in files:
+        destination = target / path.name
+        if _same_copy(path, destination):
+            unchanged.append(str(destination))
+            continue
+        try:
+            _copy_verified(path, destination)
+        except (ReaderError, OSError) as exc:
+            errors.append(f"{path.name}: {exc}")
+            continue
+        copied.append(str(destination))
+    return {"copied": len(copied), "unchanged": len(unchanged), "copied_paths": copied, "errors": errors}
+
+
+def _deliver_models(volume: CardVolume, source: Path) -> dict:
+    """Refresh the book concept index for the card, then mirror every model artifact to /models.
+
+    The index covers the EPUBs now in /books/Inbox and /books/Books, so it runs after
+    every shelf was delivered. Card files the Mac folder lacks are left alone.
+    """
+    errors: list[str] = []
+    try:
+        index = concept_index.refresh_index(source, volume.root)
+    except (ReaderError, OSError) as exc:
+        index = None
+        errors.append(f"{concept_index.INDEX_NAME}: not refreshed: {exc}")
+    files = sorted(path for path in source.iterdir()
+                   if not path.name.startswith(".") and path.suffix in MODEL_SUFFIXES
+                   and not path.is_symlink() and path.is_file())
+    result = _mirror_files(files, volume.root / MODELS_DIR, volume.root)
+    return {"source": str(source), "index": index, **result, "errors": errors + result["errors"]}
+
+
+def _collect_usage(volume: CardVolume, usage_dir: Path) -> dict:
+    """Back up the reader's benchmark session logs and learned liquid-refresh table to the Mac."""
+    target = Path(usage_dir).expanduser()
+    logs = volume.root / BENCHMARK_LOGS
+    files: list[Path] = []
+    if not _path_has_symlink(volume.root, logs) and logs.is_dir():
+        files += sorted(path for path in logs.glob("session-*.jsonl") if not path.is_symlink() and path.is_file())
+    table = volume.root / LIQUID_REFRESH
+    if not _path_has_symlink(volume.root, table) and table.is_file():
+        files.append(table)
+    if not files:
+        return {"destination": str(target), "copied": 0, "unchanged": 0, "copied_paths": [], "errors": []}
+    target.mkdir(parents=True, exist_ok=True)
+    return {"destination": str(target), **_mirror_files(files, target, None)}
 
 
 def _path_has_symlink(root: Path, path: Path) -> bool:
