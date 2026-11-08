@@ -53,12 +53,14 @@ struct HostStorage {
   }
   HalFile open(const char* path, int flags) {
     HalFile file;
-    if (flags & O_CREAT && !exists(path)) {
+    if ((flags & O_TRUNC) || (flags & O_CREAT && !exists(path))) {
       file.openMode(path, "w+b");
     } else {
       file.openMode(path, (flags & (O_RDWR | O_WRONLY)) ? "r+b" : "rb");
     }
     return file;
   }
+  bool remove(const char* path) { return std::remove(path) == 0; }
+  bool rename(const char* oldPath, const char* newPath) { return std::rename(oldPath, newPath) == 0; }
 };
 inline HostStorage Storage;

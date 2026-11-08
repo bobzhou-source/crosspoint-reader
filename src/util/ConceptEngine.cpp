@@ -925,6 +925,389 @@ std::string weavePart(const int16_t frame, const char* fallback, const FrameFiel
   return {};
 }
 
+// ---- PE-Writer v1: pe-writer.bin + writer-clauses.bin ------------------------------
+// Exact integer semantics (pe-writer-kernel-addendum.md, shared with the
+// trainer's NumPy reference and golden writer):
+//   Linear L (f32 scale = 2^-S with S in 0..30, i16 bias[out], i8 W[out][in],
+//     row = output): lin(L, x)[o] = sh(sum_i W[o][i] x[i], S) + bias[o].
+//   gate_q7(z) = clamp(z + 64, 0, 128); normalize = the PLHN step-8 L2 to int8.
+//   Planner, s = 0..2: h = sat8((c_prev + c_echo + step_embed[s]) >> 1); twice
+//     h = normalize(h + lin(fc2, clamp(lin(fc1, h), 0, 127))).
+//   Router: b_s = argmax_b dot(c_plan[s], centroid[b]) (lowest index on ties);
+//     clause s = the valid slot (text_len > 0) of bucket b_s with the highest
+//     dot with c_plan[s]; sim_q7 = clamp(dot >> 7, 0, 127).
+//   Decoder, t = 0..35, phase s = min(2, t / 12), prev = <BOS> at t = 0:
+//     u = sat8((tok_embed[prev] + ((c_plan[s] + r_s) >> 1) + pos_embed[t]) >> 1)
+//     y = (u * gate_q7(lin(conv_in_gate, u)) + 64) >> 7
+//     z = sat8(lin(conv_dw over y_{t-2}, y_{t-1}, y_t)); h = sat8(u + lin(conv_out_proj, z))
+//     logits = lin(lm_head, h); + (gate_q7(lin(copy_gate_proj, h)) * sim_q7) >> 4 on
+//     the clause's next token; -10000 on each token >= 8 emitted in the last six
+//     steps; <BOS>, spent or unavailable entity/clause pointers masked; greedy.
+constexpr uint32_t PEWR_MAGIC = 0x52574550;  // "PEWR"
+constexpr uint32_t WCLS_MAGIC = 0x534C4357;  // "WCLS"
+constexpr size_t PEWR_HEADER_BYTES = 32;
+constexpr size_t PEWR_VOCAB = 2048;
+constexpr size_t PEWR_VOCAB_CHARS = 16;
+constexpr size_t PEWR_BUCKETS = 64;
+constexpr size_t PEWR_SLOTS = 64;
+constexpr size_t PEWR_STEP_TOKENS = 12;  // decoder tokens per thought phase
+constexpr size_t PEWR_RECENT = 6;        // anti-repetition window
+constexpr int32_t PEWR_REPEAT_PENALTY = 10000;
+constexpr uint16_t TOK_EOS = 0;
+constexpr uint16_t TOK_BOS = 1;
+constexpr uint16_t TOK_SUBJECT = 2;
+constexpr uint16_t TOK_ROLE = 3;
+constexpr uint16_t TOK_ECHO = 4;
+constexpr uint16_t TOK_CLAUSE0 = 5;
+constexpr uint16_t TOK_FIRST_WORD = 8;
+
+constexpr size_t linearBytes(const size_t out, const size_t in) { return 4 + 2 * out + out * in; }
+constexpr size_t PEWR_OFF_STEP = PEWR_HEADER_BYTES;
+constexpr size_t PEWR_OFF_FC1 = PEWR_OFF_STEP + PE_PLAN_STEPS * DIM;
+constexpr size_t PEWR_OFF_FC2 = PEWR_OFF_FC1 + linearBytes(DIM, DIM);
+constexpr size_t PEWR_OFF_CENTROIDS = PEWR_OFF_FC2 + linearBytes(DIM, DIM);
+constexpr size_t PEWR_OFF_TOK = PEWR_OFF_CENTROIDS + PEWR_BUCKETS * DIM;
+constexpr size_t PEWR_OFF_POS = PEWR_OFF_TOK + PEWR_VOCAB * DIM;
+constexpr size_t PEWR_OFF_GATE = PEWR_OFF_POS + PE_MAX_TOKENS * DIM;
+constexpr size_t PEWR_OFF_DW = PEWR_OFF_GATE + linearBytes(DIM, DIM);
+constexpr size_t PEWR_OFF_OUT = PEWR_OFF_DW + linearBytes(DIM, 3);
+constexpr size_t PEWR_OFF_LM = PEWR_OFF_OUT + linearBytes(DIM, DIM);
+constexpr size_t PEWR_OFF_COPY = PEWR_OFF_LM + linearBytes(PEWR_VOCAB, DIM);
+constexpr size_t PEWR_OFF_VOCAB = PEWR_OFF_COPY + linearBytes(1, DIM);
+constexpr size_t PEWR_BYTES = PEWR_OFF_VOCAB + PEWR_VOCAB * PEWR_VOCAB_CHARS;
+static_assert(PEWR_OFF_FC1 == 416 && PEWR_OFF_FC2 == 17060 && PEWR_OFF_CENTROIDS == 33704 && PEWR_OFF_TOK == 41896 &&
+                  PEWR_OFF_POS == 304040 && PEWR_OFF_GATE == 308648 && PEWR_OFF_DW == 325292 &&
+                  PEWR_OFF_OUT == 325936 && PEWR_OFF_LM == 342580 && PEWR_OFF_COPY == 608824 &&
+                  PEWR_OFF_VOCAB == 608958,
+              "PEWR v1 layout");
+static_assert(PEWR_BYTES == 641726, "PEWR v1 file size");
+
+constexpr size_t WCLS_HEADER_BYTES = 32;
+constexpr size_t WCLS_SLOT_BYTES = 256;
+constexpr size_t WCLS_TOKS_OFFSET = 128;
+constexpr size_t WCLS_CLAUSE_TOKENS = 16;
+constexpr size_t WCLS_TEXT_LEN_OFFSET = 161;
+constexpr size_t WCLS_TEXT_OFFSET = 162;
+constexpr size_t WCLS_TEXT_MAX = 93;
+constexpr size_t WCLS_BUCKET_BYTES = PEWR_SLOTS * WCLS_SLOT_BYTES;
+constexpr size_t WCLS_BYTES = WCLS_HEADER_BYTES + PEWR_BUCKETS * WCLS_BUCKET_BYTES;
+static_assert(WCLS_BYTES == 1048608, "WCLS v1 file size");
+constexpr size_t WCLS_BATCH_SLOTS = 16;  // 4 KB of the 16 KB bucket per read
+
+// One int8 linear layer inside the loaded pe-writer.bin. The f32 scale is
+// held exactly as mant * 2^-shift (mant < 2^24), so the rounding is integer.
+struct PeLinear {
+  const int8_t* w = nullptr;
+  const uint8_t* bias = nullptr;  // i16 LE, unaligned
+  int s = 0;
+  size_t out = 0, in = 0;
+
+  bool init(const uint8_t* base, const size_t offset, const size_t outDim, const size_t inDim) {
+    const float scale = readF32(base + offset);
+    if (!scaleShift(scale, s) || s < 0 || std::ldexp(1.0f, -s) != scale) return false;
+    bias = base + offset + 4;
+    w = reinterpret_cast<const int8_t*>(base + offset + 4 + 2 * outDim);
+    out = outDim;
+    in = inDim;
+    return true;
+  }
+
+  int32_t biasAt(const size_t o) const { return static_cast<int16_t>(readU16(bias + 2 * o)); }
+
+  void apply(const int8_t* x, int32_t* y) const {
+    for (size_t o = 0; o < out; ++o) {
+      const int8_t* row = w + o * in;
+      int32_t acc = 0;
+      for (size_t i = 0; i < in; ++i) acc += static_cast<int32_t>(row[i]) * x[i];
+      y[o] = sh(acc, s) + biasAt(o);
+    }
+  }
+};
+
+int32_t gateQ7(const int32_t z) { return std::clamp<int32_t>(z + 64, 0, 128); }
+
+struct PeWriter {
+  const uint8_t* base = nullptr;
+  PeLinear fc1, fc2, gate, dw, outProj, lm, copy;
+
+  const int8_t* at(const size_t offset) const { return reinterpret_cast<const int8_t*>(base + offset); }
+  std::string_view vocab(const size_t token) const {
+    return fixedText(base + PEWR_OFF_VOCAB + token * PEWR_VOCAB_CHARS, PEWR_VOCAB_CHARS);
+  }
+
+  bool init(const uint8_t* bytes) {
+    base = bytes;
+    return readU32(bytes) == PEWR_MAGIC && readU16(bytes + 4) == 1 && readU16(bytes + 6) == DIM &&
+           readU16(bytes + 8) == DIM && readU16(bytes + 10) == PE_PLAN_STEPS && readU16(bytes + 12) == PEWR_VOCAB &&
+           readU16(bytes + 14) == PE_MAX_TOKENS && readU16(bytes + 16) == PEWR_BUCKETS &&
+           readU16(bytes + 18) == PEWR_SLOTS && fc1.init(bytes, PEWR_OFF_FC1, DIM, DIM) &&
+           fc2.init(bytes, PEWR_OFF_FC2, DIM, DIM) && gate.init(bytes, PEWR_OFF_GATE, DIM, DIM) &&
+           dw.init(bytes, PEWR_OFF_DW, DIM, 3) && outProj.init(bytes, PEWR_OFF_OUT, DIM, DIM) &&
+           lm.init(bytes, PEWR_OFF_LM, PEWR_VOCAB, DIM) && copy.init(bytes, PEWR_OFF_COPY, 1, DIM);
+  }
+};
+
+// The retrieved clause for one thought step (empty when its bucket has no
+// valid slot).
+struct PeClause {
+  bool valid = false;
+  int8_t vec[DIM] = {};
+  uint16_t toks[WCLS_CLAUSE_TOKENS] = {};
+  int32_t simQ7 = 0;
+  char text[WCLS_TEXT_MAX + 1] = {};
+};
+
+struct PeWork {
+  int8_t plan[PE_PLAN_STEPS][DIM];
+  uint8_t buckets[PE_PLAN_STEPS];
+  PeClause clauses[PE_PLAN_STEPS];
+  uint16_t tokens[PE_MAX_TOKENS];
+  int32_t logits[PEWR_VOCAB];
+  uint8_t batch[WCLS_BATCH_SLOTS * WCLS_SLOT_BYTES];
+};
+
+void runPlanner(const PeWriter& pe, const int8_t cPage[DIM], const int8_t cEcho[DIM], PeWork& work) {
+  const int8_t* prev = cPage;
+  int32_t a32[DIM], f32[DIM];
+  int8_t x[DIM], a[DIM];
+  for (size_t s = 0; s < PE_PLAN_STEPS; ++s) {
+    const int8_t* step = pe.at(PEWR_OFF_STEP + s * DIM);
+    for (size_t d = 0; d < DIM; ++d) x[d] = sat8((prev[d] + cEcho[d] + step[d]) >> 1);
+    for (int loop = 0; loop < 2; ++loop) {
+      pe.fc1.apply(x, a32);
+      for (size_t d = 0; d < DIM; ++d) a[d] = static_cast<int8_t>(std::clamp<int32_t>(a32[d], 0, 127));
+      pe.fc2.apply(a, f32);
+      for (size_t d = 0; d < DIM; ++d) f32[d] += x[d];
+      normalize(f32, x);
+    }
+    memcpy(work.plan[s], x, DIM);
+    prev = work.plan[s];
+  }
+}
+
+uint8_t routeBucket(const PeWriter& pe, const int8_t plan[DIM]) {
+  uint8_t best = 0;
+  int32_t bestDot = INT32_MIN;
+  for (size_t b = 0; b < PEWR_BUCKETS; ++b) {
+    const int32_t score = dot(plan, pe.at(PEWR_OFF_CENTROIDS + b * DIM));
+    if (score > bestDot) {
+      bestDot = score;
+      best = static_cast<uint8_t>(b);
+    }
+  }
+  return best;
+}
+
+// One seek into writer-clauses.bin: the bucket's 64 slots stream through the
+// 4 KB batch buffer and only the best one is kept.
+bool retrieveClause(HalFile& file, const uint8_t bucket, const int8_t plan[DIM], PeWork& work, PeClause& out) {
+  out = PeClause{};
+  if (!file.seekSet(WCLS_HEADER_BYTES + static_cast<size_t>(bucket) * WCLS_BUCKET_BYTES)) return false;
+  int32_t bestDot = INT32_MIN;
+  for (size_t first = 0; first < PEWR_SLOTS; first += WCLS_BATCH_SLOTS) {
+    if (!readFully(file, work.batch, sizeof(work.batch))) return false;
+    for (size_t i = 0; i < WCLS_BATCH_SLOTS; ++i) {
+      const uint8_t* slot = work.batch + i * WCLS_SLOT_BYTES;
+      const uint8_t textLen = slot[WCLS_TEXT_LEN_OFFSET];
+      if (textLen == 0) continue;
+      const auto* vec = reinterpret_cast<const int8_t*>(slot);
+      const int32_t score = dot(plan, vec);
+      if (score <= bestDot) continue;
+      bestDot = score;
+      out.valid = true;
+      memcpy(out.vec, vec, DIM);
+      for (size_t k = 0; k < WCLS_CLAUSE_TOKENS; ++k) {
+        const uint16_t tok = readU16(slot + WCLS_TOKS_OFFSET + 2 * k);
+        out.toks[k] = tok < PEWR_VOCAB ? tok : 0;
+      }
+      out.simQ7 = std::clamp<int32_t>(score >> 7, 0, 127);
+      const std::string_view text =
+          fixedText(slot + WCLS_TEXT_OFFSET, std::min<size_t>(textLen, WCLS_TEXT_MAX));
+      memcpy(out.text, text.data(), text.size());
+      out.text[text.size()] = '\0';
+    }
+  }
+  return true;
+}
+
+bool readClausesHeader(HalFile& file) {
+  uint8_t h[WCLS_HEADER_BYTES];
+  return file.fileSize() == WCLS_BYTES && file.seekSet(0) && readFully(file, h, sizeof(h)) &&
+         readU32(h) == WCLS_MAGIC && readU16(h + 4) == 1 && readU16(h + 6) == PEWR_BUCKETS &&
+         readU16(h + 8) == PEWR_SLOTS && readU16(h + 10) == WCLS_SLOT_BYTES;
+}
+
+struct PeEntities {
+  std::string_view subject, role, echo;
+};
+
+void runDecoder(const PeWriter& pe, const PeEntities& ents, PeWork& work) {
+  bool used[TOK_FIRST_WORD] = {};
+  uint8_t cursor[PE_PLAN_STEPS] = {};
+  int8_t vHist[3][DIM] = {};  // v_{t-2}, v_{t-1}, v_t
+  int32_t acc[DIM];
+  int8_t u[DIM], c[DIM], h[DIM];
+  uint16_t prev = TOK_BOS;
+  std::fill(std::begin(work.tokens), std::end(work.tokens), 0);
+
+  const auto selectable = [&](const uint16_t v) {
+    if (v == TOK_BOS) return false;
+    if (v >= TOK_FIRST_WORD || v == TOK_EOS) return true;
+    if (used[v]) return false;
+    if (v == TOK_SUBJECT) return !ents.subject.empty();
+    if (v == TOK_ECHO) return !ents.echo.empty();
+    if (v >= TOK_CLAUSE0) return work.clauses[v - TOK_CLAUSE0].valid;
+    return true;  // <ENT_ROLE> falls back to "this concept"
+  };
+
+  for (size_t t = 0; t < PE_MAX_TOKENS; ++t) {
+    const size_t s = std::min(PE_PLAN_STEPS - 1, t / PEWR_STEP_TOKENS);
+    const PeClause& clause = work.clauses[s];
+    const int8_t* emb = pe.at(PEWR_OFF_TOK + static_cast<size_t>(prev) * DIM);
+    const int8_t* pos = pe.at(PEWR_OFF_POS + t * DIM);
+    for (size_t d = 0; d < DIM; ++d) {
+      const int32_t m = (work.plan[s][d] + clause.vec[d]) >> 1;
+      u[d] = sat8((emb[d] + m + pos[d]) >> 1);
+    }
+
+    // Gated ShortConv (k = 3) over the gated inputs.
+    pe.gate.apply(u, acc);
+    memmove(vHist[0], vHist[1], 2 * DIM);
+    for (size_t d = 0; d < DIM; ++d) vHist[2][d] = static_cast<int8_t>((u[d] * gateQ7(acc[d]) + 64) >> 7);
+    for (size_t d = 0; d < DIM; ++d) {
+      const int8_t* tap = pe.dw.w + d * 3;
+      const int32_t sum = tap[0] * vHist[0][d] + tap[1] * vHist[1][d] + tap[2] * vHist[2][d];
+      c[d] = sat8(sh(sum, pe.dw.s) + pe.dw.biasAt(d));
+    }
+    pe.outProj.apply(c, acc);
+    for (size_t d = 0; d < DIM; ++d) h[d] = sat8(u[d] + acc[d]);
+
+    // Dual-route head: vocabulary logits plus the clause copy boost.
+    pe.lm.apply(h, work.logits);
+    if (cursor[s] < WCLS_CLAUSE_TOKENS && clause.toks[cursor[s]] > 0) {
+      int32_t gateLogit;
+      pe.copy.apply(h, &gateLogit);
+      work.logits[clause.toks[cursor[s]]] += (gateQ7(gateLogit) * clause.simQ7) >> 4;
+    }
+    const size_t from = t > PEWR_RECENT ? t - PEWR_RECENT : 0;
+    for (size_t j = from; j < t; ++j) {
+      const uint16_t v = work.tokens[j];
+      if (v < TOK_FIRST_WORD || std::find(work.tokens + from, work.tokens + j, v) != work.tokens + j) continue;
+      work.logits[v] -= PEWR_REPEAT_PENALTY;
+    }
+
+    int best = -1;
+    for (size_t v = 0; v < PEWR_VOCAB; ++v) {
+      if (!selectable(static_cast<uint16_t>(v))) continue;
+      if (best < 0 || work.logits[v] > work.logits[best]) best = static_cast<int>(v);
+    }
+    const auto y = static_cast<uint16_t>(best);
+    work.tokens[t] = y;
+    if (y == TOK_EOS) break;
+    if (y < TOK_FIRST_WORD) used[y] = true;
+    if (y >= TOK_CLAUSE0 && y < TOK_FIRST_WORD) {
+      cursor[y - TOK_CLAUSE0] = WCLS_CLAUSE_TOKENS;
+    } else if (cursor[s] < WCLS_CLAUSE_TOKENS && clause.toks[cursor[s]] == y) {
+      ++cursor[s];
+    }
+    prev = y;
+  }
+}
+
+// The code point starting at text[i] spanning `n` bytes, or false when the
+// lead byte is invalid, the sequence runs past the end, or a continuation
+// byte is missing (no overlong or surrogate checks).
+bool decodeAt(std::string_view text, const size_t i, uint32_t& cp, size_t& n) {
+  const auto b = static_cast<uint8_t>(text[i]);
+  if (b < 0x80) {
+    n = 1;
+    cp = b;
+  } else if (b >= 0xC0 && b < 0xE0) {
+    n = 2;
+    cp = b & 0x1F;
+  } else if (b >= 0xE0 && b < 0xF0) {
+    n = 3;
+    cp = b & 0x0F;
+  } else if (b >= 0xF0 && b < 0xF8) {
+    n = 4;
+    cp = b & 0x07;
+  } else {
+    return false;
+  }
+  if (i + n > text.size()) return false;
+  for (size_t k = 1; k < n; ++k) {
+    const auto c = static_cast<uint8_t>(text[i + k]);
+    if (!continuation(c)) return false;
+    cp = (cp << 6) | (c & 0x3F);
+  }
+  return true;
+}
+
+bool cjkCodepoint(const uint32_t cp) {
+  return (cp >= 0x2E80 && cp <= 0x9FFF) || (cp >= 0xF900 && cp <= 0xFAFF) || (cp >= 0xFF00 && cp <= 0xFFEF);
+}
+
+bool startsCjk(std::string_view text) {
+  uint32_t cp;
+  size_t n;
+  return !text.empty() && decodeAt(text, 0, cp, n) && cjkCodepoint(cp);
+}
+
+// The last code point must decode from at most three continuation bytes back
+// and end exactly at the end of `text`.
+bool endsCjk(std::string_view text) {
+  if (text.empty()) return false;
+  size_t i = text.size() - 1;
+  for (int k = 0; i > 0 && k < 3 && continuation(static_cast<uint8_t>(text[i])); ++k) --i;
+  uint32_t cp;
+  size_t n;
+  return decodeAt(text, i, cp, n) && i + n == text.size() && cjkCodepoint(cp);
+}
+
+// Pieces join with one space, except: "##" pieces glue (the marker dropped),
+// the first piece, a piece opening with , . ; : ! ? ) ', a piece after "(",
+// and CJK after CJK. Cut at RIFF_MAX_BYTES on a code point boundary.
+void renderRiff(const PeWriter& pe, const PeEntities& ents, const PeWork& work, std::string& text) {
+  text.clear();
+  for (const uint16_t token : work.tokens) {
+    if (token == TOK_EOS) break;
+    std::string_view piece;
+    if (token >= TOK_FIRST_WORD) {
+      piece = pe.vocab(token);
+    } else if (token == TOK_SUBJECT) {
+      piece = ents.subject;
+    } else if (token == TOK_ROLE) {
+      piece = ents.role.empty() ? std::string_view("this concept") : ents.role;
+    } else if (token == TOK_ECHO) {
+      piece = ents.echo;
+    } else if (token >= TOK_CLAUSE0) {
+      piece = work.clauses[token - TOK_CLAUSE0].text;
+    }
+    if (piece.empty()) continue;
+    bool glue = piece.size() >= 2 && piece[0] == '#' && piece[1] == '#';
+    if (glue) {
+      piece.remove_prefix(2);
+    } else {
+      glue = text.empty() || strchr(",.;:!?)'", piece[0]) != nullptr || text.back() == '(' ||
+             (endsCjk(text) && startsCjk(piece));
+    }
+    if (!glue) text += ' ';
+    text.append(piece.data(), piece.size());
+  }
+  if (text.size() > RIFF_MAX_BYTES) {
+    size_t n = RIFF_MAX_BYTES;
+    while (n > 0 && continuation(static_cast<uint8_t>(text[n]))) --n;
+    text.resize(n);
+  }
+}
+
+std::string joinPath(const std::string& dir, const char* name) {
+  if (dir.empty()) return std::string("/") + name;
+  return dir.back() == '/' ? dir + name : dir + '/' + name;
+}
+
+constexpr size_t MARGIN_NOTE_MAX_BYTES = 480;
+
 }  // namespace
 
 uint64_t fnv1a64(std::string_view bytes) {
@@ -1125,7 +1508,9 @@ std::vector<Match> queryEpisodicAndShelf(const int8_t queryVec[DIM], const size_
     scanIndex(shelf ? paths.shelf : paths.episodic, [&](uint32_t, const uint8_t* record) {
       const int32_t score = recordDot(record, queryVec);
       if (top.size() < maxResults || score > top.back().dot) {
-        insertTop(top, Match{readU64(record), readU32(record + 8), score, shelf, recordLabel(record)}, maxResults);
+        Match match{readU64(record), readU32(record + 8), score, shelf, recordLabel(record)};
+        memcpy(match.vec, record + ICPT_VEC_OFFSET, DIM);
+        insertTop(top, std::move(match), maxResults);
       }
       return true;
     });
@@ -1432,6 +1817,127 @@ bool weaveEntityRefresher(const char* word, const size_t wordLen, const char* bo
   memcpy(outStory, text.data(), n);
   outStory[n] = '\0';
   return true;
+}
+
+bool generateMarginRiff(const std::string& modelsDir, const int8_t cPage[DIM], const int8_t cEcho[DIM],
+                        const char* subject, const char* role, const char* echoTitle, std::string& outRiff,
+                        int8_t outPlan[PE_PLAN_STEPS][DIM], uint8_t outBuckets[PE_PLAN_STEPS],
+                        uint16_t outTokens[PE_MAX_TOKENS]) {
+  outRiff.clear();
+  if (!cPage) return false;
+  const std::string writerPath = joinPath(modelsDir, PE_WRITER_FILE);
+  const std::string clausesPath = joinPath(modelsDir, WRITER_CLAUSES_FILE);
+  if (!Storage.exists(writerPath.c_str()) || !Storage.exists(clausesPath.c_str())) return false;
+
+  HalFile clauses;
+  if (!Storage.openFileForRead("PEW", clausesPath, clauses) || !readClausesHeader(clauses)) {
+    LOG_ERR("PEW", "Bad writer-clauses.bin");
+    return false;
+  }
+  // The weights live in PSRAM only for this call.
+  HalMemory::PsramBuffer weights;
+  {
+    HalFile file;
+    if (!Storage.openFileForRead("PEW", writerPath, file)) return false;
+    if (file.fileSize() != PEWR_BYTES) {
+      LOG_ERR("PEW", "pe-writer.bin size %u, expected %u", static_cast<unsigned>(file.fileSize()),
+              static_cast<unsigned>(PEWR_BYTES));
+      return false;
+    }
+    weights = HalMemory::allocatePsram(PEWR_BYTES);
+    if (!weights) {
+      LOG_ERR("PEW", "OOM: pe-writer weights");
+      return false;
+    }
+    if (!readFully(file, weights.get(), PEWR_BYTES)) return false;
+  }
+  PeWriter pe;
+  if (!pe.init(weights.get())) {
+    LOG_ERR("PEW", "Bad pe-writer.bin header");
+    return false;
+  }
+  auto work = makeUniqueNoThrow<PeWork>();
+  if (!work) {
+    LOG_ERR("PEW", "OOM: pe-writer work");
+    return false;
+  }
+
+  static const int8_t noEcho[DIM] = {};
+  runPlanner(pe, cPage, cEcho ? cEcho : noEcho, *work);
+  for (size_t s = 0; s < PE_PLAN_STEPS; ++s) {
+    work->buckets[s] = routeBucket(pe, work->plan[s]);
+    if (!retrieveClause(clauses, work->buckets[s], work->plan[s], *work, work->clauses[s])) {
+      LOG_ERR("PEW", "writer-clauses.bin read failed");
+      return false;
+    }
+  }
+  clauses.close();
+
+  const PeEntities ents{subject ? subject : "", role ? role : "", echoTitle ? echoTitle : ""};
+  runDecoder(pe, ents, *work);
+  if (outPlan) memcpy(outPlan, work->plan, sizeof(work->plan));
+  if (outBuckets) memcpy(outBuckets, work->buckets, sizeof(work->buckets));
+  if (outTokens) memcpy(outTokens, work->tokens, sizeof(work->tokens));
+  renderRiff(pe, ents, *work, outRiff);
+  return !outRiff.empty();
+}
+
+bool appendMarginNote(std::string_view note, const char* path) {
+  if (!path || !*path) return false;
+  std::string line(utf8Prefix(note, MARGIN_NOTE_MAX_BYTES));
+  for (char& ch : line) {
+    if (ch == '\n' || ch == '\r') ch = ' ';
+  }
+  if (line.empty()) return false;
+
+  // The newest notes already on the card (the file is newest last); a file
+  // past the cap is only read from its tail.
+  std::string existing;
+  if (Storage.exists(path)) {
+    HalFile in;
+    if (Storage.openFileForRead("PEW", path, in)) {
+      const size_t size = in.fileSize();
+      const size_t cap = MARGIN_NOTES_MAX * (MARGIN_NOTE_MAX_BYTES + 1);
+      const size_t skip = size > cap ? size - cap : 0;
+      existing.resize(size - skip);
+      if (!in.seekSet(skip) || !readFully(in, reinterpret_cast<uint8_t*>(existing.data()), existing.size())) {
+        existing.clear();
+      } else if (skip > 0) {
+        const size_t newline = existing.find('\n');
+        existing.erase(0, newline == std::string::npos ? existing.size() : newline + 1);
+      }
+    }
+  }
+  std::vector<std::string_view> kept;
+  for (size_t start = 0; start < existing.size();) {
+    size_t end = existing.find('\n', start);
+    if (end == std::string::npos) end = existing.size();
+    if (end > start) kept.emplace_back(existing.data() + start, end - start);
+    start = end + 1;
+  }
+  const size_t first = kept.size() >= MARGIN_NOTES_MAX ? kept.size() - (MARGIN_NOTES_MAX - 1) : 0;
+
+  const std::string temporary = std::string(path) + ".tmp";
+  {
+    HalFile out = Storage.open(temporary.c_str(), O_WRONLY | O_CREAT | O_TRUNC);
+    if (!out) return false;
+    bool ok = true;
+    const auto writeLine = [&](const std::string_view text) {
+      ok = ok && out.write(text.data(), text.size()) == text.size() && out.write("\n", 1) == 1;
+    };
+    for (size_t i = first; i < kept.size(); ++i) writeLine(kept[i]);
+    writeLine(line);
+    out.close();
+    if (!ok) {
+      Storage.remove(temporary.c_str());
+      return false;
+    }
+  }
+  if (Storage.exists(path) && !Storage.remove(path)) {
+    Storage.remove(temporary.c_str());
+    return false;
+  }
+  return Storage.rename(temporary.c_str(), path);
 }
 
 void setPaths(const Paths& newPaths) {

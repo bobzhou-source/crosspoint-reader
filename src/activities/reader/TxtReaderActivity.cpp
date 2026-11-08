@@ -618,6 +618,7 @@ bool TxtReaderActivity::openDictionaryWordSelect() {
   if (!page) return false;
   auto lookup = std::make_unique<DictionaryWordSelectActivity>(renderer, mappedInput, std::move(page),
                                                                cachedOrientedMarginLeft, cachedOrientedMarginTop);
+  lookup->setBookTitle(getBookTitle());
   lookup->setReadingPosition(static_cast<uint32_t>(std::clamp(displayedPageNumber() - 1, 0, 0xFFFF)),
                              ConceptEngine::txtStoryCutoff(currentOffset));
   startActivityForResult(std::move(lookup), [this](const ActivityResult&) { requestUpdate(); });
@@ -670,6 +671,7 @@ bool TxtReaderActivity::handleWordHold() {
     LOG_ERR("TRS", "OOM: DictionaryWordSelectActivity");
     return true;
   }
+  lookup->setBookTitle(getBookTitle());
   lookup->setReadingPosition(static_cast<uint32_t>(std::clamp(displayedPageNumber() - 1, 0, 0xFFFF)),
                              ConceptEngine::txtStoryCutoff(currentOffset));
   startActivityForResult(std::move(lookup), [this](const ActivityResult&) { requestUpdate(); });

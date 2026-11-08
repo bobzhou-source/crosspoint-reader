@@ -58,6 +58,9 @@ class DictionaryWordSelectActivity final : public Activity {
     storyCutoff = cutoff;
     hasReadingPosition = true;
   }
+  // The open book's title, used to label saved margin notes ("Title ch.3
+  // p.12 — word: riff"); without it the file name is used.
+  void setBookTitle(std::string title) { bookTitle = std::move(title); }
 
  private:
   enum class Popup : uint8_t { None, Busy, NotFound, Error };
@@ -70,7 +73,7 @@ class DictionaryWordSelectActivity final : public Activity {
   void drawHints() const;
   std::string contextAround(int radius) const;
   std::string weaveStory(std::string& matched) const;
-  void addConceptNotes(std::string& definition, bool html, const std::string& story);
+  void addConceptNotes(std::string& definition, bool html, const std::string& story, const std::string& subject);
 
   std::unique_ptr<ReaderWordPage> page;
   const int marginLeft;
@@ -86,6 +89,7 @@ class DictionaryWordSelectActivity final : public Activity {
   uint32_t readingPosition = 0;
   uint32_t storyCutoff = 0;
   bool hasReadingPosition = false;
+  std::string bookTitle;
   unsigned long lastHorizontalMoveTime = 0;
 
   // Every installed dictionary is a lookup candidate (see DictionaryRouter);

@@ -1362,3 +1362,709 @@ TEST_F(ConceptEngineTest, StoryRefresherWeavesCspwFrames) {
   EXPECT_EQ(weave("乌坦城", DOUPO, chapter(4)),
             "Story: Wu Tan City (Xiao Clan seat), Dou Qi prodigy — Xiao Clan's home city (Ch.3).");
 }
+
+// ---- PE-Writer margin riffs ----------------------------------------------------------------
+
+namespace {
+
+constexpr size_t PE_VOCAB = 2048;
+constexpr size_t PE_STEPS = 3;
+constexpr size_t PE_TOKENS = 36;
+constexpr size_t PE_BUCKETS = 64;
+constexpr size_t PE_SLOTS = 64;
+
+struct PeLayer {
+  int s = 7;
+  std::vector<int16_t> bias;
+  std::vector<int8_t> w;  // [out][in]
+};
+
+struct PeModel {
+  std::vector<int8_t> step, centroids, tok, pos;
+  PeLayer fc1, fc2, gate, dw, outp, lm, copy;
+  std::vector<std::string> vocab;  // 2048 entries, at most 16 bytes each (16 = no NUL)
+};
+
+struct ClauseSlot {
+  std::array<int8_t, 128> vec{};
+  std::array<uint16_t, 16> toks{};
+  std::string text;  // empty = invalid slot
+};
+
+using ClauseBank = std::vector<ClauseSlot>;  // bucket * 64 + slot
+
+struct Lcg {
+  uint32_t state;
+  int8_t next(const int range) {
+    state = state * 1664525u + 1013904223u;
+    return static_cast<int8_t>(static_cast<int>((state >> 8) % static_cast<uint32_t>(2 * range + 1)) - range);
+  }
+  uint32_t raw() {
+    state = state * 1664525u + 1013904223u;
+    return state >> 8;
+  }
+};
+
+std::vector<int8_t> randomBytes(Lcg& rng, const size_t n, const int range) {
+  std::vector<int8_t> out(n);
+  for (auto& v : out) v = rng.next(range);
+  return out;
+}
+
+PeLayer randomLayer(Lcg& rng, const size_t out, const size_t in, const int s, const int range, const int biasRange) {
+  PeLayer layer;
+  layer.s = s;
+  layer.w = randomBytes(rng, out * in, range);
+  layer.bias.resize(out);
+  for (auto& b : layer.bias) b = static_cast<int16_t>(rng.next(127) * biasRange / 127);
+  return layer;
+}
+
+PeModel makePeModel(const uint32_t seed) {
+  Lcg rng{seed};
+  PeModel m;
+  m.step = randomBytes(rng, PE_STEPS * 128, 60);
+  m.fc1 = randomLayer(rng, 128, 128, 8, 40, 16);
+  m.fc2 = randomLayer(rng, 128, 128, 7, 40, 16);
+  m.centroids = randomBytes(rng, PE_BUCKETS * 128, 90);
+  m.tok = randomBytes(rng, PE_VOCAB * 128, 80);
+  m.pos = randomBytes(rng, PE_TOKENS * 128, 40);
+  m.gate = randomLayer(rng, 128, 128, 9, 50, 32);
+  m.dw = randomLayer(rng, 128, 3, 6, 100, 8);
+  m.outp = randomLayer(rng, 128, 128, 8, 50, 8);
+  m.lm = randomLayer(rng, PE_VOCAB, 128, 9, 60, 200);
+  m.copy = randomLayer(rng, 1, 128, 9, 50, 16);
+  m.vocab.resize(PE_VOCAB);
+  for (size_t v = 8; v < PE_VOCAB; ++v) m.vocab[v] = "w" + std::to_string(v);
+  m.vocab[8] = "reveals";
+  m.vocab[9] = ",";
+  m.vocab[10] = "##ly";
+  m.vocab[11] = "(";
+  m.vocab[12] = "beneath";
+  m.vocab[13] = "。";
+  m.vocab[14] = "暗流";
+  m.vocab[15] = "'s";
+  m.vocab[16] = "counterbalances,";  // fills all 16 bytes
+  return m;
+}
+
+void putLayer(std::vector<uint8_t>& out, const PeLayer& layer) {
+  put<float>(out, std::ldexp(1.0f, -layer.s));
+  for (const int16_t b : layer.bias) put<int16_t>(out, b);
+  out.insert(out.end(), layer.w.begin(), layer.w.end());
+}
+
+std::vector<uint8_t> serializePe(const PeModel& m) {
+  std::vector<uint8_t> out;
+  put<uint32_t>(out, 0x52574550);
+  for (const uint16_t v : {1, 128, 128, 3, 2048, 36, 64, 64}) put<uint16_t>(out, v);
+  out.resize(32, 0);
+  out.insert(out.end(), m.step.begin(), m.step.end());
+  putLayer(out, m.fc1);
+  putLayer(out, m.fc2);
+  out.insert(out.end(), m.centroids.begin(), m.centroids.end());
+  out.insert(out.end(), m.tok.begin(), m.tok.end());
+  out.insert(out.end(), m.pos.begin(), m.pos.end());
+  putLayer(out, m.gate);
+  putLayer(out, m.dw);
+  putLayer(out, m.outp);
+  putLayer(out, m.lm);
+  putLayer(out, m.copy);
+  for (const auto& word : m.vocab) {
+    char field[16] = {};
+    memcpy(field, word.data(), std::min<size_t>(word.size(), 16));
+    out.insert(out.end(), field, field + 16);
+  }
+  EXPECT_EQ(out.size(), 641726u);
+  return out;
+}
+
+// Every third slot is empty, bucket 5 has no valid slot at all, and some token
+// ids are out of range (they must read as 0).
+ClauseBank makeClauseBank(const uint32_t seed) {
+  Lcg rng{seed};
+  ClauseBank bank(PE_BUCKETS * PE_SLOTS);
+  for (size_t b = 0; b < PE_BUCKETS; ++b) {
+    for (size_t j = 0; j < PE_SLOTS; ++j) {
+      ClauseSlot& slot = bank[b * PE_SLOTS + j];
+      for (auto& v : slot.vec) v = rng.next(100);
+      for (size_t k = 0; k < 16; ++k) {
+        const uint32_t r = rng.raw();
+        slot.toks[k] = k >= 12 ? 0 : (r % 9 == 0 ? static_cast<uint16_t>(3000 + r % 100) : 8 + r % (PE_VOCAB - 8));
+      }
+      if (b != 5 && j % 3 != 2) slot.text = "b" + std::to_string(b) + "s" + std::to_string(j) + " clause";
+    }
+  }
+  return bank;
+}
+
+std::vector<uint8_t> serializeClauses(const ClauseBank& bank) {
+  std::vector<uint8_t> out;
+  put<uint32_t>(out, 0x534C4357);
+  for (const uint16_t v : {1, 64, 64, 256}) put<uint16_t>(out, v);
+  out.resize(32, 0);
+  for (const ClauseSlot& slot : bank) {
+    uint8_t raw[256] = {};
+    memcpy(raw, slot.vec.data(), 128);
+    memcpy(raw + 128, slot.toks.data(), 32);
+    raw[160] = 0;
+    raw[161] = static_cast<uint8_t>(std::min<size_t>(slot.text.size(), 93));
+    memcpy(raw + 162, slot.text.data(), std::min<size_t>(slot.text.size(), 93));
+    out.insert(out.end(), raw, raw + 256);
+  }
+  EXPECT_EQ(out.size(), 1048608u);
+  return out;
+}
+
+// ---- Literal reference of pe-writer-kernel-addendum.md --------------------------------------
+
+int64_t refSh(const int64_t a, const int s) { return s > 0 ? (a + (int64_t{1} << (s - 1))) >> s : a; }
+int refSat8(const int64_t a) { return static_cast<int>(std::clamp<int64_t>(a, -127, 127)); }
+
+std::vector<int64_t> refLin(const PeLayer& layer, const std::vector<int>& x) {
+  const size_t in = x.size();
+  const size_t out = layer.bias.size();
+  std::vector<int64_t> y(out);
+  for (size_t o = 0; o < out; ++o) {
+    int64_t acc = 0;
+    for (size_t i = 0; i < in; ++i) acc += static_cast<int64_t>(layer.w[o * in + i]) * x[i];
+    y[o] = refSh(acc, layer.s) + layer.bias[o];
+  }
+  return y;
+}
+
+std::vector<int> refNormalize(const std::vector<int64_t>& r) {
+  int64_t n2 = 0;
+  for (const int64_t v : r) n2 += v * v;
+  int64_t n = static_cast<int64_t>(std::sqrt(static_cast<long double>(n2)));
+  while (n * n > n2) --n;
+  while ((n + 1) * (n + 1) <= n2) ++n;
+  std::vector<int> out(r.size());
+  for (size_t d = 0; d < r.size(); ++d) {
+    if (n == 0) continue;
+    const int64_t a = 127 * r[d];
+    out[d] = refSat8(a >= 0 ? (a + n / 2) / n : -((-a + n / 2) / n));
+  }
+  return out;
+}
+
+int64_t refDot(const std::vector<int>& a, const int8_t* b) {
+  int64_t sum = 0;
+  for (size_t d = 0; d < 128; ++d) sum += a[d] * static_cast<int64_t>(b[d]);
+  return sum;
+}
+
+struct PeExpect {
+  int8_t plan[PE_STEPS][128] = {};
+  uint8_t buckets[PE_STEPS] = {};
+  int clauseSlot[PE_STEPS] = {-1, -1, -1};
+  uint16_t tokens[PE_TOKENS] = {};
+  std::string text;
+};
+
+bool refCjk(const std::string& s, size_t i, size_t end) {
+  const auto b = static_cast<uint8_t>(s[i]);
+  size_t n = b < 0x80 ? 1 : (b >= 0xC0 && b < 0xE0) ? 2 : (b >= 0xE0 && b < 0xF0) ? 3 : (b >= 0xF0 && b < 0xF8) ? 4 : 0;
+  if (n == 0 || i + n > s.size() || (end != 0 && i + n != end)) return false;
+  uint32_t cp = n == 1 ? b : n == 2 ? (b & 0x1F) : n == 3 ? (b & 0x0F) : (b & 0x07);
+  for (size_t k = 1; k < n; ++k) {
+    const auto c = static_cast<uint8_t>(s[i + k]);
+    if ((c & 0xC0) != 0x80) return false;
+    cp = (cp << 6) | (c & 0x3F);
+  }
+  return (cp >= 0x2E80 && cp <= 0x9FFF) || (cp >= 0xF900 && cp <= 0xFAFF) || (cp >= 0xFF00 && cp <= 0xFFEF);
+}
+
+PeExpect referenceRiff(const PeModel& m, const ClauseBank& bank, const int8_t* cPage, const int8_t* cEcho,
+                       const std::string& subject, const std::string& role, const std::string& echo) {
+  PeExpect e;
+  std::vector<int> prev(cPage, cPage + 128);
+  std::vector<std::vector<int>> plan;
+  for (size_t s = 0; s < PE_STEPS; ++s) {
+    std::vector<int> h(128);
+    for (size_t d = 0; d < 128; ++d) h[d] = refSat8((prev[d] + (cEcho ? cEcho[d] : 0) + m.step[s * 128 + d]) >> 1);
+    for (int k = 0; k < 2; ++k) {
+      const auto a64 = refLin(m.fc1, h);
+      std::vector<int> a(128);
+      for (size_t d = 0; d < 128; ++d) a[d] = static_cast<int>(std::clamp<int64_t>(a64[d], 0, 127));
+      const auto f = refLin(m.fc2, a);
+      std::vector<int64_t> r(128);
+      for (size_t d = 0; d < 128; ++d) r[d] = h[d] + f[d];
+      h = refNormalize(r);
+    }
+    for (size_t d = 0; d < 128; ++d) e.plan[s][d] = static_cast<int8_t>(h[d]);
+    plan.push_back(h);
+    prev = h;
+  }
+  std::vector<int> r[PE_STEPS];
+  std::array<uint16_t, 16> toks[PE_STEPS] = {};
+  int sim[PE_STEPS] = {};
+  std::string clauseText[PE_STEPS];
+  for (size_t s = 0; s < PE_STEPS; ++s) {
+    int64_t best = INT64_MIN;
+    for (size_t b = 0; b < PE_BUCKETS; ++b) {
+      const int64_t score = refDot(plan[s], m.centroids.data() + b * 128);
+      if (score > best) {
+        best = score;
+        e.buckets[s] = static_cast<uint8_t>(b);
+      }
+    }
+    r[s].assign(128, 0);
+    best = INT64_MIN;
+    for (size_t j = 0; j < PE_SLOTS; ++j) {
+      const ClauseSlot& slot = bank[e.buckets[s] * PE_SLOTS + j];
+      if (slot.text.empty()) continue;
+      const int64_t score = refDot(plan[s], slot.vec.data());
+      if (score > best) {
+        best = score;
+        e.clauseSlot[s] = static_cast<int>(j);
+      }
+    }
+    if (e.clauseSlot[s] >= 0) {
+      const ClauseSlot& slot = bank[e.buckets[s] * PE_SLOTS + e.clauseSlot[s]];
+      r[s].assign(slot.vec.begin(), slot.vec.end());
+      for (size_t k = 0; k < 16; ++k) toks[s][k] = slot.toks[k] < 2048 ? slot.toks[k] : 0;
+      sim[s] = static_cast<int>(std::clamp<int64_t>(best >> 7, 0, 127));
+      clauseText[s] = slot.text.substr(0, 93);
+    }
+  }
+
+  std::vector<int> y1(128, 0), y2(128, 0);
+  int prevTok = 1;
+  int cursor[PE_STEPS] = {};
+  bool used[8] = {};
+  for (size_t t = 0; t < PE_TOKENS; ++t) {
+    const size_t s = std::min<size_t>(2, t / 12);
+    std::vector<int> u(128), y(128), z(128), h(128);
+    for (size_t d = 0; d < 128; ++d) {
+      u[d] = refSat8((m.tok[prevTok * 128 + d] + ((plan[s][d] + r[s][d]) >> 1) + m.pos[t * 128 + d]) >> 1);
+    }
+    const auto g = refLin(m.gate, u);
+    for (size_t d = 0; d < 128; ++d) y[d] = static_cast<int>((u[d] * std::clamp<int64_t>(g[d] + 64, 0, 128) + 64) >> 7);
+    for (size_t d = 0; d < 128; ++d) {
+      const int64_t acc = m.dw.w[d * 3] * y2[d] + m.dw.w[d * 3 + 1] * y1[d] + m.dw.w[d * 3 + 2] * y[d];
+      z[d] = refSat8(refSh(acc, m.dw.s) + m.dw.bias[d]);
+    }
+    y2 = y1;
+    y1 = y;
+    const auto o = refLin(m.outp, z);
+    for (size_t d = 0; d < 128; ++d) h[d] = refSat8(u[d] + o[d]);
+    auto logit = refLin(m.lm, h);
+    const int64_t gate = std::clamp<int64_t>(refLin(m.copy, h)[0] + 64, 0, 128);
+    const int tc = cursor[s] < 16 ? toks[s][cursor[s]] : 0;
+    if (tc > 0) logit[tc] += (gate * sim[s]) >> 4;
+    for (size_t v = 8; v < PE_VOCAB; ++v) {
+      for (size_t j = t >= 6 ? t - 6 : 0; j < t; ++j) {
+        if (e.tokens[j] == v) {
+          logit[v] -= 10000;
+          break;
+        }
+      }
+    }
+    int best = -1;
+    for (size_t v = 0; v < PE_VOCAB; ++v) {
+      if (v == 1) continue;
+      if (v >= 2 && v <= 7 && used[v]) continue;
+      if (v == 2 && subject.empty()) continue;
+      if (v == 4 && echo.empty()) continue;
+      if (v >= 5 && v <= 7 && e.clauseSlot[v - 5] < 0) continue;
+      if (best < 0 || logit[v] > logit[best]) best = static_cast<int>(v);
+    }
+    if (best == 0) break;
+    e.tokens[t] = static_cast<uint16_t>(best);
+    prevTok = best;
+    if (best >= 2 && best <= 7) used[best] = true;
+    if (best >= 5 && best <= 7) {
+      cursor[best - 5] = 16;
+    } else if (tc > 0 && best == tc) {
+      ++cursor[s];
+    }
+  }
+
+  for (const uint16_t token : e.tokens) {
+    if (token == 0) break;
+    std::string piece = token >= 8    ? m.vocab[token].substr(0, 16)
+                        : token == 2  ? subject
+                        : token == 3  ? (role.empty() ? "this concept" : role)
+                        : token == 4  ? echo
+                                      : clauseText[token - 5];
+    if (piece.empty()) continue;
+    bool glue = piece.rfind("##", 0) == 0;
+    if (glue) {
+      piece.erase(0, 2);
+    } else if (e.text.empty() || std::string(",.;:!?)'").find(piece[0]) != std::string::npos ||
+               e.text.back() == '(') {
+      glue = true;
+    } else {
+      size_t i = e.text.size() - 1;
+      for (int k = 0; i > 0 && k < 3 && (static_cast<uint8_t>(e.text[i]) & 0xC0) == 0x80; ++k) --i;
+      glue = refCjk(e.text, i, e.text.size()) && refCjk(piece, 0, 0);
+    }
+    if (!glue) e.text += ' ';
+    e.text += piece;
+  }
+  if (e.text.size() > 239) {
+    size_t cut = 239;
+    while (cut > 0 && (static_cast<uint8_t>(e.text[cut]) & 0xC0) == 0x80) --cut;
+    e.text.resize(cut);
+  }
+  return e;
+}
+
+struct PeRun {
+  bool ok = false;
+  std::string riff;
+  int8_t plan[PE_STEPS][128] = {};
+  uint8_t buckets[PE_STEPS] = {};
+  uint16_t tokens[PE_TOKENS] = {};
+};
+
+PeRun runRiff(const std::string& dir, const int8_t* cPage, const int8_t* cEcho, const char* subject,
+              const char* role, const char* echo) {
+  PeRun run;
+  memset(run.tokens, 0xFF, sizeof(run.tokens));
+  run.ok = ce::generateMarginRiff(dir, cPage, cEcho, subject, role, echo, run.riff, run.plan, run.buckets, run.tokens);
+  return run;
+}
+
+void expectMatchesReference(const PeRun& run, const PeExpect& want, const std::string& label) {
+  EXPECT_EQ(memcmp(run.plan, want.plan, sizeof(want.plan)), 0) << label;
+  for (size_t s = 0; s < PE_STEPS; ++s) EXPECT_EQ(run.buckets[s], want.buckets[s]) << label << " step " << s;
+  for (size_t t = 0; t < PE_TOKENS; ++t) EXPECT_EQ(run.tokens[t], want.tokens[t]) << label << " token " << t;
+  EXPECT_EQ(run.riff, want.text) << label;
+  EXPECT_EQ(run.ok, !want.text.empty()) << label;
+}
+
+// A model whose logits are only its lm_head biases (zero weights, no copy
+// boost), so the decode order is fixed by the biases, the masks and the
+// repetition penalty.
+PeModel biasOnlyModel(const uint32_t seed) {
+  PeModel m = makePeModel(seed);
+  std::fill(m.lm.w.begin(), m.lm.w.end(), 0);
+  m.lm.s = 0;
+  std::fill(m.lm.bias.begin(), m.lm.bias.end(), -1000);
+  std::fill(m.copy.w.begin(), m.copy.w.end(), 0);
+  m.copy.bias[0] = -64;  // gate_q7 = 0
+  return m;
+}
+
+}  // namespace
+
+TEST_F(ConceptEngineTest, PeWriterMatchesLiteralReferenceBitExact) {
+  const PeModel model = makePeModel(777);
+  const ClauseBank bank = makeClauseBank(4242);
+  writeFile(dir / "pe-writer.bin", serializePe(model));
+  writeFile(dir / "writer-clauses.bin", serializeClauses(bank));
+  Lcg rng{99};
+  // The random weights must exercise long decodes, several buckets and the
+  // copy boost, not just an immediate EOS.
+  size_t longRiffs = 0;
+  std::vector<uint8_t> buckets;
+  for (int c = 0; c < 24; ++c) {
+    const auto page = randomBytes(rng, 128, 127);
+    const auto echo = randomBytes(rng, 128, 127);
+    const bool withEcho = c % 3 != 0;
+    const char* subject = c % 4 == 1 ? "" : "Winston";
+    const char* role = c % 2 ? "the last man" : "";
+    const char* title = withEcho ? "Nineteen Eighty-Four" : "";
+    const PeRun run = runRiff(dir.string(), page.data(), withEcho ? echo.data() : nullptr, subject, role, title);
+    const PeExpect want =
+        referenceRiff(model, bank, page.data(), withEcho ? echo.data() : nullptr, subject, role, title);
+    expectMatchesReference(run, want, "case " + std::to_string(c));
+    if (want.tokens[12] != 0) ++longRiffs;
+    buckets.insert(buckets.end(), want.buckets, want.buckets + PE_STEPS);
+  }
+  std::sort(buckets.begin(), buckets.end());
+  EXPECT_GE(longRiffs, 12u);
+  EXPECT_GE(std::unique(buckets.begin(), buckets.end()) - buckets.begin(), 8);
+}
+
+TEST_F(ConceptEngineTest, PeWriterSyntheticRoundTrip) {
+  PeModel model = biasOnlyModel(31);
+  // Pointers first (each at most once), then two words; "reveals" and ","
+  // are then inside the repetition window, so EOS wins.
+  const int16_t order[] = {900, 800, 700, 600, 500, 400};
+  for (size_t v = 2; v <= 7; ++v) model.lm.bias[v] = order[v - 2];
+  model.lm.bias[8] = 300;
+  model.lm.bias[9] = 290;
+  model.lm.bias[0] = 100;
+  ClauseBank bank = makeClauseBank(5);
+  for (size_t j = 0; j < PE_SLOTS; ++j) bank[5 * PE_SLOTS + j].text = "bucket five clause";
+  writeFile(dir / "pe-writer.bin", serializePe(model));
+  writeFile(dir / "writer-clauses.bin", serializeClauses(bank));
+
+  Lcg rng{7};
+  const auto page = randomBytes(rng, 128, 127);
+  const auto echo = randomBytes(rng, 128, 127);
+  const PeRun run = runRiff(dir.string(), page.data(), echo.data(), "Winston", "the last man", "Nineteen Eighty-Four");
+  ASSERT_TRUE(run.ok);
+
+  // Thought vectors: unit norm at scale 127 and routed by their own argmax.
+  for (size_t s = 0; s < PE_STEPS; ++s) {
+    int64_t n2 = 0;
+    for (const int8_t v : run.plan[s]) n2 += v * v;
+    EXPECT_NEAR(std::sqrt(static_cast<double>(n2)), 127.0, 6.0) << "step " << s;
+    int64_t best = INT64_MIN;
+    size_t bestBucket = 0;
+    for (size_t b = 0; b < PE_BUCKETS; ++b) {
+      int64_t score = 0;
+      for (size_t d = 0; d < 128; ++d) score += run.plan[s][d] * model.centroids[b * 128 + d];
+      if (score > best) {
+        best = score;
+        bestBucket = b;
+      }
+    }
+    EXPECT_EQ(run.buckets[s], bestBucket) << "step " << s;
+  }
+  EXPECT_NE(memcmp(run.plan[0], run.plan[1], 128), 0);
+
+  const uint16_t expectTokens[PE_TOKENS] = {2, 3, 4, 5, 6, 7, 8, 9};
+  for (size_t t = 0; t < PE_TOKENS; ++t) EXPECT_EQ(run.tokens[t], expectTokens[t]) << "token " << t;
+
+  // Each <CLAUSE_s> expands to the best valid slot of the bucket step s routed to.
+  std::string clauses[PE_STEPS];
+  for (size_t s = 0; s < PE_STEPS; ++s) {
+    int64_t best = INT64_MIN;
+    for (size_t j = 0; j < PE_SLOTS; ++j) {
+      const ClauseSlot& slot = bank[run.buckets[s] * PE_SLOTS + j];
+      if (slot.text.empty()) continue;
+      int64_t score = 0;
+      for (size_t d = 0; d < 128; ++d) score += run.plan[s][d] * slot.vec[d];
+      if (score > best) {
+        best = score;
+        clauses[s] = slot.text;
+      }
+    }
+    ASSERT_FALSE(clauses[s].empty());
+  }
+  EXPECT_EQ(run.riff, "Winston the last man Nineteen Eighty-Four " + clauses[0] + " " + clauses[1] + " " + clauses[2] +
+                          " reveals,");
+  const PeExpect want = referenceRiff(model, bank, page.data(), echo.data(), "Winston", "the last man",
+                                      "Nineteen Eighty-Four");
+  expectMatchesReference(run, want, "round trip");
+
+  // No role: "this concept"; no echo title or subject: their pointers are never chosen.
+  const PeRun bare = runRiff(dir.string(), page.data(), echo.data(), "", "", "");
+  const uint16_t bareTokens[PE_TOKENS] = {3, 5, 6, 7, 8, 9};
+  for (size_t t = 0; t < PE_TOKENS; ++t) EXPECT_EQ(bare.tokens[t], bareTokens[t]) << "token " << t;
+  EXPECT_EQ(bare.riff, "this concept " + clauses[0] + " " + clauses[1] + " " + clauses[2] + " reveals,");
+
+  // A routed bucket without valid slots: no clause to point at.
+  for (ClauseSlot& slot : bank) slot.text.clear();
+  writeFile(dir / "writer-clauses.bin", serializeClauses(bank));
+  const PeRun empty = runRiff(dir.string(), page.data(), echo.data(), "Winston", "", "Nineteen Eighty-Four");
+  const uint16_t emptyTokens[PE_TOKENS] = {2, 3, 4, 8, 9};
+  for (size_t t = 0; t < PE_TOKENS; ++t) EXPECT_EQ(empty.tokens[t], emptyTokens[t]) << "token " << t;
+  EXPECT_EQ(empty.riff, "Winston this concept Nineteen Eighty-Four reveals,");
+}
+
+TEST_F(ConceptEngineTest, PeWriterNeverRepeatsAWordWithinSixSteps) {
+  PeModel model = biasOnlyModel(32);
+  for (size_t v = 2; v <= 7; ++v) model.lm.bias[v] = 2000;  // each pointer once, then never again
+  for (size_t v = 8; v < 15; ++v) model.lm.bias[v] = static_cast<int16_t>(500 - v);
+  model.lm.bias[0] = -9000;  // EOS loses to every unpenalized word
+  writeFile(dir / "pe-writer.bin", serializePe(model));
+  writeFile(dir / "writer-clauses.bin", serializeClauses(makeClauseBank(6)));
+  Lcg rng{8};
+  const auto page = randomBytes(rng, 128, 127);
+  const PeRun run = runRiff(dir.string(), page.data(), nullptr, "Julia", "rebel", "Brave New World");
+  ASSERT_TRUE(run.ok);
+  int pointerCount[8] = {};
+  for (size_t t = 0; t < PE_TOKENS; ++t) {
+    const uint16_t v = run.tokens[t];
+    ASSERT_NE(v, 0) << "token " << t;
+    ASSERT_NE(v, 1) << "token " << t;
+    if (v < 8) {
+      ++pointerCount[v];
+      continue;
+    }
+    for (size_t j = t >= 6 ? t - 6 : 0; j < t; ++j) EXPECT_NE(run.tokens[j], v) << "token " << t;
+  }
+  for (size_t v = 2; v <= 7; ++v) EXPECT_LE(pointerCount[v], 1) << "pointer " << v;
+  for (size_t v = 2; v <= 4; ++v) EXPECT_EQ(pointerCount[v], 1) << "pointer " << v;
+  // Seven words cycle with period seven once the pointers are spent.
+  for (size_t t = 6; t + 7 < PE_TOKENS; ++t) EXPECT_EQ(run.tokens[t], run.tokens[t + 7]) << "token " << t;
+  EXPECT_LE(run.riff.size(), ce::RIFF_MAX_BYTES);
+  const PeExpect want = referenceRiff(model, makeClauseBank(6), page.data(), nullptr, "Julia", "rebel",
+                                      "Brave New World");
+  expectMatchesReference(run, want, "cycle");
+}
+
+TEST_F(ConceptEngineTest, PeWriterRendersGlueRulesAndTruncatesOnACodepoint) {
+  PeModel model = biasOnlyModel(34);
+  // ##ly ( beneath-the-tide 。 暗流 's counterbalances, — then the same seven
+  // again (one is always outside the six-token window) up to 36 tokens.
+  model.vocab[12] = "beneath-the-tide";  // 16 bytes, no NUL
+  const uint16_t ids[] = {10, 11, 12, 13, 14, 15, 16};
+  for (size_t i = 0; i < 7; ++i) model.lm.bias[ids[i]] = static_cast<int16_t>(900 - 10 * i);
+  model.lm.bias[0] = 100;
+  writeFile(dir / "pe-writer.bin", serializePe(model));
+  writeFile(dir / "writer-clauses.bin", serializeClauses(makeClauseBank(11)));
+  Lcg rng{12};
+  const auto page = randomBytes(rng, 128, 127);
+  const PeRun run = runRiff(dir.string(), page.data(), nullptr, "", "", "");
+  ASSERT_TRUE(run.ok);
+  for (size_t t = 0; t < PE_TOKENS; ++t) EXPECT_EQ(run.tokens[t], ids[t % 7]) << "token " << t;
+  const std::string cycle = "ly (beneath-the-tide \xE3\x80\x82\xE6\x9A\x97\xE6\xB5\x81's counterbalances,";
+  EXPECT_EQ(run.riff.rfind(cycle + "ly (beneath-the-tide", 0), 0u) << run.riff;
+  EXPECT_LE(run.riff.size(), ce::RIFF_MAX_BYTES);
+  EXPECT_GT(run.riff.size(), ce::RIFF_MAX_BYTES - 4);
+  size_t at = 0;  // whole codepoints only
+  while (at < run.riff.size()) {
+    const auto lead = static_cast<uint8_t>(run.riff[at]);
+    ASSERT_NE(lead & 0xC0, 0x80) << "byte " << at;
+    at += lead < 0x80 ? 1 : lead < 0xE0 ? 2 : lead < 0xF0 ? 3 : 4;
+  }
+  EXPECT_EQ(at, run.riff.size());
+  expectMatchesReference(run, referenceRiff(model, makeClauseBank(11), page.data(), nullptr, "", "", ""), "glue");
+}
+
+TEST_F(ConceptEngineTest, PeWriterCopyBoostFollowsTheClauseCursor) {
+  PeModel model = biasOnlyModel(33);
+  for (size_t v = 8; v < PE_VOCAB; ++v) model.lm.bias[v] = 0;
+  model.lm.bias[0] = -5;
+  model.copy.bias[0] = 64;  // gate_q7 = 128
+  ClauseBank bank = makeClauseBank(9);
+  for (size_t i = 0; i < bank.size(); ++i) {
+    bank[i].toks = {20, 21, 22, 23, 0};
+    bank[i].text = "clause " + std::to_string(i);
+  }
+  writeFile(dir / "pe-writer.bin", serializePe(model));
+  writeFile(dir / "writer-clauses.bin", serializeClauses(bank));
+  Lcg rng{10};
+  const auto page = randomBytes(rng, 128, 127);
+  // Every slot vector becomes the step-0 thought (the planner does not read
+  // the clauses), so sim_q7 is about 126 and the boost about 1008.
+  const PeRun probe = runRiff(dir.string(), page.data(), nullptr, "", "", "");
+  for (ClauseSlot& slot : bank) memcpy(slot.vec.data(), probe.plan[0], 128);
+  writeFile(dir / "writer-clauses.bin", serializeClauses(bank));
+  const PeRun run = runRiff(dir.string(), page.data(), nullptr, "", "", "");
+  // The boosted clause tokens come out in clause order; then the tied plain
+  // words (bias 0) from the lowest unpenalized id.
+  EXPECT_EQ(run.tokens[0], 20);
+  EXPECT_EQ(run.tokens[1], 21);
+  EXPECT_EQ(run.tokens[2], 22);
+  EXPECT_EQ(run.tokens[3], 23);
+  const PeExpect want = referenceRiff(model, bank, page.data(), nullptr, "", "", "");
+  expectMatchesReference(run, want, "copy");
+}
+
+TEST_F(ConceptEngineTest, PeWriterRejectsMalformedFiles) {
+  PeModel model = biasOnlyModel(1);
+  model.lm.bias[8] = 300;  // "reveals", then EOS
+  const auto pe = serializePe(model);
+  const auto clauses = serializeClauses(makeClauseBank(2));
+  int8_t page[128] = {};
+  page[0] = 127;
+  std::string riff = "stale";
+  // Missing files.
+  EXPECT_FALSE(ce::generateMarginRiff(dir.string(), page, nullptr, "a", "b", "c", riff));
+  EXPECT_TRUE(riff.empty());
+  writeFile(dir / "writer-clauses.bin", clauses);
+  EXPECT_FALSE(ce::generateMarginRiff(dir.string(), page, nullptr, "a", "b", "c", riff));
+  writeFile(dir / "pe-writer.bin", pe);
+  EXPECT_TRUE(ce::generateMarginRiff(dir.string() + "/", page, nullptr, "a", "b", "c", riff));
+  EXPECT_EQ(riff, "reveals");
+
+  auto bad = pe;
+  bad[0] = 'X';
+  writeFile(dir / "pe-writer.bin", bad);
+  EXPECT_FALSE(ce::generateMarginRiff(dir.string(), page, nullptr, "a", "b", "c", riff));
+  bad = pe;
+  bad[13] = 0;  // n_vocab
+  writeFile(dir / "pe-writer.bin", bad);
+  EXPECT_FALSE(ce::generateMarginRiff(dir.string(), page, nullptr, "a", "b", "c", riff));
+  bad = pe;
+  const float notPow2 = 0.3f;
+  memcpy(bad.data() + 342580, &notPow2, 4);  // lm_head scale
+  writeFile(dir / "pe-writer.bin", bad);
+  EXPECT_FALSE(ce::generateMarginRiff(dir.string(), page, nullptr, "a", "b", "c", riff));
+  bad = pe;
+  bad.pop_back();
+  writeFile(dir / "pe-writer.bin", bad);
+  EXPECT_FALSE(ce::generateMarginRiff(dir.string(), page, nullptr, "a", "b", "c", riff));
+
+  writeFile(dir / "pe-writer.bin", pe);
+  auto badClauses = clauses;
+  badClauses[10] = 128;  // slot_bytes
+  writeFile(dir / "writer-clauses.bin", badClauses);
+  EXPECT_FALSE(ce::generateMarginRiff(dir.string(), page, nullptr, "a", "b", "c", riff));
+  badClauses = clauses;
+  badClauses.resize(badClauses.size() - 256);
+  writeFile(dir / "writer-clauses.bin", badClauses);
+  EXPECT_FALSE(ce::generateMarginRiff(dir.string(), page, nullptr, "a", "b", "c", riff));
+  EXPECT_TRUE(riff.empty());
+}
+
+TEST_F(ConceptEngineTest, MarginNotesKeepTheNewestSixtyFour) {
+  const std::string path = (dir / "margin-notes.txt").string();
+  for (int i = 0; i < 70; ++i) {
+    ASSERT_TRUE(ce::appendMarginNote("Book p." + std::to_string(i + 1) + " — word: riff\nline " + std::to_string(i),
+                                     path.c_str()));
+  }
+  EXPECT_FALSE(ce::appendMarginNote("", path.c_str()));
+  std::ifstream in(path);
+  std::vector<std::string> lines;
+  for (std::string line; std::getline(in, line);) lines.push_back(line);
+  ASSERT_EQ(lines.size(), ce::MARGIN_NOTES_MAX);
+  EXPECT_EQ(lines.front(), "Book p.7 — word: riff line 6");
+  EXPECT_EQ(lines.back(), "Book p.70 — word: riff line 69");
+  EXPECT_FALSE(fs::exists(path + ".tmp"));
+}
+
+TEST_F(ConceptEngineTest, QueryMatchesCarryTheirVectors) {
+  int8_t vec[128];
+  ce::encodeText("the whale breached beside the boat", vec);
+  ASSERT_TRUE(ce::appendEpisodicVector("/books/Moby Dick.epub", 4, vec));
+  const auto matches = ce::queryEpisodicAndShelf(vec, 1, false);
+  ASSERT_EQ(matches.size(), 1u);
+  EXPECT_EQ(memcmp(matches[0].vec, vec, 128), 0);
+}
+
+// Trainer golden cases: CONCEPT_ENGINE_GOLDEN_DIR=<dir with pe-writer.bin,
+// writer-clauses.bin, pe_writer_golden.bin> (or its pe_writer/ subdirectory).
+TEST_F(ConceptEngineTest, PeWriterMatchesGoldenVectors) {
+  const char* goldenDir = std::getenv("CONCEPT_ENGINE_GOLDEN_DIR");
+  if (!goldenDir || !*goldenDir) GTEST_SKIP() << "CONCEPT_ENGINE_GOLDEN_DIR not set";
+  fs::path golden(goldenDir);
+  if (!fs::exists(golden / "pe_writer_golden.bin")) golden /= "pe_writer";
+  if (!fs::exists(golden / "pe_writer_golden.bin")) GTEST_SKIP() << "no pe_writer_golden.bin";
+  std::ifstream in(golden / "pe_writer_golden.bin", std::ios::binary);
+  const std::vector<uint8_t> bytes((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+  ASSERT_GE(bytes.size(), 8u);
+  ASSERT_EQ(memcmp(bytes.data(), "PWGD", 4), 0);
+  uint32_t cases;
+  memcpy(&cases, bytes.data() + 4, 4);
+  constexpr size_t RECORD_BYTES = 128 + 128 + 32 * 3 + 3 * 128 + 3 + 36 * 2 + 240;
+  static_assert(RECORD_BYTES == 1051);
+  ASSERT_EQ(bytes.size(), 8 + cases * RECORD_BYTES);
+  EXPECT_EQ(cases, 32u);
+  const auto field = [](const uint8_t* p, const size_t n) {
+    const auto* c = reinterpret_cast<const char*>(p);
+    return std::string(c, strnlen(c, n));
+  };
+  size_t exact = 0;
+  for (uint32_t c = 0; c < cases; ++c) {
+    const uint8_t* p = bytes.data() + 8 + c * RECORD_BYTES;
+    const auto* page = reinterpret_cast<const int8_t*>(p);
+    const auto* echo = reinterpret_cast<const int8_t*>(p + 128);
+    const std::string subject = field(p + 256, 32);
+    const std::string role = field(p + 288, 32);
+    const std::string title = field(p + 320, 32);
+    const uint8_t* expected = p + 352;
+    uint16_t tokens[PE_TOKENS];
+    memcpy(tokens, expected + 384 + 3, sizeof(tokens));
+    const std::string text = field(expected + 384 + 3 + 72, 240);
+    const PeRun run = runRiff(golden.string(), page, echo, subject.c_str(), role.c_str(), title.c_str());
+    const bool planOk = memcmp(run.plan, expected, 384) == 0;
+    const bool bucketsOk = memcmp(run.buckets, expected + 384, 3) == 0;
+    const bool tokensOk = memcmp(run.tokens, tokens, sizeof(tokens)) == 0;
+    EXPECT_TRUE(planOk) << "case " << c;
+    EXPECT_TRUE(bucketsOk) << "case " << c;
+    EXPECT_TRUE(tokensOk) << "case " << c;
+    EXPECT_EQ(run.riff, text) << "case " << c;
+    EXPECT_EQ(run.ok, !text.empty()) << "case " << c;
+    if (planOk && bucketsOk && tokensOk && run.riff == text) ++exact;
+  }
+  EXPECT_EQ(exact, cases);
+}
