@@ -354,6 +354,8 @@ class CardAutosyncTest(unittest.TestCase):
         models.mkdir()
         (shelf / "Local Book.epub").write_bytes(epub_bytes("local"))
         (models / "cspw.bin").write_bytes(b"CSPW" + bytes(508))
+        (models / "pe-writer.bin").write_bytes(b"PEWR" + (1).to_bytes(4, "little") + bytes(56))
+        (models / "writer-clauses.bin").write_bytes(b"WCLS" + (1).to_bytes(4, "little") + bytes(1_048_600))
 
         result = self.run_autosync(books_dir=shelf, models_dir=models)
 
@@ -361,10 +363,12 @@ class CardAutosyncTest(unittest.TestCase):
         self.assertEqual(shelf_result["errors"], [])
         self.assertEqual(shelf_result["missing"], ["platonic-hnet.bin", "engram.bin"])
         self.assertEqual(sorted(path.name for path in (self.card / "models").iterdir()),
-                         ["cspw.bin", "inbox-concepts.idx", "story-graph.idx"])
+                         ["cspw.bin", "inbox-concepts.idx", "pe-writer.bin", "story-graph.idx",
+                          "writer-clauses.bin"])
+        self.assertEqual((self.card / "models/writer-clauses.bin").read_bytes()[:4], b"WCLS")
         self.assertEqual((self.card / "models/story-graph.idx").read_bytes()[:4], b"SGRF")
         log = self.log_path.read_text(encoding="utf-8")
-        self.assertIn("models shelf: copied 3, unchanged 0, errors 0", log)
+        self.assertIn("models shelf: copied 5, unchanged 0, errors 0", log)
         self.assertIn("story graph: 0 entities from 1 books, extracted 0, unreadable 1, pending 0", log)
         self.assertIn("models missing from the Mac folder: platonic-hnet.bin, engram.bin", log)
 

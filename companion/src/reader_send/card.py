@@ -63,7 +63,14 @@ DICTIONARY_SIDECARS = {".idx": ".qidx", ".syn": ".sidx"}
 # Model artifacts the ConceptEngine and CS-PW kernel load from /models; every other .bin/.idx in the
 # Mac folder is mirrored too, and a sync result names the ones the folder lacks.
 MODELS_DIR = Path("models")
-MODEL_FILENAMES = ("platonic-hnet.bin", "engram.bin", "inbox-concepts.idx", "cspw.bin", "story-graph.idx")
+MODEL_FILENAMES = ("platonic-hnet.bin", "engram.bin", "inbox-concepts.idx", "cspw.bin", "story-graph.idx",
+                   "pe-writer.bin", "writer-clauses.bin")
+# PE-Writer artifacts are header-checked before they reach the card: (magic, u32 LE version at
+# offset 4, minimum size, exact size or None). A file that fails is not copied and is reported.
+MODEL_HEADERS = {
+    "pe-writer.bin": (b"PEWR", 1, 32, None),
+    "writer-clauses.bin": (b"WCLS", 1, 1_048_608, 1_048_608),
+}
 MODEL_SUFFIXES = (".bin", ".idx")
 # Reader telemetry backed up to the Mac on every sync.
 BENCHMARK_LOGS = Path("Benchmark/logs")
@@ -829,11 +836,34 @@ def sync_models_to_card(volume: CardVolume, source: Path) -> dict:
     files = sorted(path for path in source.iterdir()
                    if not path.name.startswith(".") and path.suffix in MODEL_SUFFIXES
                    and not path.is_symlink() and path.is_file())
-    result = _mirror_files(files, volume.root / MODELS_DIR, volume.root)
     present = {path.name for path in files}
+    invalid = [problem for problem in map(_model_header_problem, files) if problem]
+    files = [path for path in files if not _model_header_problem(path)]
+    result = _mirror_files(files, volume.root / MODELS_DIR, volume.root)
     return {"source": str(source), "index": index, "story_graph": graph,
             "missing": [name for name in MODEL_FILENAMES if name not in present],
-            **result, "errors": errors + result["errors"]}
+            **result, "errors": errors + invalid + result["errors"]}
+
+
+def _model_header_problem(path: Path) -> str | None:
+    """Describe why a header-checked model file is malformed, or None when it is fine (or unchecked)."""
+    spec = MODEL_HEADERS.get(path.name)
+    if spec is None:
+        return None
+    magic, version, min_size, exact_size = spec
+    size = path.stat().st_size
+    if exact_size is not None and size != exact_size:
+        return f"{path.name}: size {size} is not the expected {exact_size} bytes; not copied"
+    if size < min_size:
+        return f"{path.name}: size {size} is below the minimum {min_size} bytes; not copied"
+    with path.open("rb") as handle:
+        head = handle.read(8)
+    if head[:4] != magic:
+        return f"{path.name}: magic {head[:4]!r} is not {magic!r}; not copied"
+    found = int.from_bytes(head[4:8], "little")
+    if found != version:
+        return f"{path.name}: version {found} is not {version}; not copied"
+    return None
 
 
 def _collect_usage(volume: CardVolume, usage_dir: Path) -> dict:
