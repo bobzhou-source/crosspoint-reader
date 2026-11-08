@@ -749,6 +749,8 @@ class CardModelsTest(unittest.TestCase):
         self.models.mkdir()
         (self.models / "platonic-hnet.bin").write_bytes(tiny_model())
         (self.models / "engram.bin").write_bytes(tiny_engram())
+        (self.models / "pe-writer.bin").write_bytes(b"PEWR" + struct.pack("<HH", 1, 128) + bytes(24))
+        (self.models / "writer-clauses.bin").write_bytes(b"WCLS" + struct.pack("<HH", 1, 64) + bytes(1_048_600))
         (self.models / "extra-artifact.idx").write_bytes(b"extra")
         (self.models / "notes.txt").write_bytes(b"not a model")
         (self.models / ".hidden.bin").write_bytes(b"hidden")
@@ -769,15 +771,16 @@ class CardModelsTest(unittest.TestCase):
     def test_models_are_mirrored_once_and_verified(self):
         result = self.sync()["models"]
         self.assertEqual(result["errors"], [])
-        self.assertEqual((result["copied"], result["unchanged"]), (5, 0))
+        self.assertEqual((result["copied"], result["unchanged"]), (7, 0))
         self.assertEqual(self.card_models(), ["engram.bin", "extra-artifact.idx", "inbox-concepts.idx",
-                                              "platonic-hnet.bin", "story-graph.idx"])
+                                              "pe-writer.bin", "platonic-hnet.bin", "story-graph.idx",
+                                              "writer-clauses.bin"])
         self.assertEqual(result["missing"], ["cspw.bin"])
         for name in self.card_models():
             self.assertEqual(card_module.file_sha256(self.card / "models" / name),
                              card_module.file_sha256(self.models / name))
         again = self.sync()["models"]
-        self.assertEqual((again["copied"], again["unchanged"]), (0, 5))
+        self.assertEqual((again["copied"], again["unchanged"]), (0, 7))
         self.assertEqual((again["index"]["encoded"], again["index"]["updated"]), (0, False))
 
     def test_a_changed_model_is_replaced_and_the_index_rebuilt(self):
@@ -809,8 +812,27 @@ class CardModelsTest(unittest.TestCase):
         self.assertIn("engram.bin: readback does not match the source SHA-256; the bad copy was removed",
                       result["errors"][0])
         self.assertNotIn("engram.bin", self.card_models())
-        self.assertEqual(result["copied"], 4)
+        self.assertEqual(result["copied"], 6)
         self.assertEqual(self.sync()["models"]["copied"], 1)  # retried on the next sync
+
+    def test_malformed_writer_models_are_not_copied_and_reported(self):
+        (self.models / "pe-writer.bin").write_bytes(b"PEWX" + struct.pack("<HH", 1, 128) + bytes(24))
+        (self.models / "writer-clauses.bin").write_bytes(b"WCLS" + struct.pack("<HH", 1, 64) + bytes(100))
+        result = self.sync()["models"]
+        self.assertEqual(len(result["errors"]), 2)
+        self.assertIn("pe-writer.bin: magic b'PEWX' is not b'PEWR'; not copied", result["errors"])
+        self.assertIn("writer-clauses.bin: size 108 is not the expected 1048608 bytes; not copied",
+                      result["errors"])
+        self.assertNotIn("pe-writer.bin", self.card_models())
+        self.assertNotIn("writer-clauses.bin", self.card_models())
+        self.assertEqual(result["missing"], ["cspw.bin"])
+
+    def test_a_writer_model_with_the_wrong_version_or_too_short_is_rejected(self):
+        (self.models / "pe-writer.bin").write_bytes(b"PEWR" + struct.pack("<HH", 2, 128) + bytes(24))
+        self.assertIn("pe-writer.bin: version 2 is not 1; not copied", self.sync()["models"]["errors"])
+        (self.models / "pe-writer.bin").write_bytes(b"PEWR" + struct.pack("<HH", 1, 128))
+        self.assertIn("pe-writer.bin: size 8 is below the minimum 32 bytes; not copied",
+                      self.sync()["models"]["errors"])
 
     def test_the_icpt_index_covers_inbox_and_books(self):
         result = self.sync()["models"]["index"]
@@ -890,9 +912,10 @@ class CardModelsTest(unittest.TestCase):
         self.assertEqual((args.models, args.usage), (Path("/m"), Path("/u")))
         self.assertIsNone(cli.parser().parse_args(["card", "sync"]).models)
 
-    def test_all_five_model_files_are_synced_when_changed(self):
+    def test_all_seven_model_files_are_synced_when_changed(self):
         self.assertEqual(card_module.MODEL_FILENAMES, ("platonic-hnet.bin", "engram.bin", "inbox-concepts.idx",
-                                                       "cspw.bin", "story-graph.idx"))
+                                                       "cspw.bin", "story-graph.idx", "pe-writer.bin",
+                                                       "writer-clauses.bin"))
         cspw = self.models / "cspw.bin"
         cspw.write_bytes(tiny_cspw())
         prebuilt = story_graph.build_story_graph(
@@ -908,7 +931,7 @@ class CardModelsTest(unittest.TestCase):
         self.assertEqual((self.card / "models/story-graph.idx").read_bytes(), prebuilt)
         self.assertEqual(len((self.card / "models/cspw.bin").read_bytes()), 393_728)
         unchanged = card_module.sync_models_to_card(self.volume, self.models)
-        self.assertEqual((unchanged["copied"], unchanged["unchanged"]), (0, 6))
+        self.assertEqual((unchanged["copied"], unchanged["unchanged"]), (0, 8))
         cspw.write_bytes(tiny_cspw(fill=3))  # same size, new bytes and mtime
         os.utime(cspw, (cspw.stat().st_atime, cspw.stat().st_mtime + 60))
         bigger = story_graph.build_story_graph(story_graph.read_story_graph(prebuilt)["entities"],
