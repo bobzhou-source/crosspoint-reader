@@ -402,6 +402,7 @@ void EpubReaderActivity::openDictionaryWordSelect() {
   }
   auto lookup =
       std::make_unique<DictionaryWordSelectActivity>(renderer, mappedInput, std::move(view), marginLeft, marginTop);
+  lookup->setBookTitle(getBookTitle());
   lookup->setReadingPosition(ConceptEngine::epubPosition(currentSpineIndex, section->currentPage),
                              storyCutoff(section.get(), currentSpineIndex));
   startActivityForResult(std::move(lookup), [this](const ActivityResult&) { requestUpdate(); });
@@ -457,6 +458,7 @@ bool EpubReaderActivity::handleWordHold() {
     LOG_ERR("ERA", "OOM: DictionaryWordSelectActivity");
     return true;
   }
+  lookup->setBookTitle(getBookTitle());
   lookup->setReadingPosition(ConceptEngine::epubPosition(currentSpineIndex, section->currentPage),
                              storyCutoff(section.get(), currentSpineIndex));
   startActivityForResult(std::move(lookup), [this](const ActivityResult&) { requestUpdate(); });

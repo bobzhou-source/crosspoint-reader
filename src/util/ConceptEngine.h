@@ -58,6 +58,8 @@
 //   event_gloss[64], char target_or_loc[56], int8 vec[128]; 24-byte aliases
 //   sorted by alias_hash: u64 alias_hash, u64 canonical_hash, u32
 //   reveal_cutoff, u32 reserved.
+// - pe-writer.bin (PEWR v1, 641,726 bytes) and writer-clauses.bin (WCLS v1,
+//   1,048,608 bytes): see generateMarginRiff below.
 namespace ConceptEngine {
 
 constexpr size_t DIM = 128;
@@ -71,6 +73,10 @@ constexpr const char* EPISODIC_PATH = "/.crosspoint/episodic.idx";
 constexpr const char* SHELF_PATH = "/models/inbox-concepts.idx";
 constexpr const char* CSPW_PATH = "/models/cspw.bin";
 constexpr const char* STORY_GRAPH_PATH = "/models/story-graph.idx";
+constexpr const char* MODELS_DIR = "/models";
+constexpr const char* PE_WRITER_FILE = "pe-writer.bin";
+constexpr const char* WRITER_CLAUSES_FILE = "writer-clauses.bin";
+constexpr const char* MARGIN_NOTES_PATH = "/.crosspoint/margin-notes.txt";
 
 // Episodic page numbers: an EPUB position packs (spine + 1) << 16 | page; a
 // value below 1 << 16 is a plain page index (TXT).
@@ -99,6 +105,7 @@ struct Match {
   int32_t dot = 0;      // int8 dot product; cosine = dot / (127 * 127)
   bool shelf = false;   // from inbox-concepts.idx rather than episodic.idx
   std::string label;
+  int8_t vec[DIM] = {};  // the record's concept vector
 };
 
 uint64_t fnv1a64(std::string_view bytes);
@@ -244,6 +251,36 @@ bool runChronoSlots(const int8_t (*scenes)[DIM], const uint32_t* pages, size_t c
 uint16_t cspwHalfLife(uint8_t salience);
 // round(32768 * 2^(-deltaPages / tau)) in Q15 through the 17-entry LUT.
 uint16_t cspwDecayQ15(uint32_t deltaPages, uint32_t tau);
+
+// ---- PE-Writer margin riffs ----------------------------------------------------
+
+constexpr size_t PE_PLAN_STEPS = 3;
+constexpr size_t PE_MAX_TOKENS = 36;
+// Longest riff, cut on a code point boundary.
+constexpr size_t RIFF_MAX_BYTES = 239;
+// margin-notes.txt keeps the newest this many notes, one per line.
+constexpr size_t MARGIN_NOTES_MAX = 64;
+
+// A 25-45 word analytical "margin riff" about the page whose concept vector is
+// `cPage`, conditioned on a cross-book echo `cEcho` (nullptr = none), from
+// <modelsDir>/pe-writer.bin (PEWR v1: 3-step looped latent thought planner,
+// 64-bucket centroid router, gated ShortConv(k=3) micro-decoder with a
+// clause-copy boost) and <modelsDir>/writer-clauses.bin (WCLS v1: 64 buckets of
+// 64 x 256-byte analytical clause slots, of which only the 3 routed buckets are
+// read). The weights are read into PSRAM for this call only. `subject`, `role`
+// and `echoTitle` (nullptr = empty) fill the <ENT_SUBJECT>, <ENT_ROLE> ("this
+// concept" when empty) and <BOOK_ECHO> tokens. The optional outputs get the
+// thought vectors, bucket ids and token ids (0 after the end). False when a
+// file is missing or malformed, memory runs out, or the riff is empty.
+bool generateMarginRiff(const std::string& modelsDir, const int8_t cPage[DIM], const int8_t cEcho[DIM],
+                        const char* subject, const char* role, const char* echoTitle, std::string& outRiff,
+                        int8_t outPlan[PE_PLAN_STEPS][DIM] = nullptr, uint8_t outBuckets[PE_PLAN_STEPS] = nullptr,
+                        uint16_t outTokens[PE_MAX_TOKENS] = nullptr);
+
+// Appends `note` (newlines flattened, cut at 480 bytes) as the newest line of
+// `path`, dropping the oldest lines past MARGIN_NOTES_MAX. The file is
+// rewritten through `<path>.tmp`.
+bool appendMarginNote(std::string_view note, const char* path = MARGIN_NOTES_PATH);
 
 // Storage locations; tests point them at a scratch directory. Changing the
 // model or CS-PW path drops the loaded weights.
