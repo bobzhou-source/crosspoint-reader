@@ -697,12 +697,12 @@ void TxtReaderActivity::renderPage(GfxRenderer& renderer) {
   renderStatusBar();
 
   if (ReaderUtils::textAntiAliasingVisible(renderer)) {
-    ReaderUtils::displayAdaptiveGrayscaleBase(renderer, refreshPolicy);
+    ReaderUtils::displayAdaptiveGrayscaleBase(renderer, refreshPolicy, takeFrameDwellMs());
     if (!ReaderUtils::renderAntiAliased(renderer, [&renderLines]() { renderLines(); })) {
       markBenchmarkRenderFailed();
     }
   } else {
-    ReaderUtils::displayAdaptive(renderer, refreshPolicy);
+    ReaderUtils::displayAdaptive(renderer, refreshPolicy, /*hasImage=*/false, /*async=*/false, takeFrameDwellMs());
   }
 
   if (showDictionaryMessage) {

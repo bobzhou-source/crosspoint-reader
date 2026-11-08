@@ -524,6 +524,7 @@ void EpubReaderActivity::loop() {
   }
 
   rememberBookOnceRendered(overlay == Overlay::None);
+  saveLearnedRefresh();
 
   // Someone else turned the screen while this reader was stacked (the control
   // center's orientation tile). Reflow before the next render, or the page
@@ -2124,7 +2125,7 @@ void EpubReaderActivity::renderContents(std::unique_ptr<Page> page, const int or
                         static_cast<uint32_t>(benchmark::Phase::BwRender), prerenderDetail);
 
   const auto decision = ReaderUtils::decideRefreshWithRegion(renderer, refreshPolicy, pageHasImages, needsAnyGrayscale,
-                                                             regionClearAvailable);
+                                                             regionClearAvailable, takeFrameDwellMs());
   const auto refresh = decision.refresh;
   const bool regionClear = refresh == AdaptiveRefreshPolicy::Refresh::Region;
   const auto refreshMode = ReaderUtils::refreshModeFor(refresh);

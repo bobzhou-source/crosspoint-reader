@@ -20,6 +20,13 @@ class ReaderActivity : public Activity {
   AdaptiveRefreshPolicy refreshPolicy;
   // FNV-1a of bookPath: identifies the book in benchmark refresh rows without recording the path.
   uint32_t bookId;
+  // Milliseconds the previous reader frame stayed on the panel (0 for the first
+  // one) and restarts that clock; the refresh policy relaxes ghosting debt over
+  // it. Call once per page frame, right before deciding its refresh.
+  uint32_t takeFrameDwellMs();
+  // Main task, from loop(): writes liquid-refresh.bin when a manual refresh
+  // taught the refresh policy since the last save.
+  void saveLearnedRefresh();
 
   std::unique_ptr<EndOfBookOptions> endOfBookOptions;
   std::atomic<bool> endOfBookOptionsReady{false};
@@ -127,4 +134,9 @@ class ReaderActivity : public Activity {
   bool benchmarkFinished = false;
 
   static void recordClear(void* context, const AdaptiveRefreshPolicy::ClearRecord& record);
+  // Page frames: the dwell clock behind takeFrameDwellMs().
+  uint32_t lastFrameMs = 0;
+  bool lastFrameShown = false;
+  // A manual refresh taught the policy; saveLearnedRefresh() writes it.
+  std::atomic<bool> learnedRefreshDirty{false};
 };

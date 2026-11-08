@@ -21,6 +21,7 @@
 #include "ReaderUtils.h"
 #include "ReadingStats.h"
 #include "RecentBooksStore.h"
+#include "RefreshPolicyStore.h"
 #include "SdCardFontSystem.h"
 #include "TxtReaderActivity.h"
 #include "XtcReaderActivity.h"
@@ -35,12 +36,40 @@ ReaderActivity::ReaderActivity(const char* name, GfxRenderer& renderer, MappedIn
   refreshPolicy.setClearObserver(&ReaderActivity::recordClear, this);
 }
 
-// Render task, under the render lock; only queues an event (no I/O). Fast refreshes never get here.
+// Render task, under the render lock, from inside the policy's commit(); no I/O
+// here: a learned manual refresh only flags the save and benchmark rows are
+// queued. Fast refreshes never get here.
 void ReaderActivity::recordClear(void* context, const AdaptiveRefreshPolicy::ClearRecord& record) {
+  auto* self = static_cast<ReaderActivity*>(context);
+  // The trace of the fast turns that led here survives a manual clear; the
+  // user asking for one means the policy cleared too late, so it learns.
+  if (record.manual() && !record.regionOnly && !self->isBenchmarkActivity() &&
+      self->refreshPolicy.recordManualRefresh()) {
+    self->learnedRefreshDirty.store(true, std::memory_order_release);
+  }
   if (!benchmark::enabled()) return;
-  const auto* self = static_cast<const ReaderActivity*>(context);
   const bool policyFile = refresh_policy_config::active().source == refresh_policy_config::Source::File;
   benchmark::record(benchmark::refreshClearEvent(record, policyFile, self->bookId, benchmark::nowUs()));
+}
+
+uint32_t ReaderActivity::takeFrameDwellMs() {
+  const uint32_t now = millis();
+  const uint32_t dwell = lastFrameShown ? now - lastFrameMs : 0;
+  lastFrameMs = now;
+  lastFrameShown = true;
+  return dwell;
+}
+
+// Main task: snapshot the readout under the render lock, write it outside.
+void ReaderActivity::saveLearnedRefresh() {
+  if (!learnedRefreshDirty.exchange(false, std::memory_order_acq_rel)) return;
+  uint8_t bytes[AdaptiveRefreshPolicy::kLearnedStateBytes];
+  size_t size = 0;
+  {
+    RenderLock lock(*this);
+    size = refreshPolicy.saveLearnedState(bytes, sizeof(bytes));
+  }
+  if (size == sizeof(bytes)) refresh_policy_store::saveLearned(bytes, size);
 }
 
 std::unique_ptr<ReaderActivity> ReaderActivity::create(GfxRenderer& renderer, MappedInputManager& mappedInput,
@@ -101,6 +130,8 @@ void ReaderActivity::onEnter() {
   {
     // Benchmark loading also paints indexing popups on the shared framebuffer.
     RenderLock lock;
+    // Benchmarks measure the compiled policy, never what this card learned.
+    if (!isBenchmarkActivity()) refresh_policy_store::loadLearned(refreshPolicy);
     loaded = loadBook();
   }
   if (!loaded) {
@@ -128,6 +159,7 @@ void ReaderActivity::rememberBookOnceRendered(const bool foreground) {
 }
 
 void ReaderActivity::onExit() {
+  saveLearnedRefresh();
   if (!isBenchmarkActivity() && statsRendered) {
     drainReadingStats(false);
     reading_stats::finish();
@@ -460,6 +492,7 @@ bool ReaderActivity::benchmarkLoop() {
 
 void ReaderActivity::loop() {
   if (benchmarkLoop()) return;
+  saveLearnedRefresh();
   rememberBookOnceRendered();
   clearEndOfBookOptionsIfNeeded();
   if (handleBoomerangEndOfBook()) return;

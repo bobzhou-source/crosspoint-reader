@@ -52,4 +52,41 @@ const refresh_policy_config::State& load() {
   return refresh_policy_config::active();
 }
 
+bool loadLearned(AdaptiveRefreshPolicy& policy) {
+  constexpr const char* path = AdaptiveRefreshPolicy::kLearnedStatePath;
+  uint8_t bytes[AdaptiveRefreshPolicy::kLearnedStateBytes];
+  HalFile file;
+  if (!Storage.exists(path)) return false;
+  if (!Storage.openFileForRead("RPOL", path, file) || file.size() != sizeof(bytes) ||
+      file.read(bytes, sizeof(bytes)) != static_cast<int>(sizeof(bytes)) ||
+      !policy.loadLearnedState(bytes, sizeof(bytes))) {
+    LOG_ERR("RPOL", "Ignoring %s: unreadable or invalid", path);
+    return false;
+  }
+  const auto& w = policy.liquidReadout().w;
+  LOG_INF("RPOL", "Liquid refresh readout loaded: debt=%d peak=%d streak=%d bias=%d updates=%lu", w[0], w[1], w[2],
+          w[3], static_cast<unsigned long>(policy.liquidUpdates()));
+  return true;
+}
+
+bool saveLearned(const uint8_t* bytes, const size_t size) {
+  constexpr const char* path = AdaptiveRefreshPolicy::kLearnedStatePath;
+  char temporary[48];
+  snprintf(temporary, sizeof(temporary), "%s.tmp", path);
+  bool written = false;
+  {
+    HalFile file;
+    if (Storage.openFileForWrite("RPOL", temporary, file)) {
+      written = file.write(bytes, size) == size && file.sync();
+      written = file.close() && written;  // Close before renaming.
+    }
+  }
+  if (!written || (Storage.exists(path) && !Storage.remove(path)) || !Storage.rename(temporary, path)) {
+    Storage.remove(temporary);
+    LOG_ERR("RPOL", "Could not save %s", path);
+    return false;
+  }
+  return true;
+}
+
 }  // namespace refresh_policy_store
