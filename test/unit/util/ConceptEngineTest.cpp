@@ -1,12 +1,14 @@
 #include <gtest/gtest.h>
 #include <unistd.h>
 
+#include <algorithm>
 #include <array>
 #include <cmath>
 #include <cstdlib>
 #include <cstring>
 #include <filesystem>
 #include <fstream>
+#include <iterator>
 #include <sstream>
 #include <string>
 #include <vector>
@@ -169,8 +171,11 @@ uint64_t fnv(const uint8_t* p, const size_t n) {
   return h;
 }
 
+using Spans = std::vector<std::pair<size_t, size_t>>;  // (start, length) per H-Net chunk
+
 std::array<int8_t, 128> refForward(const std::vector<uint8_t>& model, const Shifts& s, const std::string& text,
-                                   const std::vector<uint8_t>* engram = nullptr, const int sg = 5) {
+                                   const std::vector<uint8_t>* engram = nullptr, const int sg = 5,
+                                   Spans* outSpans = nullptr) {
   const auto* w = reinterpret_cast<const int8_t*>(model.data());
   const size_t embed = 32, c1dw = embed + 256 * DB, c1pw = c1dw + DB * 3, c1g = c1pw + DB * DB, c2dw = c1g + DB * DB,
                c2pw = c2dw + DB * 3, c2g = c2pw + DB * DB, rqo = c2g + DB * DB, rko = rqo + DB * DR,
@@ -195,7 +200,7 @@ std::array<int8_t, 128> refForward(const std::vector<uint8_t>& model, const Shif
       q[t][j] = rq(aq, s.sr);
       k[t][j] = rq(ak, s.sr);
     }
-  std::vector<std::pair<size_t, size_t>> spans;
+  Spans spans;
   size_t len = 0;
   for (size_t t = 0; t < n; ++t) {
     const bool cont = (b[t] & 0xC0) == 0x80;
@@ -210,6 +215,7 @@ std::array<int8_t, 128> refForward(const std::vector<uint8_t>& model, const Shif
     ++len;
     spans.back().second = len;
   }
+  if (outSpans) *outSpans = spans;
   Seq x(spans.size(), std::vector<int8_t>(DC));
   for (size_t c = 0; c < spans.size(); ++c) {
     const auto [start, count] = spans[c];
@@ -231,6 +237,16 @@ std::array<int8_t, 128> refForward(const std::vector<uint8_t>& model, const Shif
       const uint64_t key = fnv(b + start, count);
       const auto* delta = reinterpret_cast<const int8_t*>(engram->data() + 512 + (key % slots) * 64 + 8);
       for (size_t d = 0; d < 24; ++d) x[c][d] = sat8(x[c][d] + sat8(sh(delta[d], sg - 5)));
+      // Bigram: the previous chunk joined with this one, exact hash only, half delta.
+      if (c >= 1 && spans[c - 1].second + count <= 18) {
+        const uint64_t key2 = fnv(b + spans[c - 1].first, spans[c - 1].second + count);
+        const uint8_t* slot2 = engram->data() + 512 + (key2 % slots) * 64;
+        uint64_t stored;
+        memcpy(&stored, slot2, 8);
+        const auto* delta2 = reinterpret_cast<const int8_t*>(slot2 + 8);
+        if (key2 != 0 && stored == key2)
+          for (size_t d = 0; d < 24; ++d) x[c][d] = sat8(x[c][d] + sat8(sh(delta2[d] >> 1, sg - 5)));
+      }
     }
   }
   for (int loop = 0; loop < 2; ++loop) x = refBlock(x, DC, w + cdw, w + cpw, w + cg, w + co, s.sc);
@@ -260,7 +276,19 @@ std::array<int8_t, 128> encode(const std::string& text, const char* engram = "")
 class ConceptEngineTest : public ::testing::Test {
  protected:
   fs::path dir;
-  std::string modelPath, engramPath, episodicPath, shelfPath;
+  std::string modelPath, engramPath, episodicPath, shelfPath, cspwPath, storyPath;
+  // Golden-file locations; members because setPaths keeps the pointers until TearDown.
+  std::string goldenModel, goldenEngram, goldenCspw;
+
+  ce::Paths scratchPaths() const {
+    ce::Paths paths;
+    paths.model = modelPath.c_str();
+    paths.episodic = episodicPath.c_str();
+    paths.shelf = shelfPath.c_str();
+    paths.cspw = cspwPath.c_str();
+    paths.storyGraph = storyPath.c_str();
+    return paths;
+  }
 
   void SetUp() override {
     dir = fs::temp_directory_path() /
@@ -272,11 +300,9 @@ class ConceptEngineTest : public ::testing::Test {
     engramPath = (dir / "engram.bin").string();
     episodicPath = (dir / "episodic.idx").string();
     shelfPath = (dir / "inbox-concepts.idx").string();
-    ce::Paths paths;
-    paths.model = modelPath.c_str();
-    paths.episodic = episodicPath.c_str();
-    paths.shelf = shelfPath.c_str();
-    ce::setPaths(paths);
+    cspwPath = (dir / "cspw.bin").string();
+    storyPath = (dir / "story-graph.idx").string();
+    ce::setPaths(scratchPaths());
     ce::unloadModel();
   }
 
@@ -366,12 +392,10 @@ TEST_F(ConceptEngineTest, MatchesTrainerGoldenVectors) {
   const char* goldenDir = std::getenv("CONCEPT_ENGINE_GOLDEN_DIR");
   if (!goldenDir || !*goldenDir) GTEST_SKIP() << "CONCEPT_ENGINE_GOLDEN_DIR not set";
   const fs::path golden(goldenDir);
-  const std::string model = (golden / "platonic-hnet.bin").string();
-  const std::string engram = (golden / "engram.bin").string();
-  ce::Paths paths;
-  paths.model = model.c_str();
-  paths.episodic = episodicPath.c_str();
-  paths.shelf = shelfPath.c_str();
+  goldenModel = (golden / "platonic-hnet.bin").string();
+  goldenEngram = (golden / "engram.bin").string();
+  ce::Paths paths = scratchPaths();
+  paths.model = goldenModel.c_str();
   ce::setPaths(paths);
   std::ifstream lines(golden / "golden.jsonl");
   ASSERT_TRUE(lines.good());
@@ -421,7 +445,7 @@ TEST_F(ConceptEngineTest, MatchesTrainerGoldenVectors) {
       v = static_cast<int8_t>(value);
     }
     std::array<int8_t, 128> got{};
-    ASSERT_TRUE(ce::encodeText(text, got.data(), engram.c_str()));
+    ASSERT_TRUE(ce::encodeText(text, got.data(), goldenEngram.c_str()));
     EXPECT_EQ(got, want) << text;
     ++checked;
   }
@@ -578,4 +602,653 @@ TEST(ConceptEngineHash, Fnv1a64KnownValues) {
   EXPECT_EQ(ce::fnv1a64(""), 0xcbf29ce484222325ULL);
   EXPECT_EQ(ce::fnv1a64("a"), 0xaf63dc4c8601ec8cULL);
   EXPECT_EQ(ce::fnv1a64("foobar"), 0x85944171f73967e8ULL);
+}
+
+// ---- Bigram Engram ------------------------------------------------------------------
+
+TEST_F(ConceptEngineTest, ForwardAppliesBigramAcrossChunkBoundary) {
+  const Shifts s;
+  const std::string idiom = "一举两得";
+  const char* texts[] = {"这真是一举两得的好办法", "他们一举两得，", "一举两得", "我们一举两得地完成了任务"};
+  std::vector<uint8_t> model;
+  std::string text;
+  for (uint32_t seed = 1; seed < 200 && text.empty(); ++seed) {
+    const auto candidate = makeModel(s, seed);
+    for (const char* t : texts) {
+      Spans spans;
+      refForward(candidate, s, t, nullptr, 5, &spans);
+      const size_t at = std::string(t).find(idiom);
+      for (size_t c = 1; c < spans.size(); ++c) {
+        if (spans[c - 1].first == at && spans[c].first == at + spans[c - 1].second &&
+            spans[c - 1].second + spans[c].second == idiom.size()) {
+          model = candidate;
+          text = t;
+        }
+      }
+      if (!text.empty()) break;
+    }
+  }
+  ASSERT_FALSE(text.empty()) << "no seed splits the idiom into exactly two chunks";
+  writeFile(modelPath, model);
+
+  constexpr uint32_t slots = 4096;
+  const uint64_t h2 = ce::fnv1a64(idiom);
+  std::array<int8_t, 24> delta;
+  delta.fill(40);
+  const auto engram = makeEngram(slots, {{h2, delta, "kill two birds"}});
+  writeFile(engramPath, engram);
+  // Same slot, different span hash: the bigram must not fire.
+  const auto stale = makeEngram(slots, {{h2 + slots, delta, "kill two birds"}});
+  const std::string stalePath = (dir / "engram-stale.bin").string();
+  writeFile(stalePath, stale);
+
+  const auto with = encode(text, engramPath.c_str());
+  const auto without = encode(text, stalePath.c_str());
+  EXPECT_EQ(with, refForward(model, s, text, &engram));
+  EXPECT_EQ(without, refForward(model, s, text, &stale));
+  EXPECT_NE(with, without);
+}
+
+// ---- CS-PW v2: Chrono-CfC kernel -------------------------------------------------------
+
+namespace {
+
+constexpr size_t CS_D = 192, CS_KV = 96, CS_HD = 48;
+constexpr size_t OFF_UP = 512, OFF_Q = 25088, OFF_K = 61952, OFF_V = 80384, OFF_O = 98816, OFF_DOWN = 135680,
+                 OFF_SAL_W = 160256, OFF_SAL_B = 160384, OFF_GATE = 160512, OFF_FRAME_BANK = 226048,
+                 OFF_FRAME_STR = 258816, OFF_PHRASE_BANK = 275200, OFF_PHRASE_STR = 340736, OFF_TAIL = 391936,
+                 CSPW_FILE_BYTES = 393728;
+
+template <typename T>
+void poke(std::vector<uint8_t>& out, const size_t at, const T value) {
+  memcpy(out.data() + at, &value, sizeof(T));
+}
+
+void pokeText(std::vector<uint8_t>& out, const size_t at, const size_t cap, const std::string& text) {
+  memcpy(out.data() + at, text.data(), std::min(text.size(), cap));
+}
+
+// A CSPW v2 file with zero weights and no frame/phrase strings.
+std::vector<uint8_t> makeCspw(const int16_t salienceBias = 0) {
+  std::vector<uint8_t> out(CSPW_FILE_BYTES, 0);
+  memcpy(out.data(), "CSPW", 4);
+  poke<uint16_t>(out, 4, 2);
+  poke<uint32_t>(out, 8, 192);
+  poke<uint32_t>(out, 12, 128);
+  poke<uint32_t>(out, 16, 4);
+  poke<uint32_t>(out, 20, 256);
+  poke<uint32_t>(out, 24, 512);
+  poke<int16_t>(out, OFF_SAL_B, salienceBias);
+  return out;
+}
+
+// Pseudo-random weights in [-range, range]; every third frame and fifth
+// phrase stays empty.
+std::vector<uint8_t> makeRandomCspw(const uint32_t seed, const int16_t salienceBias, const int range = 16) {
+  auto out = makeCspw(salienceBias);
+  uint32_t state = seed;
+  for (size_t at = OFF_UP; at < OFF_TAIL; ++at) {
+    state = state * 1664525u + 1013904223u;
+    const int v = static_cast<int>((state >> 16) % static_cast<uint32_t>(2 * range + 1)) - range;
+    out[at] = static_cast<uint8_t>(static_cast<int8_t>(v));
+  }
+  memset(out.data() + OFF_SAL_B, 0, 128);
+  poke<int16_t>(out, OFF_SAL_B, salienceBias);
+  memset(out.data() + OFF_FRAME_STR, 0, OFF_PHRASE_BANK - OFF_FRAME_STR);
+  memset(out.data() + OFF_PHRASE_STR, 0, OFF_TAIL - OFF_PHRASE_STR);
+  for (size_t f = 0; f < 256; ++f)
+    if (f % 3 != 0) pokeText(out, OFF_FRAME_STR + f * 64, 63, "frame " + std::to_string(f));
+  for (size_t p = 0; p < 512; ++p)
+    if (p % 5 != 0) pokeText(out, OFF_PHRASE_STR + p * 100, 99, "phrase " + std::to_string(p));
+  return out;
+}
+
+int64_t floorDiv(const int64_t a, const int64_t b) {
+  int64_t q = a / b;
+  if (a % b != 0 && ((a < 0) != (b < 0))) --q;
+  return q;
+}
+
+using IVec = std::vector<int64_t>;
+
+IVec refProject(const IVec& x, const int8_t* w, const size_t out) {
+  IVec y(out);
+  for (size_t j = 0; j < out; ++j) {
+    int64_t acc = 0;
+    for (size_t i = 0; i < x.size(); ++i) acc += x[i] * w[i * out + j];
+    y[j] = sat8(acc >> 7);
+  }
+  return y;
+}
+
+int64_t refDot(const int8_t* a, const IVec& b) {
+  int64_t acc = 0;
+  for (size_t i = 0; i < b.size(); ++i) acc += a[i] * b[i];
+  return acc;
+}
+
+struct RefSlots {
+  std::array<IVec, 4> slot;
+  int g[4] = {};
+  int tau[4] = {};
+  int frame[4] = {-1, -1, -1, -1};
+  int phrase = -1;
+  int arc = -1;
+};
+
+// Literal transcription of the CS-PW kernel addendum §B, LUTs from their
+// definitions.
+RefSlots refChrono(const std::vector<uint8_t>& file, const std::vector<std::array<int8_t, 128>>& scenes,
+                   const std::vector<uint32_t>& pages, const int8_t* echo) {
+  const auto at = [&](const size_t off) { return reinterpret_cast<const int8_t*>(file.data() + off); };
+  int64_t expLut[65], frac[16], neg[17];
+  for (int t = 0; t < 64; ++t) expLut[t] = std::lround(256.0 * std::pow(2.0, -t / 8.0));
+  expLut[64] = 0;
+  for (int i = 0; i < 16; ++i) frac[i] = std::lround(32768.0 * std::pow(2.0, i / 16.0));
+  for (int i = 0; i <= 16; ++i) neg[i] = std::lround(32768.0 * std::pow(2.0, -i / 16.0));
+
+  const size_t M = scenes.size();
+  std::vector<IVec> s(M), h(M), q(M), k(M), v(M), r(M);
+  std::array<std::vector<IVec>, 4> u;
+  for (size_t m = 0; m < M; ++m) {
+    s[m].assign(scenes[m].begin(), scenes[m].end());
+    h[m] = refProject(s[m], at(OFF_UP), CS_D);
+    q[m] = refProject(h[m], at(OFF_Q), CS_D);
+    k[m] = refProject(h[m], at(OFF_K), CS_KV);
+    v[m] = refProject(h[m], at(OFF_V), CS_KV);
+  }
+  RefSlots out;
+  int16_t bias;
+  memcpy(&bias, file.data() + OFF_SAL_B, 2);
+  for (size_t a = 0; a < M; ++a) {
+    IVec attn(CS_D);
+    for (size_t head = 0; head < 4; ++head) {
+      const size_t kv = head >> 1;
+      std::vector<int64_t> score(a + 1), e(a + 1);
+      for (size_t b = 0; b <= a; ++b) {
+        int64_t acc = 0;
+        for (size_t d = 0; d < CS_HD; ++d) acc += q[a][head * CS_HD + d] * k[b][kv * CS_HD + d];
+        score[b] = acc >> 6;
+      }
+      const int64_t best = *std::max_element(score.begin(), score.end());
+      int64_t S = 0;
+      for (size_t b = 0; b <= a; ++b) S += e[b] = expLut[std::min<int64_t>(best - score[b], 64)];
+      for (size_t d = 0; d < CS_HD; ++d) {
+        int64_t acc = 0;
+        for (size_t b = 0; b <= a; ++b) acc += floorDiv(e[b] * 256 + S / 2, S) * v[b][kv * CS_HD + d];
+        attn[head * CS_HD + d] = sat8(acc >> 8);
+      }
+    }
+    for (size_t j = 0; j < CS_D; ++j) {
+      int64_t acc = 0;
+      for (size_t i = 0; i < CS_D; ++i) acc += attn[i] * at(OFF_O)[i * CS_D + j];
+      h[a][j] = sat8(h[a][j] + (acc >> 7));
+    }
+    const IVec v128 = refProject(h[a], at(OFF_DOWN), 128);
+    r[a].resize(128);
+    for (size_t j = 0; j < 128; ++j) r[a][j] = sat8((s[a][j] + v128[j]) >> 1);
+    out.g[a] = static_cast<int>(std::clamp<int64_t>((refDot(at(OFF_SAL_W), r[a]) >> 7) + bias + 128, 0, 255));
+    const int code = 64 + (out.g[a] >> 1);
+    out.tau[a] = static_cast<int>(std::max<int64_t>(16, (frac[code & 15] * (int64_t{1} << (code >> 4)) + 16384) >> 15));
+    for (size_t slot = 0; slot < 4; ++slot) {
+      IVec y(128);
+      for (size_t d = 0; d < 128; ++d) y[d] = sat8(refDot(at(OFF_GATE + slot * 128 * 128 + d * 128), r[a]) >> 7);
+      u[slot].push_back(y);
+    }
+  }
+  out.slot[0].assign(128, 0);
+  int64_t den = 0;
+  for (size_t m = 0; m < M; ++m) den += out.g[m] + 32;
+  for (size_t d = 0; d < 128; ++d) {
+    int64_t num = 0;
+    for (size_t m = 0; m < M; ++m) num += (out.g[m] + 32) * u[0][m][d];
+    out.slot[0][d] = sat8(floorDiv(2 * num + den, 2 * den));
+  }
+  out.slot[1] = u[1][0];
+  IVec arc = u[2][0];
+  for (size_t m = 1; m < M; ++m) {
+    const int64_t dp = std::max<int64_t>(0, int64_t{pages[m]} - int64_t{pages[m - 1]});
+    const int64_t x = dp * 256 / out.tau[m];
+    int64_t f = 0;
+    if (x < 4096) {
+      const int64_t ip = x >> 8, xf = x & 255, seg = xf >> 4, t = xf & 15;
+      const int64_t base = (neg[seg] * (16 - t) + neg[seg + 1] * t + 8) >> 4;
+      f = ip == 0 ? base : (base + (int64_t{1} << (ip - 1))) >> ip;
+    }
+    const int64_t alpha = std::clamp<int64_t>((32768 - f) + ((out.g[m] * f) >> 9), 4096, 32768);
+    for (size_t d = 0; d < 128; ++d) arc[d] = sat8(((32768 - alpha) * arc[d] + alpha * u[2][m][d] + 16384) >> 15);
+  }
+  out.slot[2] = arc;
+  out.slot[3] = u[3][M - 1];
+  if (echo)
+    for (size_t d = 0; d < 128; ++d) out.slot[3][d] = sat8((out.slot[3][d] + echo[d]) >> 1);
+  for (size_t g = 0; g < 4; ++g) {
+    int64_t best = 0;
+    for (size_t f = g * 64; f < g * 64 + 64; ++f) {
+      if (file[OFF_FRAME_STR + f * 64] == 0) continue;
+      const int64_t score = refDot(at(OFF_FRAME_BANK + f * 128), out.slot[g]);
+      if (out.frame[g] < 0 || score > best) {
+        out.frame[g] = static_cast<int>(f);
+        best = score;
+      }
+    }
+  }
+  int64_t bestPhrase = 0;
+  for (size_t p = 0; p < 512; ++p) {
+    if (file[OFF_PHRASE_STR + p * 100] == 0) continue;
+    const int64_t score = refDot(at(OFF_PHRASE_BANK + p * 128), out.slot[0]);
+    if (out.phrase < 0 || score > bestPhrase) {
+      out.phrase = static_cast<int>(p);
+      bestPhrase = score;
+    }
+  }
+  int64_t bestArc = 0;
+  for (size_t m = 1; m < M; ++m) {
+    int64_t score = 0;
+    for (size_t d = 0; d < 128; ++d) score += arc[d] * u[2][m][d];
+    if (out.arc < 0 || score >= bestArc) {
+      out.arc = static_cast<int>(m);
+      bestArc = score;
+    }
+  }
+  return out;
+}
+
+std::array<int8_t, 128> randomVec(uint32_t& state, const int range = 100) {
+  std::array<int8_t, 128> v{};
+  for (auto& x : v) {
+    state = state * 1664525u + 1013904223u;
+    x = static_cast<int8_t>(static_cast<int>((state >> 16) % static_cast<uint32_t>(2 * range + 1)) - range);
+  }
+  return v;
+}
+
+void expectSlotsMatch(const ce::ChronoSlots& got, const RefSlots& want, const size_t M, const std::string& what) {
+  for (size_t m = 0; m < M; ++m) {
+    EXPECT_EQ(got.salience[m], want.g[m]) << what << " scene " << m;
+    EXPECT_EQ(got.tau[m], want.tau[m]) << what << " scene " << m;
+  }
+  for (size_t k = 0; k < 4; ++k) {
+    for (size_t d = 0; d < 128; ++d) ASSERT_EQ(got.slot[k][d], want.slot[k][d]) << what << " slot " << k << " d " << d;
+    EXPECT_EQ(got.frame[k], want.frame[k]) << what << " slot " << k;
+  }
+  EXPECT_EQ(got.phrase, want.phrase) << what;
+  EXPECT_EQ(got.arcScene, want.arc) << what;
+}
+
+}  // namespace
+
+TEST(ConceptEngineCspw, HalfLifeAndDecayFollowTheirDefinitions) {
+  for (int g = 0; g < 256; ++g) {
+    const double exact = std::pow(2.0, (64 + (g >> 1)) / 16.0);
+    const uint16_t tau = ce::cspwHalfLife(static_cast<uint8_t>(g));
+    EXPECT_NEAR(tau, std::max(16.0, exact), 0.51) << g;
+  }
+  EXPECT_EQ(ce::cspwHalfLife(0), 16);
+  EXPECT_EQ(ce::cspwHalfLife(255), 3922);
+  EXPECT_EQ(ce::cspwDecayQ15(0, 16), 32768);
+  EXPECT_EQ(ce::cspwDecayQ15(16, 16), 16384);
+  EXPECT_EQ(ce::cspwDecayQ15(32, 16), 8192);
+  EXPECT_EQ(ce::cspwDecayQ15(256, 16), 0);
+  for (const uint32_t tau : {16u, 45u, 300u, 3922u}) {
+    uint16_t previous = 32768;
+    for (uint32_t dp = 0; dp < 16 * tau; dp += std::max(1u, tau / 37)) {
+      const uint16_t f = ce::cspwDecayQ15(dp, tau);
+      EXPECT_NEAR(f, 32768.0 * std::pow(2.0, -static_cast<double>(dp) / tau), 160.0) << dp << "/" << tau;
+      EXPECT_LE(f, previous) << dp << "/" << tau;
+      previous = f;
+    }
+  }
+}
+
+TEST_F(ConceptEngineTest, ChronoSlotsMatchLiteralReferenceBitExact) {
+  const std::vector<std::vector<uint32_t>> pageSets = {{7}, {3, 10}, {3, 10, 200}, {1, 2, 60, 59}, {5, 5, 5, 4000}};
+  uint32_t state = 99;
+  for (uint32_t seed = 1; seed <= 4; ++seed) {
+    const int16_t bias = static_cast<int16_t>(-160 + 90 * static_cast<int>(seed));
+    const auto file = makeRandomCspw(seed, bias);
+    writeFile(cspwPath, file);
+    ce::unloadModel();
+    for (const auto& pages : pageSets) {
+      for (const bool withEcho : {false, true}) {
+        std::vector<std::array<int8_t, 128>> scenes;
+        int8_t packed[4][128];
+        for (size_t m = 0; m < pages.size(); ++m) {
+          scenes.push_back(randomVec(state));
+          memcpy(packed[m], scenes.back().data(), 128);
+        }
+        const auto echo = randomVec(state);
+        ce::ChronoSlots got;
+        ASSERT_TRUE(ce::runChronoSlots(packed, pages.data(), pages.size(), withEcho ? echo.data() : nullptr, got));
+        const RefSlots want = refChrono(file, scenes, pages, withEcho ? echo.data() : nullptr);
+        expectSlotsMatch(got, want, pages.size(),
+                         "seed " + std::to_string(seed) + " M " + std::to_string(pages.size()) +
+                             (withEcho ? " echo" : ""));
+      }
+    }
+  }
+}
+
+TEST_F(ConceptEngineTest, ChronoSlotsRejectBadInput) {
+  int8_t scenes[4][128] = {};
+  const uint32_t pages[4] = {};
+  ce::ChronoSlots out;
+  EXPECT_FALSE(ce::runChronoSlots(scenes, pages, 1, nullptr, out));  // no cspw.bin
+  auto file = makeCspw();
+  file[8] = 128;  // d_model
+  writeFile(cspwPath, file);
+  EXPECT_FALSE(ce::runChronoSlots(scenes, pages, 1, nullptr, out));
+  writeFile(cspwPath, makeCspw());
+  ce::unloadModel();
+  EXPECT_FALSE(ce::runChronoSlots(scenes, pages, 0, nullptr, out));
+  EXPECT_FALSE(ce::runChronoSlots(scenes, pages, 5, nullptr, out));
+  EXPECT_TRUE(ce::runChronoSlots(scenes, pages, 4, nullptr, out));
+  EXPECT_EQ(out.frame[0], -1);
+  EXPECT_EQ(out.phrase, -1);
+  EXPECT_EQ(out.arcScene, 3);  // all-zero scores tie toward the latest scene
+}
+
+// With only identity slot gates the slots show the temporal rules directly:
+// Slot 1 keeps the origin, Slot 2 swaps to the latest scene after a long gap
+// and keeps most of the old one after no gap, more so at low salience.
+TEST_F(ConceptEngineTest, ChronoSlotsSwapArcByPageGapAndSalience) {
+  int8_t scenes[2][128] = {};
+  for (size_t d = 0; d < 64; ++d) scenes[0][d] = 100;
+  for (size_t d = 64; d < 128; ++d) scenes[1][d] = 100;
+  const auto run = [&](const int16_t bias, const uint32_t gap) {
+    auto file = makeCspw(bias);
+    for (size_t k = 0; k < 4; ++k)
+      for (size_t d = 0; d < 128; ++d) file[OFF_GATE + k * 128 * 128 + d * 128 + d] = 127;
+    writeFile(cspwPath, file);
+    ce::unloadModel();
+    const uint32_t pages[2] = {1, 1 + gap};
+    ce::ChronoSlots out;
+    EXPECT_TRUE(ce::runChronoSlots(scenes, pages, 2, nullptr, out));
+    return out;
+  };
+  // r = 100 >> 1 = 50, u = (127 * 50) >> 7 = 49 on each scene's half.
+  const auto farLow = run(-128, 399);
+  EXPECT_EQ(farLow.salience[1], 0);
+  EXPECT_EQ(farLow.tau[1], 16);
+  EXPECT_EQ(farLow.slot[1][0], 49);
+  EXPECT_EQ(farLow.slot[1][64], 0);
+  EXPECT_EQ(farLow.slot[2][0], 0);
+  EXPECT_EQ(farLow.slot[2][64], 49);
+  EXPECT_EQ(farLow.slot[3][64], 49);
+  EXPECT_EQ(farLow.slot[0][0], 25);  // (2 * 32 * 49 + 64) // 128
+
+  const auto nearLow = run(-128, 0);  // alpha floors at 4096
+  EXPECT_EQ(nearLow.slot[2][0], 43);
+  EXPECT_EQ(nearLow.slot[2][64], 6);
+
+  const auto nearHigh = run(127, 0);  // alpha = 255 * 32768 >> 9 = 16320
+  EXPECT_EQ(nearHigh.salience[1], 255);
+  EXPECT_EQ(nearHigh.tau[1], 3922);
+  EXPECT_EQ(nearHigh.slot[2][0], 25);
+  EXPECT_EQ(nearHigh.slot[2][64], 24);
+  EXPECT_EQ(nearHigh.slot[1][0], 49);
+}
+
+// Trainer golden cases: CONCEPT_ENGINE_GOLDEN_DIR=<dir with cspw.bin, cspw_golden.bin>.
+TEST_F(ConceptEngineTest, MatchesCspwGoldenVectors) {
+  const char* goldenDir = std::getenv("CONCEPT_ENGINE_GOLDEN_DIR");
+  if (!goldenDir || !*goldenDir) GTEST_SKIP() << "CONCEPT_ENGINE_GOLDEN_DIR not set";
+  const fs::path golden(goldenDir);
+  if (!fs::exists(golden / "cspw_golden.bin")) GTEST_SKIP() << "no cspw_golden.bin";
+  goldenCspw = (golden / "cspw.bin").string();
+  ce::Paths paths = scratchPaths();
+  paths.cspw = goldenCspw.c_str();
+  ce::setPaths(paths);
+  std::ifstream in(golden / "cspw_golden.bin", std::ios::binary);
+  const std::vector<uint8_t> bytes((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+  ASSERT_GE(bytes.size(), 16u);
+  ASSERT_EQ(memcmp(bytes.data(), "CSGV", 4), 0);
+  uint32_t version, cases;
+  memcpy(&version, bytes.data() + 4, 4);
+  memcpy(&cases, bytes.data() + 8, 4);
+  ASSERT_EQ(version, 1u);
+  constexpr size_t CASE_BYTES = 1196;
+  ASSERT_EQ(bytes.size(), 16 + cases * CASE_BYTES);
+  for (uint32_t c = 0; c < cases; ++c) {
+    const uint8_t* p = bytes.data() + 16 + c * CASE_BYTES;
+    const size_t M = p[0];
+    uint32_t pages[4];
+    memcpy(pages, p + 4, 16);
+    int8_t scenes[4][128];
+    memcpy(scenes, p + 20, 512);
+    const auto* echo = reinterpret_cast<const int8_t*>(p + 532);
+    ce::ChronoSlots got;
+    ASSERT_TRUE(ce::runChronoSlots(scenes, pages, M, p[1] ? echo : nullptr, got)) << "case " << c;
+    for (size_t m = 0; m < M; ++m) {
+      uint16_t tau;
+      memcpy(&tau, p + 664 + m * 2, 2);
+      EXPECT_EQ(got.salience[m], p[660 + m]) << "case " << c << " scene " << m;
+      EXPECT_EQ(got.tau[m], tau) << "case " << c << " scene " << m;
+    }
+    EXPECT_EQ(memcmp(got.slot, p + 672, 512), 0) << "case " << c;
+    int16_t frame[4], phrase, arc;
+    memcpy(frame, p + 1184, 8);
+    memcpy(&phrase, p + 1192, 2);
+    memcpy(&arc, p + 1194, 2);
+    for (size_t k = 0; k < 4; ++k) EXPECT_EQ(got.frame[k], frame[k]) << "case " << c << " slot " << k;
+    EXPECT_EQ(got.phrase, phrase) << "case " << c;
+    EXPECT_EQ(got.arcScene, arc) << "case " << c;
+  }
+  EXPECT_GT(cases, 0u);
+}
+
+// ---- CS-PW v2: spoiler-gated story refreshers --------------------------------------------
+
+namespace {
+
+struct SgEvent {
+  uint32_t cutoff;
+  uint16_t page;
+  uint8_t hint;
+  uint8_t salience;
+  std::string gloss;
+  std::string target;
+};
+
+struct SgEntity {
+  std::string term;
+  std::string book;  // empty = any book
+  uint32_t firstCutoff;
+  std::string name;
+  std::vector<SgEvent> events;
+};
+
+struct SgAlias {
+  std::string alias;
+  std::string canonical;
+  uint32_t reveal;
+};
+
+size_t align512(const size_t n) { return (n + 511) / 512 * 512; }
+
+std::vector<uint8_t> makeStoryGraph(std::vector<SgEntity> entities, std::vector<SgAlias> aliases) {
+  const auto key = [](const SgEntity& e) {
+    return std::make_pair(ce::fnv1a64(e.term), e.book.empty() ? uint64_t{0} : ce::fnv1a64(e.book));
+  };
+  std::sort(entities.begin(), entities.end(), [&](const SgEntity& a, const SgEntity& b) { return key(a) < key(b); });
+  std::sort(aliases.begin(), aliases.end(),
+            [](const SgAlias& a, const SgAlias& b) { return ce::fnv1a64(a.alias) < ce::fnv1a64(b.alias); });
+  size_t events = 0;
+  for (const auto& e : entities) events += e.events.size();
+  const size_t entitiesOffset = 512;
+  const size_t eventsOffset = align512(entitiesOffset + entities.size() * 64);
+  const size_t aliasesOffset = align512(eventsOffset + events * 256);
+  std::vector<uint8_t> out(aliasesOffset + aliases.size() * 24, 0);
+  memcpy(out.data(), "SGRF", 4);
+  poke<uint16_t>(out, 4, 1);
+  poke<uint32_t>(out, 8, static_cast<uint32_t>(entities.size()));
+  poke<uint32_t>(out, 12, static_cast<uint32_t>(events));
+  poke<uint32_t>(out, 16, static_cast<uint32_t>(aliases.size()));
+  poke<uint32_t>(out, 20, static_cast<uint32_t>(entitiesOffset));
+  poke<uint32_t>(out, 24, static_cast<uint32_t>(eventsOffset));
+  poke<uint32_t>(out, 28, static_cast<uint32_t>(aliasesOffset));
+  uint32_t next = 0;
+  for (size_t i = 0; i < entities.size(); ++i) {
+    const auto& e = entities[i];
+    const size_t at = entitiesOffset + i * 64;
+    poke<uint64_t>(out, at, key(e).first);
+    poke<uint64_t>(out, at + 8, key(e).second);
+    poke<uint32_t>(out, at + 16, e.firstCutoff);
+    poke<uint32_t>(out, at + 20, next);
+    poke<uint16_t>(out, at + 24, static_cast<uint16_t>(e.events.size()));
+    pokeText(out, at + 28, 32, e.name);
+    for (const auto& ev : e.events) {
+      const size_t eat = eventsOffset + static_cast<size_t>(next++) * 256;
+      poke<uint32_t>(out, eat, ev.cutoff);
+      poke<uint16_t>(out, eat + 4, ev.page);
+      out[eat + 6] = ev.hint;
+      out[eat + 7] = ev.salience;
+      pokeText(out, eat + 8, 64, ev.gloss);
+      pokeText(out, eat + 72, 56, ev.target);
+      for (size_t d = 0; d < 128; ++d)
+        out[eat + 128 + d] = static_cast<uint8_t>(static_cast<int8_t>((d * 7 + next) % 41 - 20));
+    }
+  }
+  for (size_t i = 0; i < aliases.size(); ++i) {
+    const size_t at = aliasesOffset + i * 24;
+    poke<uint64_t>(out, at, ce::fnv1a64(aliases[i].alias));
+    poke<uint64_t>(out, at + 8, ce::fnv1a64(aliases[i].canonical));
+    poke<uint32_t>(out, at + 16, aliases[i].reveal);
+  }
+  return out;
+}
+
+// Chapter n of a TXT novel stored at 10 KiB a chapter.
+uint32_t chapter(const int n) { return ce::txtStoryCutoff(static_cast<size_t>(n) * 10240); }
+
+const char* const DOUPO = "/books/Chinese/斗破苍穹.txt";
+
+std::vector<uint8_t> makeDoupoGraph() {
+  return makeStoryGraph(
+      {
+          {"萧炎",
+           DOUPO,
+           chapter(1),
+           "Xiao Yan (Dou Qi disciple)",
+           {
+               {chapter(1), 1, 1, 200, "introduced at Xiao Clan test (Ch.1)", "Xiao Clan"},
+               {chapter(2), 2, 0, 50, "shamed at the Dou Qi test (Ch.2)", "Xiao Clan"},
+               {chapter(3), 3, 2, 180, "clashed over 3-year pact (Ch.3)", "Wu Tan City"},
+               {chapter(5), 5, 3, 90, "rise-from-ruin arc", "Martial Peak: fallen genius returns"},
+               {chapter(500), 500, 2, 255, "crowned Yan Di, the Flame Emperor (Ch.500)", "Central Plains"},
+           }},
+          {"萧炎", "", 0, "Xiao Yan (any book)", {{0, 0, 1, 10, "a Dou Qi cultivator", ""}}},
+          {"乌坦城",
+           DOUPO,
+           chapter(3),
+           "Wu Tan City (Xiao Clan seat)",
+           {{chapter(3), 3, 1, 100, "Xiao Clan's home city (Ch.3)", ""}}},
+          {"美杜莎",
+           DOUPO,
+           chapter(300),
+           "Medusa (Snake-People queen)",
+           {{chapter(300), 300, 1, 220, "Snake-People queen met in the desert (Ch.300)", "Tagoo Desert"}}},
+          {"药老", DOUPO, chapter(1), "", {{chapter(1), 1, 1, 10, "ring spirit in Xiao Yan's ring (Ch.1)", ""}}},
+          {"纳兰嫣然", DOUPO, chapter(2), "Nalan Yanran", {{chapter(3), 3, 1, 60, "broke the engagement (Ch.3)", ""}}},
+      },
+      {{"炎帝", "萧炎", chapter(500)}});
+}
+
+std::string weave(const std::string& word, const char* book, const uint32_t cutoff, const size_t cap = 512) {
+  std::vector<char> out(cap, '\x7f');
+  if (!ce::weaveEntityRefresher(word.data(), word.size(), book, cutoff, out.data(), out.size())) return "<none>";
+  return out.data();
+}
+
+}  // namespace
+
+TEST(ConceptEngineCutoffs, PackLayoutIndependentPositions) {
+  EXPECT_EQ(ce::epubStoryCutoff(0, 0), 1u << 16);
+  EXPECT_EQ(ce::epubStoryCutoff(2, 64 * 7 + 63), (3u << 16) | 7u);
+  EXPECT_EQ(ce::epubStoryCutoff(1, 0xFFFFFFFFu), (2u << 16) | 0xFFFFu);
+  EXPECT_EQ(ce::epubStoryCutoff(-1, 640), 10u);
+  EXPECT_EQ(ce::txtStoryCutoff(0), 1u << 16);
+  EXPECT_EQ(ce::txtStoryCutoff(5 * 1024 + 1023), (1u << 16) | 5u);
+  EXPECT_EQ(ce::txtStoryCutoff(size_t{1} << 40), (1u << 16) | 0xFFFFu);
+  EXPECT_LT(ce::epubStoryCutoff(3, 1 << 20), ce::epubStoryCutoff(4, 0));
+}
+
+TEST_F(ConceptEngineTest, StoryRefresherUsesOnlyEventsUpToCutoff) {
+  writeFile(storyPath, makeDoupoGraph());
+  EXPECT_EQ(weave("萧炎", DOUPO, chapter(1)),
+            "Story: Xiao Yan (Dou Qi disciple) — introduced at Xiao Clan test (Ch.1).");
+  const std::string ch4 = weave("萧炎", DOUPO, chapter(4));
+  EXPECT_EQ(ch4,
+            "Story: Xiao Yan (Dou Qi disciple) — introduced at Xiao Clan test (Ch.1); recently clashed over 3-year "
+            "pact (Ch.3).");
+  EXPECT_EQ(ch4.find("Flame Emperor"), std::string::npos);
+  EXPECT_EQ(ch4.find("Martial Peak"), std::string::npos);
+  EXPECT_EQ(weave("萧炎", DOUPO, chapter(6)), ch4 + " | Echo: Martial Peak: fallen genius returns");
+}
+
+TEST_F(ConceptEngineTest, StoryRefresherGatesEntitiesAndAliases) {
+  writeFile(storyPath, makeDoupoGraph());
+  // Not introduced yet: no name, no refresher.
+  EXPECT_EQ(weave("美杜莎", DOUPO, chapter(4)), "<none>");
+  EXPECT_EQ(weave("美杜莎", DOUPO, chapter(300)),
+            "Story: Medusa (Snake-People queen) — Snake-People queen met in the desert (Ch.300).");
+  EXPECT_EQ(weave("萧炎", DOUPO, chapter(0)), "<none>");
+  // Introduced, but nothing has happened yet.
+  EXPECT_EQ(weave("纳兰嫣然", DOUPO, chapter(2)), "<none>");
+  // 炎帝 only becomes Xiao Yan once the reader reaches the reveal.
+  EXPECT_EQ(weave("炎帝", DOUPO, chapter(1)), "<none>");
+  EXPECT_EQ(weave("炎帝", DOUPO, chapter(499)), "<none>");
+  const std::string revealed =
+      "Story: Xiao Yan (Dou Qi disciple) — introduced at Xiao Clan test (Ch.1); recently crowned Yan Di, the Flame "
+      "Emperor (Ch.500). | Echo: Martial Peak: fallen genius returns";
+  EXPECT_EQ(weave("炎帝", DOUPO, chapter(500)), revealed);
+  EXPECT_EQ(weave("萧炎", DOUPO, 0), revealed);  // 0 = ungated
+  EXPECT_EQ(weave("萧火火", DOUPO, 0), "<none>");
+}
+
+TEST_F(ConceptEngineTest, StoryRefresherPrefersBookRecordOverWildcard) {
+  writeFile(storyPath, makeDoupoGraph());
+  EXPECT_EQ(weave("萧炎", "/books/other.epub", ce::epubStoryCutoff(0, 0)),
+            "Story: Xiao Yan (any book) — a Dou Qi cultivator.");
+  EXPECT_EQ(weave("萧炎", nullptr, 0), "Story: Xiao Yan (any book) — a Dou Qi cultivator.");
+  EXPECT_EQ(weave("乌坦城", "/books/other.epub", 0), "<none>");
+  EXPECT_EQ(weave("乌坦城", DOUPO, chapter(4)), "Story: Wu Tan City (Xiao Clan seat) — Xiao Clan's home city (Ch.3).");
+}
+
+TEST_F(ConceptEngineTest, StoryRefresherFallsBackToWordAndCutsOnCodepoints) {
+  writeFile(storyPath, makeDoupoGraph());
+  EXPECT_EQ(weave("药老", DOUPO, chapter(1)), "Story: 药老 — ring spirit in Xiao Yan's ring (Ch.1).");
+  EXPECT_EQ(weave("药老", DOUPO, chapter(1), 12), "Story: 药");  // 11 bytes allowed, 老 would end at 13
+  EXPECT_EQ(weave("药老", DOUPO, chapter(1), 14), "Story: 药老");
+  EXPECT_EQ(weave("萧炎", DOUPO, chapter(1), 0), "<none>");
+}
+
+TEST_F(ConceptEngineTest, StoryRefresherRejectsMissingOrForeignGraph) {
+  EXPECT_EQ(weave("萧炎", DOUPO, chapter(4)), "<none>");
+  auto graph = makeDoupoGraph();
+  graph[0] = 'X';
+  writeFile(storyPath, graph);
+  EXPECT_EQ(weave("萧炎", DOUPO, chapter(4)), "<none>");
+  graph = makeDoupoGraph();
+  graph.resize(graph.size() - 10);  // alias table cut short
+  writeFile(storyPath, graph);
+  EXPECT_EQ(weave("萧炎", DOUPO, chapter(4)), "<none>");
+}
+
+TEST_F(ConceptEngineTest, StoryRefresherWeavesCspwFrames) {
+  writeFile(storyPath, makeDoupoGraph());
+  auto file = makeCspw();
+  pokeText(file, OFF_FRAME_STR + 0 * 64, 63, "%E, %R");
+  pokeText(file, OFF_FRAME_STR + 64 * 64, 63, "first %O, at %L");
+  pokeText(file, OFF_FRAME_STR + 128 * 64, 63, "lately %A in %L");
+  pokeText(file, OFF_FRAME_STR + 192 * 64, 63, "cf. %B (100%%)");
+  pokeText(file, OFF_PHRASE_STR + 0 * 100, 99, "Dou Qi prodigy");
+  writeFile(cspwPath, file);
+  EXPECT_EQ(weave("萧炎", DOUPO, chapter(6)),
+            "Story: Xiao Yan (Dou Qi disciple), Dou Qi prodigy — first introduced at Xiao Clan test (Ch.1), at Xiao "
+            "Clan; lately clashed over 3-year pact (Ch.3) in Wu Tan City. | Echo: cf. Martial Peak: fallen genius "
+            "returns (100%)");
+  // An empty placeholder (%L without a place) falls back to the part default.
+  EXPECT_EQ(weave("乌坦城", DOUPO, chapter(4)),
+            "Story: Wu Tan City (Xiao Clan seat), Dou Qi prodigy — Xiao Clan's home city (Ch.3).");
 }

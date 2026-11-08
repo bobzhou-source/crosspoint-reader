@@ -30,6 +30,7 @@
 #include "TxtReaderPageSelectionActivity.h"
 #include "components/UITheme.h"
 #include "fontIds.h"
+#include "util/ConceptEngine.h"
 #include "util/DictionaryRegistry.h"
 
 namespace {
@@ -616,7 +617,8 @@ bool TxtReaderActivity::openDictionaryWordSelect() {
   if (!page) return false;
   auto lookup = std::make_unique<DictionaryWordSelectActivity>(renderer, mappedInput, std::move(page),
                                                                cachedOrientedMarginLeft, cachedOrientedMarginTop);
-  lookup->setReadingPosition(static_cast<uint32_t>(std::clamp(displayedPageNumber() - 1, 0, 0xFFFF)));
+  lookup->setReadingPosition(static_cast<uint32_t>(std::clamp(displayedPageNumber() - 1, 0, 0xFFFF)),
+                             ConceptEngine::txtStoryCutoff(currentOffset));
   startActivityForResult(std::move(lookup), [this](const ActivityResult&) { requestUpdate(); });
   return true;
 }
@@ -667,7 +669,8 @@ bool TxtReaderActivity::handleWordHold() {
     LOG_ERR("TRS", "OOM: DictionaryWordSelectActivity");
     return true;
   }
-  lookup->setReadingPosition(static_cast<uint32_t>(std::clamp(displayedPageNumber() - 1, 0, 0xFFFF)));
+  lookup->setReadingPosition(static_cast<uint32_t>(std::clamp(displayedPageNumber() - 1, 0, 0xFFFF)),
+                             ConceptEngine::txtStoryCutoff(currentOffset));
   startActivityForResult(std::move(lookup), [this](const ActivityResult&) { requestUpdate(); });
   return true;
 }
