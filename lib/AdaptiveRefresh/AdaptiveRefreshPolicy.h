@@ -1,6 +1,7 @@
 #pragma once
 
 #include <FrameChangeMetrics.h>
+#include <stddef.h>
 #include <stdint.h>
 
 // Content-aware "when does the next page need a clearing refresh" policy.
@@ -28,6 +29,25 @@
 //      panel still shows the previous frame.
 // Frames whose refresh mode is dictated elsewhere (overlays, menus) that should
 // still count are accounted the same way: decide(), ignore the answer, commit().
+//
+// LiquidRefresh (optional, off until fed): a closed-form continuous-time
+// (CfC) relaxation of the debt between turns plus a backprop-free
+// eligibility-trace readout that learns from manual refreshes.
+//   - Inputs::elapsedMs (or recordTileTransitions()) gives the page dwell.
+//     Before the new charge is added the relaxing share of the debt decays by
+//     rho = exp(-dt * softplus(f(polarity, class))); kLiquidFloorPermille of
+//     every charge is irreversible until the next clear. Fast turns
+//     (dt < kFastTurnMs) are charged up to kFastTurnBoostPermille extra.
+//   - recordTileTransitions() feeds an 8x6 tile plane; a tile ghosting well
+//     above the screen mean clears earlier than the same change spread out.
+//   - The debt rule becomes the readout z = v.psi + b >= 1000 over
+//     psi = [debt_ratio, peak_tile_excess, fast_streak, 1] (all permille).
+//     recordManualRefresh() moves v, b along the eligibility trace
+//     e = gamma*lambda*e + (a - p)*psi, bounded so the plain debt threshold
+//     stays within [50%, 150%] of the configured one. The safety cap and all
+//     other clear reasons are unchanged.
+// With elapsedMs == 0, no tiles and the default readout, every decision,
+// debt and clear row is the content-v2 rule exactly.
 class AdaptiveRefreshPolicy {
  public:
   // Clear maps to the app's HALF refresh (FULL stays a manual/GfxRenderer promotion).
@@ -97,6 +117,10 @@ class AdaptiveRefreshPolicy {
     // Logical screen size, to clamp the pictures' area.
     uint16_t screenWidth = 0;
     uint16_t screenHeight = 0;
+    // Milliseconds the previous frame stayed on the panel (page dwell). 0:
+    // unknown; the liquid decay and fast-turn boost are then off unless
+    // recordTileTransitions() passed a dwell for this frame.
+    uint32_t elapsedMs = 0;
   };
 
   struct Decision {
@@ -172,6 +196,46 @@ class AdaptiveRefreshPolicy {
   enum class ImageWaveform : uint8_t { Quality, Fast };
   static constexpr ImageWaveform kImageWaveform = ImageWaveform::Quality;
 
+  // --- LiquidRefresh constants --------------------------------------------
+  static constexpr uint8_t kTileCols = 8;
+  static constexpr uint8_t kTileRows = 6;
+  static constexpr uint8_t kTileCount = kTileCols * kTileRows;
+  // Share of each charge that never relaxes before a clear.
+  static constexpr uint32_t kLiquidFloorPermille = 500;
+  // f(polarity, class) in thousandths; the relaxation rate is softplus(f) per
+  // second (evaluated at compile time): text ~0.049/s (tau ~21 s), grayscale
+  // ~0.030/s, image ~0.018/s. Night mode (inverted output) adds
+  // kLiquidLogitInvertedMilli: slower. Classes index kLiquidLogitMilli.
+  enum LiquidClass : uint8_t { kLiquidText, kLiquidGray, kLiquidImage };
+  static constexpr int32_t kLiquidLogitMilli[3] = {-3000, -3500, -4000};
+  static constexpr int32_t kLiquidLogitInvertedMilli = -700;
+  // A dwell below kFastTurnMs is a fast turn: its charge grows linearly up to
+  // +kFastTurnBoostPermille as the dwell approaches 0 and it extends the
+  // fast streak (full at kFastStreakFull turns).
+  static constexpr uint32_t kFastTurnMs = 2000;
+  static constexpr uint32_t kFastTurnBoostPermille = 250;
+  static constexpr uint8_t kFastStreakFull = 8;
+  // A tile ghosting kTilePeakScale x the clear threshold above the screen
+  // mean contributes a full 1000 to the readout.
+  static constexpr uint32_t kTilePeakScale = 2;
+  // Eligibility trace decay (gamma * lambda) and learning rate, thousandths.
+  static constexpr int32_t kTraceDecayPermille = 750;
+  static constexpr int32_t kLearnRatePermille = 50;
+  // Learned-state file: 32 bytes, "LQRF" on disk (little-endian magic).
+  static constexpr size_t kLearnedStateBytes = 32;
+  static constexpr uint32_t kLearnedStateMagic = 0x4652514Cu;
+  static constexpr uint16_t kLearnedStateVersion = 1;
+  static constexpr char kLearnedStatePath[] = "/.crosspoint/liquid-refresh.bin";
+
+  // Readout weights, thousandths. The default makes z the plain debt ratio.
+  enum LiquidWeight : uint8_t { kReadoutDebt, kReadoutPeak, kReadoutStreak, kReadoutBias };
+  struct LiquidReadout {
+    // v0 [667, 2000], v1 [500, 2000], v2 [0, 500], b [-500, 500] and then the
+    // plain debt threshold bounds.
+    int16_t w[4] = {1000, 1000, 0, 0};
+    bool operator==(const LiquidReadout&) const = default;
+  };
+
   // Every tunable of the rule. The defaults are the compiled constants above;
   // a policy built with Config{} behaves exactly like the compiled policy.
   struct Config {
@@ -237,6 +301,30 @@ class AdaptiveRefreshPolicy {
   Decision decide(const Inputs& in);
   void commit(Refresh displayed);
 
+  // Per-tile share of pixels (permille of that tile, row-major 8x6) the frame
+  // about to be decided changes, plus its page dwell. Call before decide();
+  // consumed by the next commit(). Inputs::elapsedMs, when set, wins.
+  void recordTileTransitions(const uint16_t tileChanged[kTileCount], uint32_t elapsedMs);
+  // The user asked for a refresh (m = 1): the clear came too late. Moves the
+  // readout along the eligibility trace of the fast turns since the last
+  // clear. Valid before or after the manual clear is committed. False when no
+  // fast turn was traced.
+  bool recordManualRefresh();
+  // Learned readout persistence (kLearnedStatePath). No I/O: the caller owns
+  // the file. save returns kLearnedStateBytes, or 0 when len is too small;
+  // load rejects a short, foreign or corrupt buffer and keeps the state.
+  size_t saveLearnedState(uint8_t* buf, size_t len) const;
+  bool loadLearnedState(const uint8_t* buf, size_t len);
+  void resetLearnedState();
+  const LiquidReadout& liquidReadout() const { return readout_; }
+  uint32_t liquidUpdates() const { return liquid_.updates; }
+  // Plain debt threshold the readout implies (no tile peak, no fast streak).
+  uint32_t learnedThresholdPermille(bool inverted = false) const;
+  int16_t tileGhostPermille(uint8_t tile) const { return tile < kTileCount ? liquid_.tile[tile] : 0; }
+  // rho in thousandths for a dwell over a resident frame of class `cls`:
+  // exp(-elapsedMs/1000 * softplus(f(inverted, cls))), integer rational.
+  static uint16_t liquidRhoPermille(uint32_t elapsedMs, uint8_t cls, bool inverted);
+
   bool clearPending() const { return initialClear_ || clearRequested_; }
   uint32_t debtPixels() const { return debt_; }
   uint16_t fastSinceClear() const { return fastSinceClear_; }
@@ -257,8 +345,14 @@ class AdaptiveRefreshPolicy {
 
  private:
   uint32_t chargeFor(const Inputs& in) const;
+  uint32_t weightFor(const Inputs& in) const;
+  uint32_t elapsedFor(const Inputs& in) const { return in.elapsedMs ? in.elapsedMs : liquid_.stagedElapsedMs; }
+  bool liquidDebtDue(const Inputs& in);
+  int32_t tileNext(uint8_t tile) const;
+  void liquidCommit(Refresh displayed);
+  void clampReadout();
   ClearRecord labelFor(const Inputs& in, Reason reason) const;
-  RegionFallback regionFor(const Inputs& in, Rect& region) const;
+  RegionFallback regionFor(const Inputs& in, bool debtDue, Rect& region) const;
 
   Config config_;
   uint32_t debt_ = 0;            // weighted changed pixels since the last clear (saturating)
@@ -284,4 +378,29 @@ class AdaptiveRefreshPolicy {
   // Region mode: union of the rects of picture pages since the last clear.
   Rect imageRegion_{};
   bool imageRegionUnknown_ = false;
+
+  // LiquidRefresh state, 232 bytes at most together with readout_. Episodic
+  // fields are set by reset(); the readout survives it.
+  struct Liquid {
+    int16_t tile[kTileCount];        // tile ghost, thousandths of the tile
+    uint8_t staged[kTileCount];      // recordTileTransitions(), units of 4 permille
+    int16_t trace[4];                // eligibility trace e
+    int16_t psi[4];                  // this frame's features, set by decide()
+    uint32_t pendingDebt;            // decayed debt before this frame's charge
+    uint32_t debtFloor;              // irreversible share of debt_
+    uint32_t stagedElapsedMs;
+    uint32_t updates;                // manual-refresh updates applied (saturating)
+    uint16_t tileGain;               // this frame's tile charge multiplier, thousandths
+    uint16_t retention;              // this frame's tile retention, thousandths
+    int16_t pressure;                // p = clamp(z, 0, 1000)
+    uint8_t fastStreak;
+    uint8_t pendingStreak;
+    uint8_t residentClass;           // LiquidClass of the frame on the panel
+    uint8_t pendingClass;
+    uint8_t traceTurns;              // fast turns in the trace (saturating)
+    bool tilesActive;
+    bool tilesStaged;
+  };
+  Liquid liquid_{};
+  LiquidReadout readout_;
 };

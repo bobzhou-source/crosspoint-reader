@@ -1,6 +1,8 @@
 #include <gtest/gtest.h>
 
+#include <cmath>
 #include <cstdint>
+#include <cstring>
 #include <vector>
 
 #include "AdaptiveRefreshPolicy.h"
@@ -742,4 +744,220 @@ TEST(AdaptiveRefreshPolicyRegion, RegionModeOffIsTheRc922RuleExactly) {
       EXPECT_TRUE(sameRecord(rc922Rows.rows[i], candidateRows.rows[i])) << "clear " << i;
     }
   }
+}
+
+namespace {
+
+Policy::Inputs dwell(uint32_t changed, uint32_t elapsedMs) {
+  auto in = exact(changed);
+  in.elapsedMs = elapsedMs;
+  return in;
+}
+
+// The control center's refresh tile: a renderer promotion labelled manual.
+void manualClear(Policy& p) {
+  auto in = exact(100);
+  in.externalClearPending = true;
+  in.externalManual = true;
+  const auto d = p.decide(in);
+  ASSERT_EQ(d.refresh, Refresh::Clear);
+  p.commit(d.refresh);
+}
+
+// Fast frames before a clear when every frame changes `changed` pixels laid
+// out on the 8x6 tile plane as `tiles`.
+unsigned fastTilesBeforeClear(Policy& p, const uint16_t (&tiles)[Policy::kTileCount], uint32_t changed,
+                              Reason* reason = nullptr, unsigned limit = 500) {
+  for (unsigned n = 0; n < limit; ++n) {
+    p.recordTileTransitions(tiles, 0);
+    const auto d = step(p, exact(changed));
+    if (d.refresh == Refresh::Clear) {
+      if (reason) *reason = d.reason;
+      return n;
+    }
+  }
+  return limit;
+}
+
+// Rounds of `turns` fast pages, each ended by a manual refresh.
+void annoy(Policy& p, unsigned rounds, unsigned turns = 6) {
+  for (unsigned r = 0; r < rounds; ++r) {
+    for (unsigned i = 0; i < turns; ++i) ASSERT_EQ(step(p, exact(100)).refresh, Refresh::Fast) << r << "/" << i;
+    manualClear(p);
+    ASSERT_TRUE(p.recordManualRefresh()) << "round " << r;
+  }
+}
+
+}  // namespace
+
+TEST(LiquidRefresh, RhoFollowsTheClosedFormDecay) {
+  for (const bool inverted : {false, true}) {
+    for (uint8_t cls = Policy::kLiquidText; cls <= Policy::kLiquidImage; ++cls) {
+      EXPECT_EQ(Policy::liquidRhoPermille(0, cls, inverted), 1000);
+      const int32_t logit = Policy::kLiquidLogitMilli[cls] + (inverted ? Policy::kLiquidLogitInvertedMilli : 0);
+      const double rate = std::log1p(std::exp(logit / 1000.0));  // softplus, per second
+      uint16_t previous = 1000;
+      for (const uint32_t ms : {50u, 300u, 1000u, 5000u, 20000u, 60000u, 600000u, 4000000000u}) {
+        const uint16_t rho = Policy::liquidRhoPermille(ms, cls, inverted);
+        EXPECT_NEAR(rho, 1000.0 * std::exp(-(ms / 1000.0) * rate), 2.0) << int(cls) << " " << inverted << " " << ms;
+        EXPECT_LE(rho, previous);
+        previous = rho;
+      }
+    }
+  }
+  // Night mode and heavier content relax more slowly.
+  EXPECT_GT(Policy::liquidRhoPermille(20000, Policy::kLiquidText, true),
+            Policy::liquidRhoPermille(20000, Policy::kLiquidText, false));
+  EXPECT_GT(Policy::liquidRhoPermille(20000, Policy::kLiquidImage, false),
+            Policy::liquidRhoPermille(20000, Policy::kLiquidText, false));
+}
+
+TEST(LiquidRefresh, UniformTilesWithoutDwellAreTheContentV2RuleExactly) {
+  uint16_t uniform[Policy::kTileCount];
+  Policy legacy;
+  Policy liquid;
+  uint32_t seed = 4242;
+  for (int i = 0; i < 600; ++i) {
+    seed = seed * 1103515245u + 12345u;
+    const uint32_t changed = 20 + (seed >> 8) % 600;
+    const bool picture = (seed >> 20) % 7 == 0;
+    for (auto& t : uniform) t = static_cast<uint16_t>(changed);  // kPixels = 1000: changed is permille
+    liquid.recordTileTransitions(uniform, 0);
+    const auto a = legacy.decide(readerPage(changed, picture));
+    const auto b = liquid.decide(readerPage(changed, picture));
+    ASSERT_EQ(a.refresh, b.refresh) << "page " << i;
+    ASSERT_EQ(a.reason, b.reason) << "page " << i;
+    legacy.commit(a.refresh);
+    liquid.commit(b.refresh);
+    if (picture) {
+      legacy.imagePageShown();
+      liquid.imagePageShown();
+    }
+    ASSERT_EQ(legacy.debtPixels(), liquid.debtPixels()) << "page " << i;
+  }
+}
+
+TEST(LiquidRefresh, DwellRelaxesDebtWhileRapidTurnsChargeMore) {
+  Policy legacy(false);
+  EXPECT_EQ(fastFramesBeforeClear(legacy, dwell(100, 0)), 14u);
+
+  // A minute per page: the relaxing half of each charge fades, the
+  // irreversible half still reaches the budget well before the safety cap.
+  Policy slow(false);
+  unsigned slowTurns = 0;
+  Policy::Decision d{};
+  while ((d = step(slow, dwell(100, 60000))).refresh == Refresh::Fast) ++slowTurns;
+  EXPECT_EQ(d.reason, Reason::Debt);
+  EXPECT_GT(slowTurns, 20u);
+  EXPECT_LT(slowTurns, static_cast<unsigned>(Policy::kSafetyCap));
+
+  // Flipping every 300 ms: almost no relaxation and each turn is boosted.
+  Policy rapid(false);
+  EXPECT_LT(fastFramesBeforeClear(rapid, dwell(100, 300)), 14u);
+
+  // The debt after one long dwell sits between the floor and the full debt.
+  Policy one(false);
+  step(one, dwell(400, 0));
+  ASSERT_EQ(one.debtPixels(), 400u);
+  step(one, dwell(0, 60000));
+  EXPECT_GE(one.debtPixels(), 200u);
+  EXPECT_LT(one.debtPixels(), 230u);
+}
+
+TEST(LiquidRefresh, PeakTileClearsEarlierThanTheSameChangeSpreadOut) {
+  // Both layouts change 100 of 1000 pixels (100 permille of the screen).
+  uint16_t uniform[Policy::kTileCount];
+  for (auto& t : uniform) t = 100;
+  uint16_t peak[Policy::kTileCount] = {};
+  for (int i = 0; i < 5; ++i) peak[i] = 960;  // 5 * 960 / 48 = 100
+
+  Policy spread(false);
+  Reason spreadReason = Reason::None;
+  EXPECT_EQ(fastTilesBeforeClear(spread, uniform, 100, &spreadReason), 14u);
+  EXPECT_EQ(spreadReason, Reason::Debt);
+
+  Policy local(false);
+  Reason localReason = Reason::None;
+  const unsigned localTurns = fastTilesBeforeClear(local, peak, 100, &localReason);
+  EXPECT_LE(localTurns, 3u);
+  EXPECT_EQ(localReason, Reason::Debt);
+
+  // The clear wipes the tile plane; one more fast frame books the tile charge.
+  EXPECT_EQ(local.tileGhostPermille(0), 0);
+  local.recordTileTransitions(peak, 0);
+  ASSERT_EQ(step(local, exact(100)).refresh, Refresh::Fast);
+  EXPECT_EQ(local.tileGhostPermille(0), 960);
+  EXPECT_EQ(local.tileGhostPermille(47), 0);
+}
+
+TEST(LiquidRefresh, ManualRefreshesLearnEarlierClearsThatPersist) {
+  Policy learner(false);
+  annoy(learner, 6);
+  EXPECT_EQ(learner.liquidUpdates(), 6u);
+  EXPECT_FALSE(learner.recordManualRefresh());  // the trace was consumed
+  const uint32_t learned = learner.learnedThresholdPermille();
+  EXPECT_LT(learned, Policy::kClearThresholdPermille);
+  EXPECT_GE(learned, Policy::kClearThresholdPermille / 2);
+
+  uint8_t buf[Policy::kLearnedStateBytes + 4];
+  EXPECT_EQ(learner.saveLearnedState(buf, Policy::kLearnedStateBytes - 1), 0u);
+  ASSERT_EQ(learner.saveLearnedState(buf, sizeof buf), Policy::kLearnedStateBytes);
+  EXPECT_EQ(std::memcmp(buf, "LQRF", 4), 0);
+
+  Policy restored(false);
+  ASSERT_TRUE(restored.loadLearnedState(buf, Policy::kLearnedStateBytes));
+  EXPECT_EQ(restored.liquidReadout(), learner.liquidReadout());
+  EXPECT_EQ(restored.liquidUpdates(), 6u);
+  EXPECT_EQ(restored.learnedThresholdPermille(), learned);
+  restored.reset();  // a new book keeps what was learned
+  EXPECT_EQ(restored.liquidReadout(), learner.liquidReadout());
+
+  Policy fresh(false);
+  restored.reset(false);
+  const unsigned learnedTurns = fastFramesBeforeClear(restored, exact(100));
+  EXPECT_LT(learnedTurns, fastFramesBeforeClear(fresh, exact(100)));
+  EXPECT_GE(learnedTurns, 7u);  // never below half the configured threshold
+}
+
+TEST(LiquidRefresh, LearningStaysWithinHalfAndOneAndAHalfThresholdsAndTheSafetyCap) {
+  Policy p(false);
+  annoy(p, 200);
+  EXPECT_GE(p.learnedThresholdPermille(), Policy::kClearThresholdPermille / 2);
+  EXPECT_LE(p.learnedThresholdPermille(), Policy::kClearThresholdPermille * 3 / 2);
+  EXPECT_GE(fastFramesBeforeClear(p, exact(100)), 7u);
+
+  // Tiny changes still clear at the safety cap, not earlier or later.
+  Policy capped(false);
+  uint8_t buf[Policy::kLearnedStateBytes];
+  ASSERT_EQ(p.saveLearnedState(buf, sizeof buf), Policy::kLearnedStateBytes);
+  ASSERT_TRUE(capped.loadLearnedState(buf, sizeof buf));
+  for (unsigned i = 0; i < Policy::kSafetyCap; ++i) ASSERT_EQ(step(capped, exact(1)).refresh, Refresh::Fast) << i;
+  EXPECT_EQ(capped.decide(exact(1)).reason, Reason::SafetyCap);
+}
+
+TEST(LiquidRefresh, PolicyClearsEndTheTraceAndBadStateIsRejected) {
+  Policy p(false);
+  for (int i = 0; i < 6; ++i) step(p, exact(100));
+  p.requestClear();
+  ASSERT_EQ(step(p, exact(100)).reason, Reason::Requested);
+  EXPECT_FALSE(p.recordManualRefresh());  // no complaint pending after a policy clear
+
+  // Recorded before the manual clear is committed works too.
+  for (int i = 0; i < 6; ++i) step(p, exact(100));
+  EXPECT_TRUE(p.recordManualRefresh());
+  const auto readout = p.liquidReadout();
+  EXPECT_NE(readout, Policy::LiquidReadout{});
+
+  uint8_t buf[Policy::kLearnedStateBytes];
+  ASSERT_EQ(p.saveLearnedState(buf, sizeof buf), Policy::kLearnedStateBytes);
+  Policy other(false);
+  EXPECT_FALSE(other.loadLearnedState(buf, sizeof buf - 1));
+  buf[9] ^= 0x40;  // corrupt v0
+  EXPECT_FALSE(other.loadLearnedState(buf, sizeof buf));
+  EXPECT_EQ(other.liquidReadout(), Policy::LiquidReadout{});
+  buf[9] ^= 0x40;
+  ASSERT_TRUE(other.loadLearnedState(buf, sizeof buf));
+  EXPECT_EQ(other.liquidReadout(), readout);
+  other.resetLearnedState();
+  EXPECT_EQ(other.liquidReadout(), Policy::LiquidReadout{});
 }
