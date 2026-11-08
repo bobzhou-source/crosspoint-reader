@@ -17,7 +17,7 @@ from pathlib import Path
 from .cache import Cache
 from .cloud_annotations import load_annotations, map_annotation
 from .common import ReaderError, atomic_write, bounded_read
-from . import concept_index, novels
+from . import concept_index, novels, story_graph
 from .book_hooks import BACKUP_SUFFIX
 
 CONFIG_VERSION = 1
@@ -60,8 +60,10 @@ DICTIONARIES_DIR = Path("dictionaries")
 HIDDEN_DICTIONARIES_DIR = Path(".dictionaries")
 # Lookup sidecars the reader builds next to <stem>.idx / <stem>.syn.
 DICTIONARY_SIDECARS = {".idx": ".qidx", ".syn": ".sidx"}
-# Model artifacts the ConceptEngine loads from /models (platonic-hnet.bin, engram.bin, inbox-concepts.idx).
+# Model artifacts the ConceptEngine and CS-PW kernel load from /models; every other .bin/.idx in the
+# Mac folder is mirrored too, and a sync result names the ones the folder lacks.
 MODELS_DIR = Path("models")
+MODEL_FILENAMES = ("platonic-hnet.bin", "engram.bin", "inbox-concepts.idx", "cspw.bin", "story-graph.idx")
 MODEL_SUFFIXES = (".bin", ".idx")
 # Reader telemetry backed up to the Mac on every sync.
 BENCHMARK_LOGS = Path("Benchmark/logs")
@@ -635,7 +637,7 @@ def sync_card(cache: Cache, config: dict, *, volume: CardVolume | None = None, n
     book_result = _deliver_shelf(volume, book_plan) if book_plan is not None else None
     dictionary_result = (_deliver_dictionaries(volume, dictionary_plan)
                          if dictionary_plan is not None else None)
-    models_result = _deliver_models(volume, models_source) if models_source is not None else None
+    models_result = sync_models_to_card(volume, models_source) if models_source is not None else None
     usage_result = _collect_usage(volume, Path(usage_dir)) if usage_dir is not None else None
     (_, annotation_count, annotation_path, annotation_updated,
      _, native_path, native_updated, crossfire_result) = _annotation_import(volume, config, crossfire)
@@ -805,11 +807,13 @@ def _mirror_files(files: list[Path], target: Path, card_root: Path | None) -> di
     return {"copied": len(copied), "unchanged": len(unchanged), "copied_paths": copied, "errors": errors}
 
 
-def _deliver_models(volume: CardVolume, source: Path) -> dict:
-    """Refresh the book concept index for the card, then mirror every model artifact to /models.
+def sync_models_to_card(volume: CardVolume, source: Path) -> dict:
+    """Refresh the card-derived indexes in `source`, then mirror every model artifact to /models.
 
-    The index covers the EPUBs now in /books/Inbox and /books/Books, so it runs after
-    every shelf was delivered. Card files the Mac folder lacks are left alone.
+    `inbox-concepts.idx` covers the EPUBs now in /books/Inbox and /books/Books and `story-graph.idx`
+    (unless a prebuilt one is there) those plus /books/Novels, so this runs after every shelf was
+    delivered. A file is copied when its size or mtime differs from the card copy and verified by
+    SHA-256 read-back. Card files the Mac folder lacks are left alone.
     """
     errors: list[str] = []
     try:
@@ -817,11 +821,19 @@ def _deliver_models(volume: CardVolume, source: Path) -> dict:
     except (ReaderError, OSError) as exc:
         index = None
         errors.append(f"{concept_index.INDEX_NAME}: not refreshed: {exc}")
+    try:
+        graph = story_graph.refresh_story_graph(source, volume.root)
+    except (ReaderError, OSError) as exc:
+        graph = None
+        errors.append(f"{story_graph.STORY_GRAPH_NAME}: not refreshed: {exc}")
     files = sorted(path for path in source.iterdir()
                    if not path.name.startswith(".") and path.suffix in MODEL_SUFFIXES
                    and not path.is_symlink() and path.is_file())
     result = _mirror_files(files, volume.root / MODELS_DIR, volume.root)
-    return {"source": str(source), "index": index, **result, "errors": errors + result["errors"]}
+    present = {path.name for path in files}
+    return {"source": str(source), "index": index, "story_graph": graph,
+            "missing": [name for name in MODEL_FILENAMES if name not in present],
+            **result, "errors": errors + result["errors"]}
 
 
 def _collect_usage(volume: CardVolume, usage_dir: Path) -> dict:

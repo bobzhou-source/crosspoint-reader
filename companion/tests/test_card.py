@@ -16,6 +16,7 @@ from reader_send import cache as cache_module
 from reader_send import card as card_module
 from reader_send import cli
 from reader_send import concept_index
+from reader_send import story_graph
 from reader_send.cache import Cache
 from reader_send.card import (BOOK_INBOX, FIRMWARE_CONFIG_KEYS, FIRMWARE_NAME, FIRMWARE_ORIGIN, CardVolume,
                               _validate_reader_sync_config, provision_reader_sync, resolve_card,
@@ -642,6 +643,12 @@ def tiny_model(seed: int = 7) -> bytes:
     return header + payload
 
 
+def tiny_cspw(fill: int = 1) -> bytes:
+    """A cspw.bin of the contract size (393,728 bytes): CSPW v2 header, constant int8 payload."""
+    header = struct.pack("<4sHHIIIIII", b"CSPW", 2, 0, 192, 128, 4, 256, 512, 0).ljust(512, b"\0")
+    return header + bytes([fill]) * (393_728 - 512)
+
+
 def tiny_engram(slots: int = 64, seed: int = 3) -> bytes:
     generator = random.Random(seed)
     header = concept_index.ENGRAM_HEADER.pack(concept_index.ENGRAM_MAGIC, 1, slots, 64, 2 ** -5)
@@ -661,6 +668,25 @@ class ConceptIndexTest(unittest.TestCase):
         self.assertEqual(concept_index.MODEL_HEADER.size, 32)
         self.assertEqual(concept_index.MODEL_PAYLOAD_BYTES, 94_976)
         self.assertEqual((concept_index.INDEX_HEADER.size, concept_index.INDEX_RECORD.size), (16, 192))
+
+    def test_a_bigram_slot_applies_only_on_an_exact_span_hash_match(self):
+        text = "萧炎和纳兰 met at dawn".encode("utf-8")
+        engram = bytearray(tiny_engram())
+        model = concept_index.PlatonicHNet(tiny_model(), concept_index.Engram(bytes(engram)))
+        spans = model.chunks(text)
+        number = next(n for n in range(1, len(spans)) if spans[n][1] - spans[n - 1][0] <= 18)
+        span_hash = concept_index.fnv1a64(text[spans[number - 1][0]:spans[number][1]])
+        offset = 512 + (span_hash % 64) * 64
+        struct.pack_into("<24b", engram, offset + 8, *([100] * 24))
+        without_hash = concept_index.PlatonicHNet(tiny_model(), concept_index.Engram(bytes(engram)))
+        struct.pack_into("<Q", engram, offset, span_hash)
+        with_hash = concept_index.PlatonicHNet(tiny_model(), concept_index.Engram(bytes(engram)))
+        self.assertEqual(with_hash.engram.bigram_delta(text[spans[number - 1][0]:spans[number][1]]), [50] * 24)
+        self.assertIsNone(without_hash.engram.bigram_delta(text[spans[number - 1][0]:spans[number][1]]))
+        self.assertNotEqual(with_hash.encode(text), without_hash.encode(text))
+        struct.pack_into("<Q", engram, offset, span_hash ^ 1)  # same slot, another span
+        self.assertEqual(concept_index.PlatonicHNet(tiny_model(), concept_index.Engram(bytes(engram))).encode(text),
+                         without_hash.encode(text))
 
     def test_the_model_encodes_deterministically_to_a_unit_int8_vector(self):
         model = concept_index.PlatonicHNet(tiny_model(), concept_index.Engram(tiny_engram()))
@@ -743,14 +769,15 @@ class CardModelsTest(unittest.TestCase):
     def test_models_are_mirrored_once_and_verified(self):
         result = self.sync()["models"]
         self.assertEqual(result["errors"], [])
-        self.assertEqual((result["copied"], result["unchanged"]), (4, 0))
-        self.assertEqual(self.card_models(),
-                         ["engram.bin", "extra-artifact.idx", "inbox-concepts.idx", "platonic-hnet.bin"])
+        self.assertEqual((result["copied"], result["unchanged"]), (5, 0))
+        self.assertEqual(self.card_models(), ["engram.bin", "extra-artifact.idx", "inbox-concepts.idx",
+                                              "platonic-hnet.bin", "story-graph.idx"])
+        self.assertEqual(result["missing"], ["cspw.bin"])
         for name in self.card_models():
             self.assertEqual(card_module.file_sha256(self.card / "models" / name),
                              card_module.file_sha256(self.models / name))
         again = self.sync()["models"]
-        self.assertEqual((again["copied"], again["unchanged"]), (0, 4))
+        self.assertEqual((again["copied"], again["unchanged"]), (0, 5))
         self.assertEqual((again["index"]["encoded"], again["index"]["updated"]), (0, False))
 
     def test_a_changed_model_is_replaced_and_the_index_rebuilt(self):
@@ -782,7 +809,7 @@ class CardModelsTest(unittest.TestCase):
         self.assertIn("engram.bin: readback does not match the source SHA-256; the bad copy was removed",
                       result["errors"][0])
         self.assertNotIn("engram.bin", self.card_models())
-        self.assertEqual(result["copied"], 3)
+        self.assertEqual(result["copied"], 4)
         self.assertEqual(self.sync()["models"]["copied"], 1)  # retried on the next sync
 
     def test_the_icpt_index_covers_inbox_and_books(self):
@@ -863,6 +890,54 @@ class CardModelsTest(unittest.TestCase):
         self.assertEqual((args.models, args.usage), (Path("/m"), Path("/u")))
         self.assertIsNone(cli.parser().parse_args(["card", "sync"]).models)
 
+    def test_all_five_model_files_are_synced_when_changed(self):
+        self.assertEqual(card_module.MODEL_FILENAMES, ("platonic-hnet.bin", "engram.bin", "inbox-concepts.idx",
+                                                       "cspw.bin", "story-graph.idx"))
+        cspw = self.models / "cspw.bin"
+        cspw.write_bytes(tiny_cspw())
+        prebuilt = story_graph.build_story_graph(
+            [{"term": "萧炎", "book_path": "/books/Novels/doupo.epub", "kind": 1, "name": "Xiao Yan",
+              "events": [{"cutoff": story_graph.epub_cutoff(0, 0), "chapter_or_page": 1, "gloss": "introduced"}]}])
+        (self.models / "story-graph.idx").write_bytes(prebuilt)
+        result = card_module.sync_models_to_card(self.volume, self.models)
+        self.assertEqual((result["errors"], result["missing"]), ([], []))
+        self.assertTrue(result["story_graph"]["prebuilt"])
+        for name in card_module.MODEL_FILENAMES:
+            self.assertEqual(card_module.file_sha256(self.card / "models" / name),
+                             card_module.file_sha256(self.models / name), name)
+        self.assertEqual((self.card / "models/story-graph.idx").read_bytes(), prebuilt)
+        self.assertEqual(len((self.card / "models/cspw.bin").read_bytes()), 393_728)
+        unchanged = card_module.sync_models_to_card(self.volume, self.models)
+        self.assertEqual((unchanged["copied"], unchanged["unchanged"]), (0, 6))
+        cspw.write_bytes(tiny_cspw(fill=3))  # same size, new bytes and mtime
+        os.utime(cspw, (cspw.stat().st_atime, cspw.stat().st_mtime + 60))
+        bigger = story_graph.build_story_graph(story_graph.read_story_graph(prebuilt)["entities"],
+                                               [{"alias": "炎帝", "canonical": "萧炎", "reveal_cutoff": 0x30000}])
+        (self.models / "story-graph.idx").write_bytes(bigger)
+        changed = card_module.sync_models_to_card(self.volume, self.models)
+        self.assertEqual(sorted(Path(path).name for path in changed["copied_paths"]), ["cspw.bin", "story-graph.idx"])
+        self.assertEqual((self.card / "models/cspw.bin").read_bytes(), tiny_cspw(fill=3))
+        self.assertEqual((self.card / "models/story-graph.idx").read_bytes(), bigger)
+
+    def test_a_missing_story_graph_is_built_from_the_card_books(self):
+        (self.card / "books/Books/Shelf/Luria.epub").write_bytes(
+            tiny_epub("Major Trends", "Then Isaac Luria taught in Safed. " * 5))
+        result = self.sync()["models"]
+        graph = result["story_graph"]
+        self.assertEqual((graph["prebuilt"], graph["updated"], graph["books"], graph["extracted"]), (False, True, 3, 3))
+        self.assertGreaterEqual(graph["entities"], 2)
+        data = (self.card / "models/story-graph.idx").read_bytes()
+        self.assertEqual(data, (self.models / "story-graph.idx").read_bytes())
+        self.assertEqual(story_graph.verify_story_graph(data), [])
+        found = story_graph.query_story_graph(data, "Isaac Luria", "/books/Books/Shelf/Luria.epub", 0)
+        self.assertEqual((found["status"], found["entity"]["kind"]), ("found", story_graph.KIND_CHARACTER))
+        origin = found["events"][0]
+        self.assertEqual((origin["gloss"], origin["slot_hint"]), ("Then Isaac Luria taught in Safed.", 1))
+        model = concept_index.PlatonicHNet(tiny_model(), concept_index.Engram(tiny_engram()))
+        self.assertEqual(origin["vec"], model.encode(origin["gloss"].encode("utf-8")))  # the text up to the cutoff
+        self.assertEqual(story_graph.query_story_graph(data, "Isaac Luria", "/books/Books/Shelf/Luria.epub",
+                                                       story_graph.epub_cutoff(0, 0))["status"], "not_yet_introduced")
+        self.assertEqual(self.sync()["models"]["story_graph"]["extracted"], 0)
 
 
 if __name__ == "__main__":

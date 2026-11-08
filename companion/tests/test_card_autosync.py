@@ -348,6 +348,26 @@ class CardAutosyncTest(unittest.TestCase):
         log = self.log_path.read_text(encoding="utf-8")
         self.assertIn("books shelf: copied 1, unchanged 0, errors 0", log)
 
+    def test_models_and_the_story_graph_are_synced_and_logged(self):
+        shelf, models = self.root / "shelf", self.root / "models"
+        shelf.mkdir()
+        models.mkdir()
+        (shelf / "Local Book.epub").write_bytes(epub_bytes("local"))
+        (models / "cspw.bin").write_bytes(b"CSPW" + bytes(508))
+
+        result = self.run_autosync(books_dir=shelf, models_dir=models)
+
+        shelf_result = result["shelves"]["models"]
+        self.assertEqual(shelf_result["errors"], [])
+        self.assertEqual(shelf_result["missing"], ["platonic-hnet.bin", "engram.bin"])
+        self.assertEqual(sorted(path.name for path in (self.card / "models").iterdir()),
+                         ["cspw.bin", "inbox-concepts.idx", "story-graph.idx"])
+        self.assertEqual((self.card / "models/story-graph.idx").read_bytes()[:4], b"SGRF")
+        log = self.log_path.read_text(encoding="utf-8")
+        self.assertIn("models shelf: copied 3, unchanged 0, errors 0", log)
+        self.assertIn("story graph: 0 entities from 1 books, extracted 0, unreadable 1, pending 0", log)
+        self.assertIn("models missing from the Mac folder: platonic-hnet.bin, engram.bin", log)
+
     def test_shelf_errors_make_the_run_fail_without_losing_the_cloud_books(self):
         self.server.add(FIRST, epub_bytes("first"))
         shelf = self.root / "shelf"
