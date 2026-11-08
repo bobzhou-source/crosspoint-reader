@@ -465,11 +465,16 @@ TEST_F(ConceptEngineTest, EngramGlossNeedsExactSpanHash) {
   EXPECT_EQ(gloss("--", engramPath), "");
 }
 
-TEST_F(ConceptEngineTest, EngramGlossFoldsLatinCase) {
-  writeFile(engramPath, makeEngram(64, {{ce::fnv1a64("\xC3\xBC" "ber"), {}, "over, beyond"},
-                                        {ce::fnv1a64("\xD0\xB4\xD0\xB0"), {}, "yes"}}));
+TEST_F(ConceptEngineTest, EngramGlossFoldsLatinCaseAndTypography) {
+  writeFile(engramPath, makeEngram(4096, {{ce::fnv1a64("\xC3\xBC" "ber"), {}, "over, beyond"},
+                                          {ce::fnv1a64("\xD0\xB4\xD0\xB0"), {}, "yes"},
+                                          {ce::fnv1a64("ain't"), {}, "is not"},
+                                          {ce::fnv1a64("well-to-do"), {}, "wealthy"}}));
   EXPECT_EQ(gloss("\xC3\x9C" "ber", engramPath), "over, beyond");  // Über
   EXPECT_EQ(gloss("\xD0\x94\xD0\x90!", engramPath), "yes");         // ДА!
+  EXPECT_EQ(gloss("Ain\xE2\x80\x99t", engramPath), "is not");       // Ain’t
+  EXPECT_EQ(gloss("\xE2\x80\x98" "ain't\xE2\x80\x99", engramPath), "is not");
+  EXPECT_EQ(gloss("well\xE2\x80\x90to\xE2\x80\x91" "do,", engramPath), "wealthy");
 }
 
 TEST_F(ConceptEngineTest, EngramGlossTriesLongestCjkCompound) {

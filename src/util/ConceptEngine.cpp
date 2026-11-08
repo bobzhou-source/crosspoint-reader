@@ -741,7 +741,10 @@ std::string lookupEngramGloss(std::string_view text, std::string* matchedWord, c
     size_t length;
     const uint32_t cp = decodeUtf8(word, i, length);
     cjk = cjk || isCjk(cp);
-    const uint32_t folded = lowerCodepoint(cp);
+    // Book text sets don’t and well‐known with typographic marks; keys use ASCII.
+    const uint32_t folded = (cp == 0x2018 || cp == 0x2019) ? '\''
+                            : (cp == 0x2010 || cp == 0x2011) ? '-'
+                                                             : lowerCodepoint(cp);
     if (folded == cp) {
       lower.append(word.data() + i, length);
     } else {
