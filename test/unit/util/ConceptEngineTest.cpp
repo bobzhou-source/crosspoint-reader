@@ -7,6 +7,7 @@
 #include <cstring>
 #include <filesystem>
 #include <fstream>
+#include <iterator>
 #include <sstream>
 #include <string>
 #include <vector>
@@ -360,12 +361,30 @@ TEST_F(ConceptEngineTest, MissingModelUsesTrigramSimHash) {
   EXPECT_TRUE(ce::encodeText("Bank of the river", a.data()));
 }
 
-// Golden vectors from the trainer's Python reference:
-// CONCEPT_ENGINE_GOLDEN_DIR=<dir with platonic-hnet.bin, engram.bin, golden.jsonl>.
+// The trainer's artifacts: CONCEPT_ENGINE_GOLDEN_DIR=<dir with platonic-hnet.bin,
+// engram.bin, golden.jsonl ({"text","hex","vec",...} per line) and
+// engram_gloss_examples.json ([{"word","gloss"}, ...])>.
+const char* goldenDir() {
+  const char* dir = std::getenv("CONCEPT_ENGINE_GOLDEN_DIR");
+  return dir && *dir ? dir : nullptr;
+}
+
+// The JSON string value after `"key":` at or past `from`; handles \" and \\ only.
+std::string jsonString(const std::string& text, const std::string& key, size_t from = 0) {
+  const size_t at = text.find("\"" + key + "\"", from);
+  if (at == std::string::npos) return {};
+  size_t i = text.find('"', text.find(':', at)) + 1;
+  std::string out;
+  for (; i < text.size() && text[i] != '"'; ++i) {
+    if (text[i] == '\\') ++i;
+    out += text[i];
+  }
+  return out;
+}
+
 TEST_F(ConceptEngineTest, MatchesTrainerGoldenVectors) {
-  const char* goldenDir = std::getenv("CONCEPT_ENGINE_GOLDEN_DIR");
-  if (!goldenDir || !*goldenDir) GTEST_SKIP() << "CONCEPT_ENGINE_GOLDEN_DIR not set";
-  const fs::path golden(goldenDir);
+  if (!goldenDir()) GTEST_SKIP() << "CONCEPT_ENGINE_GOLDEN_DIR not set";
+  const fs::path golden(goldenDir());
   const std::string model = (golden / "platonic-hnet.bin").string();
   const std::string engram = (golden / "engram.bin").string();
   ce::Paths paths;
@@ -378,40 +397,10 @@ TEST_F(ConceptEngineTest, MatchesTrainerGoldenVectors) {
   std::string line;
   size_t checked = 0;
   while (std::getline(lines, line)) {
-    // {"text": "<json string>", "vec": [ints]}
-    const size_t key = line.find("\"text\"");
-    ASSERT_NE(key, std::string::npos);
-    size_t i = line.find('"', line.find(':', key)) + 1;
+    // Exact input bytes come from "hex" (the text may be malformed UTF-8).
+    const std::string hex = jsonString(line, "hex");
     std::string text;
-    for (; line[i] != '"'; ++i) {
-      if (line[i] != '\\') {
-        text += line[i];
-        continue;
-      }
-      const char e = line[++i];
-      if (e == 'n') text += '\n';
-      else if (e == 't') text += '\t';
-      else if (e == 'r') text += '\r';
-      else if (e == 'u') {
-        uint32_t cp = std::stoul(line.substr(i + 1, 4), nullptr, 16);
-        i += 4;
-        if (cp >= 0xD800 && cp < 0xDC00 && line[i + 1] == '\\' && line[i + 2] == 'u') {
-          const uint32_t low = std::stoul(line.substr(i + 3, 4), nullptr, 16);
-          cp = 0x10000 + ((cp - 0xD800) << 10) + (low - 0xDC00);
-          i += 6;
-        }
-        if (cp < 0x80) text += static_cast<char>(cp);
-        else if (cp < 0x800) text += {static_cast<char>(0xC0 | cp >> 6), static_cast<char>(0x80 | (cp & 0x3F))};
-        else if (cp < 0x10000)
-          text += {static_cast<char>(0xE0 | cp >> 12), static_cast<char>(0x80 | ((cp >> 6) & 0x3F)),
-                   static_cast<char>(0x80 | (cp & 0x3F))};
-        else
-          text += {static_cast<char>(0xF0 | cp >> 18), static_cast<char>(0x80 | ((cp >> 12) & 0x3F)),
-                   static_cast<char>(0x80 | ((cp >> 6) & 0x3F)), static_cast<char>(0x80 | (cp & 0x3F))};
-      } else {
-        text += e;
-      }
-    }
+    for (size_t i = 0; i + 1 < hex.size(); i += 2) text += static_cast<char>(std::stoi(hex.substr(i, 2), nullptr, 16));
     std::array<int8_t, 128> want{};
     std::stringstream vec(line.substr(line.find('[', line.find("\"vec\"")) + 1));
     for (auto& v : want) {
@@ -422,7 +411,27 @@ TEST_F(ConceptEngineTest, MatchesTrainerGoldenVectors) {
     }
     std::array<int8_t, 128> got{};
     ASSERT_TRUE(ce::encodeText(text, got.data(), engram.c_str()));
-    EXPECT_EQ(got, want) << text;
+    EXPECT_EQ(got, want) << "hex " << hex;
+    ++checked;
+  }
+  EXPECT_GT(checked, 0u);
+}
+
+TEST_F(ConceptEngineTest, MatchesTrainerGlossExamples) {
+  if (!goldenDir()) GTEST_SKIP() << "CONCEPT_ENGINE_GOLDEN_DIR not set";
+  const std::string engram = (fs::path(goldenDir()) / "engram.bin").string();
+  std::ifstream file(fs::path(goldenDir()) / "engram_gloss_examples.json");
+  ASSERT_TRUE(file.good());
+  const std::string json((std::istreambuf_iterator<char>(file)), std::istreambuf_iterator<char>());
+  size_t checked = 0;
+  for (size_t at = json.find("\"word\""); at != std::string::npos; at = json.find("\"word\"", at + 1)) {
+    const std::string word = jsonString(json, "word", at);
+    const std::string gloss = jsonString(json, "gloss", at);
+    std::string matched;
+    EXPECT_EQ(ce::lookupEngramGloss(word, &matched, 1, engram.c_str()), gloss) << word;
+    EXPECT_EQ(matched, word);
+    // Held mid-sentence: trailing text and punctuation still find the compound.
+    EXPECT_EQ(ce::lookupEngramGloss("\xE2\x80\x9C" + word, nullptr, 1, engram.c_str()), gloss) << word;
     ++checked;
   }
   EXPECT_GT(checked, 0u);
@@ -430,28 +439,62 @@ TEST_F(ConceptEngineTest, MatchesTrainerGoldenVectors) {
 
 // ---- ENGR gloss ------------------------------------------------------------------
 
+std::string gloss(const std::string& text, const std::string& engram, std::string* matched = nullptr,
+                  const size_t minCjkChars = 1) {
+  return ce::lookupEngramGloss(text, matched, minCjkChars, engram.c_str());
+}
+
 TEST_F(ConceptEngineTest, EngramGlossNeedsExactSpanHash) {
   constexpr uint32_t slots = 64;
   const uint64_t rizz = ce::fnv1a64("rizz");
   writeFile(engramPath, makeEngram(slots, {{rizz, {}, "charisma, esp. in flirting"}}));
-  EXPECT_EQ(ce::lookupEngramGloss("rizz", engramPath.c_str()), "charisma, esp. in flirting");
-  EXPECT_EQ(ce::lookupEngramGloss("Rizz", engramPath.c_str()), "charisma, esp. in flirting");
+  std::string matched;
+  EXPECT_EQ(gloss("rizz", engramPath, &matched), "charisma, esp. in flirting");
+  EXPECT_EQ(matched, "rizz");
+  EXPECT_EQ(gloss("\xE2\x80\x9CRizz,\xE2\x80\x9D", engramPath), "charisma, esp. in flirting");
+  EXPECT_EQ(gloss("(RIZZ)...", engramPath), "charisma, esp. in flirting");
   // A word landing in the same slot with a different hash is not a match.
   std::string collider;
   for (int i = 0; collider.empty(); ++i) {
     const std::string candidate = "w" + std::to_string(i);
     if (ce::fnv1a64(candidate) % slots == rizz % slots) collider = candidate;
   }
-  EXPECT_EQ(ce::lookupEngramGloss(collider, engramPath.c_str()), "");
-  EXPECT_EQ(ce::lookupEngramGloss("rizz", (dir / "absent.bin").c_str()), "");
-  EXPECT_EQ(ce::lookupEngramGloss("", engramPath.c_str()), "");
+  EXPECT_EQ(gloss(collider, engramPath), "");
+  EXPECT_EQ(gloss("rizz", (dir / "absent.bin").string()), "");
+  EXPECT_EQ(gloss("", engramPath), "");
+  EXPECT_EQ(gloss("--", engramPath), "");
+}
+
+TEST_F(ConceptEngineTest, EngramGlossFoldsLatinCase) {
+  writeFile(engramPath, makeEngram(64, {{ce::fnv1a64("\xC3\xBC" "ber"), {}, "over, beyond"},
+                                        {ce::fnv1a64("\xD0\xB4\xD0\xB0"), {}, "yes"}}));
+  EXPECT_EQ(gloss("\xC3\x9C" "ber", engramPath), "over, beyond");  // Über
+  EXPECT_EQ(gloss("\xD0\x94\xD0\x90!", engramPath), "yes");         // ДА!
+}
+
+TEST_F(ConceptEngineTest, EngramGlossTriesLongestCjkCompound) {
+  // 不知道 and 知道 both have glosses; 不 alone does not.
+  writeFile(engramPath, makeEngram(4096, {{ce::fnv1a64("不知道"), {}, "no+to know"},
+                                          {ce::fnv1a64("知道"), {}, "to know"},
+                                          {ce::fnv1a64("ABC"), {}, "uppercase key"}}));
+  std::string matched;
+  EXPECT_EQ(gloss("不知道他在哪", engramPath, &matched), "no+to know");
+  EXPECT_EQ(matched, "不知道");
+  EXPECT_EQ(gloss("知道了。", engramPath, &matched), "to know");
+  EXPECT_EQ(matched, "知道");
+  // From one character earlier the compound must still cover the held one.
+  EXPECT_EQ(gloss("不在", engramPath, nullptr, 2), "");
+  EXPECT_EQ(gloss("不知", engramPath, nullptr, 2), "");
+  EXPECT_EQ(gloss("不知道", engramPath, nullptr, 2), "no+to know");
+  // Latin text is looked up lowercased only.
+  EXPECT_EQ(gloss("ABC", engramPath), "");
 }
 
 TEST_F(ConceptEngineTest, EngramGlossRejectsBadHeader) {
   auto engram = makeEngram(64, {{ce::fnv1a64("yeet"), {}, "to throw"}});
   engram[12] = 32;  // slot_bytes
   writeFile(engramPath, engram);
-  EXPECT_EQ(ce::lookupEngramGloss("yeet", engramPath.c_str()), "");
+  EXPECT_EQ(gloss("yeet", engramPath), "");
 }
 
 // ---- Sense ranking ------------------------------------------------------------------

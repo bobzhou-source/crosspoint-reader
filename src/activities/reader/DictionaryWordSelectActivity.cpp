@@ -59,17 +59,6 @@ const char* senseMarker(const GfxRenderer& renderer, const int fontId) {
   return family != fonts.end() && family->second.hasCodepoint(0x2605) ? "\xE2\x98\x85 " : "\xC2\xBB ";
 }
 
-// A held word without its surrounding ASCII punctuation, for the Engram slot.
-std::string_view bareWord(std::string_view word) {
-  const auto punct = [](const char c) {
-    return static_cast<unsigned char>(c) < 0x80 && !((c >= '0' && c <= '9') || (c >= 'A' && c <= 'Z') ||
-                                                     (c >= 'a' && c <= 'z') || c == '-' || c == '\'');
-  };
-  while (!word.empty() && punct(word.front())) word.remove_prefix(1);
-  while (!word.empty() && punct(word.back())) word.remove_suffix(1);
-  return word;
-}
-
 }  // namespace
 
 void DictionaryWordSelectActivity::onEnter() {
@@ -171,18 +160,24 @@ void DictionaryWordSelectActivity::performLookup() {
                            });
     return;
   }
-  // No dictionary knows the word: the Engram table may still hold a one-line
-  // gloss for it (slang, idioms, compounds).
-  if (miss == DictionaryRouter::Miss::NotFound) {
-    const WordBox& held = words[selected];
-    const std::string_view word =
-        held.cjkBytes ? std::string_view(held.text, held.cjkBytes) : bareWord(held.text ? held.text : "");
-    std::string gloss = ConceptEngine::lookupEngramGloss(word);
+  // No dictionary knows the word (or none is installed): the Engram table may
+  // still hold a one-line gloss for it (slang, idioms, compounds). A CJK hold
+  // tries the compounds starting at the held character, then those starting
+  // one earlier that still cover it.
+  if (miss == DictionaryRouter::Miss::NotFound || miss == DictionaryRouter::Miss::NoDictionary) {
+    std::string word;
+    std::string gloss;
+    if (run[0]) {
+      gloss = ConceptEngine::lookupEngramGloss(run, &word);
+      if (gloss.empty() && previous[0]) gloss = ConceptEngine::lookupEngramGloss(previous, &word, 2);
+    } else if (words[selected].text) {
+      gloss = ConceptEngine::lookupEngramGloss(words[selected].text, &word);
+    }
     if (!gloss.empty()) {
       popup = Popup::None;
       addConceptNotes(gloss, false);
       startActivityForResult(
-          std::make_unique<DictionaryDefinitionActivity>(renderer, mappedInput, std::string(word), std::move(gloss)),
+          std::make_unique<DictionaryDefinitionActivity>(renderer, mappedInput, std::move(word), std::move(gloss)),
           [this](const ActivityResult&) {
             if (direct) {
               finish();

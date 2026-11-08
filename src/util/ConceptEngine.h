@@ -76,9 +76,16 @@ std::string rankDictionarySenses(const int8_t contextVec[DIM], std::string_view 
 // Text of the best sense only (no number), or empty with fewer than two.
 std::string bestDictionarySense(const int8_t contextVec[DIM], std::string_view plainDefinition);
 
-// The Engram gloss for `word` when its slot holds exactly that span; empty
-// otherwise (absent file, empty slot, hash collision).
-std::string lookupEngramGloss(std::string_view word, const char* engramPath = ENGRAM_PATH);
+// Longest CJK compound tried as an Engram gloss key.
+constexpr size_t GLOSS_MAX_CJK_CHARS = 8;
+
+// The Engram gloss for `text`, keyed like the trainer: surrounding whitespace
+// and punctuation trimmed, lowercased unless it holds CJK. A CJK run is tried
+// as its longest prefix first, down to `minCjkChars` characters. The gloss is
+// shown only when the slot holds exactly that span's hash; empty otherwise
+// (absent file, empty slot, collision). `matchedWord` receives the key found.
+std::string lookupEngramGloss(std::string_view text, std::string* matchedWord = nullptr, size_t minCjkChars = 1,
+                              const char* engramPath = ENGRAM_PATH);
 
 // Records a page (or the passage around a lookup) in episodic.idx. A record
 // for the same book and page is replaced; past the cap the oldest is reused.

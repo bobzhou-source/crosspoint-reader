@@ -525,6 +525,78 @@ size_t bestSenseIndex(const ParsedDefinition& parsed, const int8_t context[DIM])
   return best;
 }
 
+// One code point at text[i]; a malformed byte decodes as itself, length 1.
+uint32_t decodeUtf8(const std::string_view text, const size_t i, size_t& length) {
+  const auto byte = [&](const size_t k) { return static_cast<uint8_t>(text[k]); };
+  const uint8_t lead = byte(i);
+  length = 1;
+  if (lead < 0x80) return lead;
+  const size_t need = lead >= 0xF0 && lead < 0xF8 ? 4 : lead >= 0xE0 ? 3 : lead >= 0xC0 ? 2 : 0;
+  if (need == 0 || lead >= 0xF8 || i + need > text.size()) return lead;
+  uint32_t cp = lead & (0x7F >> need);
+  for (size_t k = 1; k < need; ++k) {
+    if ((byte(i + k) & 0xC0) != 0x80) return lead;
+    cp = (cp << 6) | (byte(i + k) & 0x3F);
+  }
+  length = need;
+  return cp;
+}
+
+void appendUtf8(std::string& out, const uint32_t cp) {
+  if (cp < 0x80) {
+    out += static_cast<char>(cp);
+  } else if (cp < 0x800) {
+    out += static_cast<char>(0xC0 | (cp >> 6));
+    out += static_cast<char>(0x80 | (cp & 0x3F));
+  } else if (cp < 0x10000) {
+    out += static_cast<char>(0xE0 | (cp >> 12));
+    out += static_cast<char>(0x80 | ((cp >> 6) & 0x3F));
+    out += static_cast<char>(0x80 | (cp & 0x3F));
+  } else {
+    out += static_cast<char>(0xF0 | (cp >> 18));
+    out += static_cast<char>(0x80 | ((cp >> 12) & 0x3F));
+    out += static_cast<char>(0x80 | ((cp >> 6) & 0x3F));
+    out += static_cast<char>(0x80 | (cp & 0x3F));
+  }
+}
+
+// Whitespace and punctuation trimmed from a gloss key: ASCII non-alphanumerics,
+// Latin-1 punctuation, general punctuation, CJK/fullwidth punctuation.
+bool isGlossPunct(const uint32_t cp) {
+  if (cp < 0x80) return !((cp >= '0' && cp <= '9') || (cp >= 'A' && cp <= 'Z') || (cp >= 'a' && cp <= 'z'));
+  if (cp <= 0xBF) return cp != 0xAA && cp != 0xB2 && cp != 0xB3 && cp != 0xB5 && cp != 0xB9 && cp != 0xBA &&
+                         !(cp >= 0xBC && cp <= 0xBE);
+  if (cp >= 0x2000 && cp <= 0x206F) return true;
+  if (cp >= 0x3000 && cp <= 0x303F) return !(cp >= 0x3005 && cp <= 0x3007) && !(cp >= 0x3021 && cp <= 0x3029);
+  if (cp == 0x30FB || (cp >= 0xFE30 && cp <= 0xFE4F)) return true;
+  return (cp >= 0xFF01 && cp <= 0xFF0F) || (cp >= 0xFF1A && cp <= 0xFF20) || (cp >= 0xFF3B && cp <= 0xFF40) ||
+         (cp >= 0xFF5B && cp <= 0xFF65);
+}
+
+bool isCjk(const uint32_t cp) {
+  return (cp >= 0x2E80 && cp <= 0x9FFF) || (cp >= 0xAC00 && cp <= 0xD7AF) || (cp >= 0xF900 && cp <= 0xFAFF) ||
+         (cp >= 0xFF66 && cp <= 0xFFDC) || (cp >= 0x20000 && cp <= 0x3FFFF);
+}
+
+// Simple lowercase for Latin-1, Latin Extended-A, Greek and Cyrillic capitals.
+uint32_t lowerCodepoint(const uint32_t cp) {
+  if (cp >= 'A' && cp <= 'Z') return cp + 32;
+  if (cp < 0xC0) return cp;
+  if (cp <= 0xDE) return cp == 0xD7 ? cp : cp + 32;
+  if (cp >= 0x100 && cp <= 0x17F) {
+    if (cp == 0x130) return 'i';
+    if (cp == 0x178) return 0xFF;
+    const bool evenUpper = (cp <= 0x137) || (cp >= 0x14A && cp <= 0x177);
+    const bool oddUpper = (cp >= 0x139 && cp <= 0x148) || (cp >= 0x179 && cp <= 0x17E);
+    if ((evenUpper && cp % 2 == 0) || (oddUpper && cp % 2 == 1)) return cp + 1;
+    return cp;
+  }
+  if (cp >= 0x391 && cp <= 0x3AB && cp != 0x3A2) return cp + 32;
+  if (cp >= 0x410 && cp <= 0x42F) return cp + 32;
+  if (cp >= 0x400 && cp <= 0x40F) return cp + 80;
+  return cp;
+}
+
 }  // namespace
 
 uint64_t fnv1a64(std::string_view bytes) {
@@ -639,21 +711,66 @@ std::string rankDictionarySenses(std::string_view contextSentence, std::string_v
   return rankDictionarySenses(context, rawDefinition, marker);
 }
 
-std::string lookupEngramGloss(std::string_view word, const char* engramPath) {
+std::string lookupEngramGloss(std::string_view text, std::string* matchedWord, const size_t minCjkChars,
+                              const char* engramPath) {
+  // The trainer's key: the span without surrounding whitespace/punctuation,
+  // lowercased unless it holds CJK.
+  size_t start = 0;
+  size_t end = text.size();
+  while (start < end) {
+    size_t length;
+    if (!isGlossPunct(decodeUtf8(text, start, length))) break;
+    start += length;
+  }
+  while (end > start) {
+    size_t at = end - 1;
+    while (at > start && (static_cast<uint8_t>(text[at]) & 0xC0) == 0x80) --at;
+    size_t length;
+    if (!isGlossPunct(decodeUtf8(text, at, length)) || at + length != end) break;
+    end = at;
+  }
+  const std::string_view word = text.substr(start, end - start);
   if (word.empty()) return {};
+
+  bool cjk = false;
+  std::string lower;
+  lower.reserve(word.size());
+  size_t charEnds[GLOSS_MAX_CJK_CHARS];
+  size_t chars = 0;
+  for (size_t i = 0; i < word.size();) {
+    size_t length;
+    const uint32_t cp = decodeUtf8(word, i, length);
+    cjk = cjk || isCjk(cp);
+    const uint32_t folded = lowerCodepoint(cp);
+    if (folded == cp) {
+      lower.append(word.data() + i, length);
+    } else {
+      appendUtf8(lower, folded);
+    }
+    i += length;
+    if (chars < GLOSS_MAX_CJK_CHARS) charEnds[chars++] = i;
+  }
+
   Engram engram;
   if (!engram.open(engramPath)) return {};
-  std::string lower(word);
-  for (char& c : lower)
-    if (c >= 'A' && c <= 'Z') c = static_cast<char>(c + 32);
   std::string gloss;
-  for (const std::string_view key : {word, std::string_view(lower)}) {
+  const auto tryKey = [&](const std::string_view key) {
     const uint64_t hash = fnv1a64(key);
     uint8_t slot[ENGR_SLOT_BYTES];
-    if (hash == 0 || !engram.readSlot(hash, slot) || readU64(slot) != hash) continue;
-    const char* text = reinterpret_cast<const char*>(slot + ENGR_GLOSS_OFFSET);
-    gloss.assign(text, strnlen(text, ENGR_GLOSS_BYTES));
-    if (!gloss.empty()) break;
+    if (hash == 0 || !engram.readSlot(hash, slot) || readU64(slot) != hash) return false;
+    const char* stored = reinterpret_cast<const char*>(slot + ENGR_GLOSS_OFFSET);
+    gloss.assign(stored, strnlen(stored, ENGR_GLOSS_BYTES));
+    if (gloss.empty()) return false;
+    if (matchedWord) matchedWord->assign(key);
+    return true;
+  };
+  if (!cjk) {
+    tryKey(lower);
+  } else {
+    // A CJK run has no spaces: the longest compound from its start wins.
+    for (size_t n = chars; n >= std::max<size_t>(minCjkChars, 1); --n) {
+      if (tryKey(word.substr(0, charEnds[n - 1]))) break;
+    }
   }
   engram.file.close();
   return gloss;
