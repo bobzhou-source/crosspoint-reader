@@ -2,6 +2,8 @@
 
 #include <stdint.h>
 
+#include <new>
+
 // Smooth scaling and error diffusion for exact-size dithered decodes (the
 // full-screen picture viewer and inline page pictures): a box filter when
 // shrinking, centre-aligned bilinear when enlarging, then Sierra-2-4A error
@@ -78,14 +80,18 @@ inline uint8_t diffuse(const int gray, int16_t* down, const int x, const bool sp
   return static_cast<uint8_t>(level);
 }
 
-// LiquidRefresh CfC v2 dither head. The reader installs a provider (its
-// refresh policy's y1/y2 readouts) while it is open; without one every decode
-// keeps gain 1.0 and full diffusion.
+// LiquidDisplay CfC dither head. The reader installs a provider (its refresh
+// policy's y1/y2/y3 readouts) while it is open; without one every decode keeps
+// gain 1.0, full diffusion, no unsharp mask and the default paper-white snap.
 struct DitherParams {
   uint16_t contrastGainQ8 = 256;  // mid-gray S-curve opening, 256 = 1.0x
   uint16_t errorBleedQ8 = 256;    // share of the diffusion error passed on
+  uint16_t unsharpGainQ8 = 0;     // high-pass boost against the local mean, 256 = 1.0x
+  uint8_t whiteClip = 252;        // source gray >= whiteClip is paper white
 };
-using DitherProvider = DitherParams (*)(void* context, uint16_t edgePermille, uint16_t midGrayPermille);
+// upscalePermille: output/source size of the decode, 1000 = 1:1.
+using DitherProvider = DitherParams (*)(void* context, uint16_t edgePermille, uint16_t midGrayPermille,
+                                        uint16_t upscalePermille);
 inline DitherProvider ditherProvider = nullptr;
 inline void* ditherProviderContext = nullptr;
 inline void setDitherProvider(const DitherProvider provider, void* const context) {
@@ -97,34 +103,78 @@ inline void setDitherProvider(const DitherProvider provider, void* const context
 inline uint16_t lastEdgePermille = 60;
 inline uint16_t lastMidGrayPermille = 400;
 
+// Output/source size in permille (1000 = 1:1), saturating.
+inline uint16_t upscalePermille(const int dst, const int src) {
+  if (dst <= 0 || src <= 0) return 1000;
+  const int64_t p = static_cast<int64_t>(dst) * 1000 / src;
+  return static_cast<uint16_t>(p > 0xFFFF ? 0xFFFF : p);
+}
+
 // Per-decode: counts strong horizontal transitions (|dGray| >= kEdgeStep)
 // and mid-gray pixels (64..191) of the source grays, re-asks the provider
-// every kRequeryPixels, and applies the contrast gain before diffusion.
+// every kRequeryPixels, and shapes each gray before diffusion: snap to paper
+// white at whiteClip, the contrast S-curve, then an unsharp mask against the
+// causal local mean (two left neighbours in the span and the pixel above,
+// when `width` columns of row memory could be had).
 class DitherShaper {
  public:
   static constexpr int kEdgeStep = 40;
   static constexpr uint32_t kRequeryPixels = 4096;
 
-  DitherShaper() { query(lastEdgePermille, lastMidGrayPermille); }
+  explicit DitherShaper(const int width = 0, const uint16_t upscale = 1000) : upscale_(upscale) {
+    if (width > 0) {
+      above_ = new (std::nothrow) int16_t[width];
+      if (above_) {
+        width_ = width;
+        for (int i = 0; i < width; ++i) above_[i] = -1;
+      }
+    }
+    query(lastEdgePermille, lastMidGrayPermille);
+  }
   ~DitherShaper() {
     if (pixels_ >= kRequeryPixels) {
       lastEdgePermille = edgePermille();
       lastMidGrayPermille = midGrayPermille();
     }
+    delete[] above_;
   }
   DitherShaper(const DitherShaper&) = delete;
   DitherShaper& operator=(const DitherShaper&) = delete;
 
-  // The gray to diffuse for source gray `gray`; spanStart: no left neighbour.
-  int shape(const int gray, const bool spanStart) {
+  // The gray to diffuse for source gray `gray` at output column x (-1:
+  // unknown, no pixel above); spanStart: no left neighbour.
+  int shape(const int gray, const bool spanStart, const int x = -1) {
     if (!spanStart && prev_ >= 0 && (gray - prev_ >= kEdgeStep || prev_ - gray >= kEdgeStep)) ++edges_;
     prev_ = gray;
     if (gray >= 64 && gray <= 191) ++mid_;
     ++pixels_;
     if (++sinceQuery_ >= kRequeryPixels) query(edgePermille(), midGrayPermille());
-    if (params_.contrastGainQ8 == 256) return gray;
-    const int v = 128 + (((gray - 128) * static_cast<int>(params_.contrastGainQ8)) >> 8);
-    return v < 0 ? 0 : v > 255 ? 255 : v;
+    if (spanStart) left1_ = left2_ = -1;
+    int16_t* const above = above_ && x >= 0 && x < width_ ? &above_[x] : nullptr;
+
+    int v;
+    if (gray >= params_.whiteClip) {
+      v = 255;  // paper white: no pepper of level-2 dots in the background
+    } else if (params_.contrastGainQ8 == 256) {
+      v = gray;
+    } else {
+      v = 128 + (((gray - 128) * static_cast<int>(params_.contrastGainQ8)) >> 8);
+      v = v < 0 ? 0 : v > 255 ? 255 : v;
+    }
+    int out = v;
+    if (params_.unsharpGainQ8 != 0 && v != 255) {
+      int sum = v;
+      int n = 1;
+      if (left1_ >= 0) sum += left1_, ++n;
+      if (left2_ >= 0) sum += left2_, ++n;
+      if (above && *above >= 0) sum += *above, ++n;
+      out = v + (v - sum / n) * static_cast<int>(params_.unsharpGainQ8) / 256;
+      out = out < 0 ? 0 : out > 255 ? 255 : out;
+    }
+    left2_ = left1_;
+    left1_ = static_cast<int16_t>(v);
+    if (above) *above = static_cast<int16_t>(v);
+    return out;
   }
   int bleedQ8() const { return params_.errorBleedQ8; }
   const DitherParams& params() const { return params_; }
@@ -134,15 +184,20 @@ class DitherShaper {
  private:
   void query(const uint16_t edge, const uint16_t mid) {
     sinceQuery_ = 0;
-    if (ditherProvider) params_ = ditherProvider(ditherProviderContext, edge, mid);
+    if (ditherProvider) params_ = ditherProvider(ditherProviderContext, edge, mid, upscale_);
   }
 
   DitherParams params_{};
+  int16_t* above_ = nullptr;  // shaped (pre-unsharp) gray of the row above, by column; -1 none yet
+  int width_ = 0;
   uint32_t pixels_ = 0;
   uint32_t edges_ = 0;
   uint32_t mid_ = 0;
   uint32_t sinceQuery_ = 0;
+  uint16_t upscale_;
   int prev_ = -1;
+  int16_t left1_ = -1;
+  int16_t left2_ = -1;
 };
 
 }  // namespace smooth_resample

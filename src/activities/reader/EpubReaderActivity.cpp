@@ -482,7 +482,8 @@ bool EpubReaderActivity::openPictureViewer(const size_t index) {
     return false;
   }
   block.ensureExtracted();
-  auto viewer = makeUniqueNoThrow<EpubPictureViewerActivity>(renderer, mappedInput, block.getImagePath());
+  auto viewer =
+      makeUniqueNoThrow<EpubPictureViewerActivity>(renderer, mappedInput, block.getImagePath(), rotationAdvisor());
   if (!viewer) {
     LOG_ERR("ERS", "OOM: picture viewer");
     return false;

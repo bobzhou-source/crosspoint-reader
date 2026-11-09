@@ -56,7 +56,7 @@ struct PngContext {
   int32_t invScaleY{0};
   uint8_t* smoothRow{nullptr};
   uint8_t* smoothPrev{nullptr};
-  smooth_resample::DitherShaper* shaper{nullptr};  // CfC v2 dither head, set with smoothSum
+  smooth_resample::DitherShaper* shaper{nullptr};  // LiquidDisplay dither head, set with smoothSum
   uint32_t* smoothSum{nullptr};
   int16_t* smoothDown{nullptr};
   int smoothRows{0};
@@ -258,8 +258,8 @@ void emitSmoothRow(PngContext* ctx, const int dstY, Value&& value) {
   int carry = 0;
   for (int dstX = 0; dstX < ctx->dstWidth; dstX++) {
     const bool spanStart = dstX == 0;
-    const uint8_t level = smooth_resample::diffuse(ctx->shaper->shape(value(dstX), spanStart), ctx->smoothDown, dstX,
-                                                   spanStart, carry, ctx->shaper->bleedQ8());
+    const uint8_t level = smooth_resample::diffuse(ctx->shaper->shape(value(dstX), spanStart, dstX), ctx->smoothDown,
+                                                   dstX, spanStart, carry, ctx->shaper->bleedQ8());
     const int outX = ctx->config->x + dstX;
     if (outX >= ctx->screenWidth) continue;
     pw.writePixel(outX, level);
@@ -551,7 +551,7 @@ bool PngToFramebufferConverter::decodeToFramebuffer(const std::string& imagePath
       ctx.smoothDown = reinterpret_cast<int16_t*>(ctx.smoothSum + ctx.dstWidth);
       ctx.smoothRow = reinterpret_cast<uint8_t*>(ctx.smoothDown + ctx.dstWidth);
       ctx.smoothPrev = ctx.smoothRow + ctx.dstWidth;
-      ctx.shaper = &shaper.emplace();
+      ctx.shaper = &shaper.emplace(ctx.dstWidth, smooth_resample::upscalePermille(ctx.dstWidth, ctx.visibleWidth));
     }
   }
 

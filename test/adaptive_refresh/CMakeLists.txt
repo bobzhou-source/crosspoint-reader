@@ -7,6 +7,7 @@ add_executable(AdaptiveRefreshPolicyTest
 
 target_include_directories(AdaptiveRefreshPolicyTest PRIVATE
   ${REPO_ROOT}/lib/AdaptiveRefresh
+  ${REPO_ROOT}/lib/Epub/Epub/converters
   ${REPO_ROOT}/freeink-sdk/libs/display/FreeInkDisplay/include
   ${REPO_ROOT}/.pio/libdeps/x4pro-gh_release/ArduinoJson/src
 )

@@ -19,6 +19,7 @@
 #include "DictionaryRegistry.h"
 #include "DictionaryRouter.h"
 #include "StringUtils.h"
+#include "src/activities/reader/DictionaryLookupSections.h"
 #include "src/activities/reader/DictionaryPageWords.h"
 #include "src/activities/reader/ReaderTouchZones.h"
 
@@ -575,6 +576,119 @@ TEST(ReaderTouchZonesTest, BlankSpaceAndNoDictionary) {
   EXPECT_EQ(ReaderTouchZones::holdAction(Zone::None, false, false, false), HoldAction::None);
   EXPECT_EQ(ReaderTouchZones::holdAction(Zone::None, false, true, false), HoldAction::NoDictionary);
   EXPECT_EQ(ReaderTouchZones::holdAction(Zone::Next, true, true, false), HoldAction::None);
+}
+
+// ---- Lookup popup sections: tabs, Compact / Longer, layout --------------------------------
+
+using DictionaryLookup::LineKind;
+using DictionaryLookup::LookupSections;
+using DictionaryLookup::Section;
+
+LookupSections fullSections() {
+  LookupSections s;
+  s.defShort = "1. a sense";
+  s.defLong = "1. a sense\n2. another sense";
+  s.storyShort = "Xiao Yan — clashed over the pact";
+  s.storyLong = "Xiao Yan\n• Ch.1: [origin] introduced\n• Ch.3: [arc] clashed over the pact";
+  s.relatedShort = "Moby Dick p.12 — “the whale…”";
+  s.relatedLong = "• Moby Dick p.12\n“the whale breached beside the boat”";
+  s.riffShort = "Winston weighs loyalty";
+  s.riffLong = "Winston: weighs loyalty. In context: a cost. The tension: a choice.";
+  return s;
+}
+
+TEST(DictionaryLookupSectionsTest, TabsCycleAndSkipEmptySections) {
+  LookupSections s = fullSections();
+  EXPECT_TRUE(s.hasExtras());
+  EXPECT_EQ(DictionaryLookup::nextSection(s, Section::All, 1), Section::Def);
+  EXPECT_EQ(DictionaryLookup::nextSection(s, Section::Riff, 1), Section::All);
+  EXPECT_EQ(DictionaryLookup::nextSection(s, Section::All, -1), Section::Riff);
+  EXPECT_EQ(DictionaryLookup::nextSection(s, Section::Def, -1), Section::All);
+
+  s.storyShort.clear();
+  s.storyLong.clear();
+  s.relatedShort.clear();
+  EXPECT_TRUE(s.has(Section::Related));  // the longer form alone still counts
+  s.relatedLong.clear();
+  EXPECT_EQ(DictionaryLookup::nextSection(s, Section::Def, 1), Section::Riff);
+  EXPECT_EQ(DictionaryLookup::nextSection(s, Section::Riff, -1), Section::Def);
+  EXPECT_TRUE(s.hasExtras());
+
+  s.riffShort.clear();
+  s.riffLong.clear();
+  EXPECT_FALSE(s.hasExtras());  // a definition alone keeps the plain view
+  s.defShort.clear();
+  s.defLong.clear();
+  EXPECT_EQ(DictionaryLookup::nextSection(s, Section::All, 1), Section::All);
+  EXPECT_TRUE(s.has(Section::All));
+
+  EXPECT_STREQ(DictionaryLookup::sectionLabel(Section::Related), "Related");
+  EXPECT_STREQ(DictionaryLookup::sectionHeader(Section::Story), "STORY SO FAR");
+}
+
+TEST(DictionaryLookupSectionsTest, LongerFallsBackToCompactAndBack) {
+  LookupSections s = fullSections();
+  EXPECT_EQ(s.text(Section::Story, false), s.storyShort);
+  EXPECT_EQ(s.text(Section::Story, true), s.storyLong);
+  EXPECT_EQ(s.text(Section::All, true), "");
+  s.riffLong.clear();
+  EXPECT_EQ(s.text(Section::Riff, true), "Winston weighs loyalty");
+  s.defShort.clear();
+  EXPECT_EQ(s.text(Section::Def, false), s.defLong);
+}
+
+TEST(DictionaryLookupSectionsTest, ComposesHeadedSectionsWithOffsets) {
+  LookupSections s = fullSections();
+  s.relatedShort.clear();
+  s.relatedLong.clear();
+  std::vector<uint32_t> offsets = {99};
+  const std::string all = DictionaryLookup::composeSections(s, Section::All, false, offsets);
+  EXPECT_EQ(all,
+            "DEFINITION\n1. a sense\n\nSTORY SO FAR\nXiao Yan — clashed over the pact\n\nMARGIN RIFF\nWinston weighs "
+            "loyalty");
+  ASSERT_EQ(offsets.size(), 3u);
+  EXPECT_EQ(all.compare(offsets[0], 10, "DEFINITION"), 0);
+  EXPECT_EQ(all.compare(offsets[1], 12, "STORY SO FAR"), 0);
+  EXPECT_EQ(all.compare(offsets[2], 11, "MARGIN RIFF"), 0);
+
+  const std::string story = DictionaryLookup::composeSections(s, Section::Story, true, offsets);
+  EXPECT_EQ(story, "STORY SO FAR\n" + s.storyLong);
+  EXPECT_EQ(offsets, std::vector<uint32_t>{0});
+  EXPECT_GT(DictionaryLookup::composeSections(s, Section::All, true, offsets).size(), all.size());
+
+  EXPECT_EQ(DictionaryLookup::composeSections(s, Section::Related, true, offsets), "");
+  EXPECT_TRUE(offsets.empty());
+}
+
+TEST(DictionaryLookupSectionsTest, CompactDefinitionKeepsLeadingLines) {
+  EXPECT_EQ(DictionaryLookup::compactDefinition("one\ntwo\n"), "one\ntwo");
+  EXPECT_EQ(DictionaryLookup::compactDefinition("a\nb\nc\nd", 2), "a\nb\n...");
+  EXPECT_EQ(DictionaryLookup::compactDefinition("short\n" + std::string(600, 'x'), 6, 480), "short\n...");
+  // A late space is a word boundary; an early one is not worth the loss.
+  const std::string late = std::string(100, 'y') + " tail end of a very long first line";
+  EXPECT_EQ(DictionaryLookup::compactDefinition(late, 6, 120), std::string(100, 'y') + " tail end of a very...");
+  const std::string early = "word " + std::string(200, 'y');
+  EXPECT_EQ(DictionaryLookup::compactDefinition(early, 6, 120), "word " + std::string(115, 'y') + "...");
+  std::string cjk;
+  for (int i = 0; i < 50; ++i) cjk += "義";
+  const std::string cjkCut = DictionaryLookup::compactDefinition(cjk, 6, 40);
+  EXPECT_EQ(cjkCut, cjk.substr(0, 39) + "...");
+}
+
+TEST(DictionaryLookupSectionsTest, PagesNeverEndOnAHeaderOrStartBlank) {
+  using K = LineKind;
+  // H T T B H T T T B H T
+  const std::vector<K> kinds = {K::Header, K::Text, K::Text,  K::Blank, K::Header, K::Text,
+                                K::Text,   K::Text, K::Blank, K::Header, K::Text};
+  // Four lines a page: page 1 would end "B" after two texts; page 2 starts at
+  // the header, not the blank; the last header moves with its text.
+  EXPECT_EQ(DictionaryLookup::paginateLines(kinds, 4), (std::vector<uint32_t>{0, 4, 9}));
+  EXPECT_EQ(DictionaryLookup::paginateLines(kinds, 5), (std::vector<uint32_t>{0, 4, 9}));
+  EXPECT_EQ(DictionaryLookup::paginateLines(kinds, 100), std::vector<uint32_t>{0});
+  EXPECT_EQ(DictionaryLookup::paginateLines({}, 4), std::vector<uint32_t>{0});
+  // A page that is all header still advances.
+  EXPECT_EQ(DictionaryLookup::paginateLines({K::Header, K::Header, K::Text}, 1), (std::vector<uint32_t>{0, 1, 2}));
+  EXPECT_EQ(DictionaryLookup::paginateLines({K::Text, K::Text, K::Text}, 0), (std::vector<uint32_t>{0, 1, 2}));
 }
 
 }  // namespace

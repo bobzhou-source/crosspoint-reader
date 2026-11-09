@@ -9,6 +9,7 @@
 #include <algorithm>
 #include <climits>
 #include <cstdlib>
+#include <cstring>
 #include <string_view>
 
 #include "CrossPointSettings.h"
@@ -35,6 +36,11 @@ constexpr int CONTEXT_WORDS = 8;
 constexpr int EPISODE_WORDS = 24;
 // "Story: ..." refreshers are a few dozen words.
 constexpr size_t STORY_BYTES = 512;
+
+// `text` without a leading `prefix`.
+std::string withoutPrefix(const std::string& text, const std::string_view prefix) {
+  return text.compare(0, prefix.size(), prefix) == 0 ? text.substr(prefix.size()) : text;
+}
 
 std::string escapeHtml(std::string_view text) {
   std::string out;
@@ -183,17 +189,20 @@ void DictionaryWordSelectActivity::performLookup() {
     popup = Popup::None;
     Dictionary& dict = router.dictionary();
     const char* shown = usedPrevious ? previous : run;
-    addConceptNotes(definition, dict.definitionsAreHtml(), weaveStory(storyWord), headword);
-    startActivityForResult(std::make_unique<DictionaryDefinitionActivity>(
-                               renderer, mappedInput, std::move(headword), std::move(definition),
-                               dict.definitionsAreHtml(), run[0] ? &dict : nullptr, shown, matchMask),
-                           [this](const ActivityResult&) {
-                             if (direct) {
-                               finish();
-                             } else {
-                               requestUpdate();
-                             }
-                           });
+    const std::string story = weaveStory(storyWord);
+    auto sections =
+        addConceptNotes(definition, dict.definitionsAreHtml(), story, weaveTimeline(storyWord), headword, storyWord);
+    auto activity = std::make_unique<DictionaryDefinitionActivity>(renderer, mappedInput, std::move(headword),
+                                                                   std::move(definition), dict.definitionsAreHtml(),
+                                                                   run[0] ? &dict : nullptr, shown, matchMask);
+    activity->setSections(std::move(sections));
+    startActivityForResult(std::move(activity), [this](const ActivityResult&) {
+      if (direct) {
+        finish();
+      } else {
+        requestUpdate();
+      }
+    });
     return;
   }
   // No dictionary knows the word: a character, place or concept of the story
@@ -212,17 +221,18 @@ void DictionaryWordSelectActivity::performLookup() {
     }
     if (!story.empty() || !note.empty()) {
       popup = Popup::None;
-      // The refresher goes in as a note, not as text to sense-rank.
-      addConceptNotes(note, false, story, shownWord);
-      startActivityForResult(
-          std::make_unique<DictionaryDefinitionActivity>(renderer, mappedInput, std::move(shownWord), std::move(note)),
-          [this](const ActivityResult&) {
-            if (direct) {
-              finish();
-            } else {
-              requestUpdate();
-            }
-          });
+      // The refresher goes in as its section, not as text to sense-rank.
+      auto sections = addConceptNotes(note, false, story, weaveTimeline(storyWord), shownWord, storyWord);
+      auto activity =
+          std::make_unique<DictionaryDefinitionActivity>(renderer, mappedInput, std::move(shownWord), std::move(note));
+      activity->setSections(std::move(sections));
+      startActivityForResult(std::move(activity), [this](const ActivityResult&) {
+        if (direct) {
+          finish();
+        } else {
+          requestUpdate();
+        }
+      });
       return;
     }
   }
@@ -331,13 +341,31 @@ std::string DictionaryWordSelectActivity::weaveStory(std::string& matched) const
   return {};
 }
 
+std::string DictionaryWordSelectActivity::weaveTimeline(const std::string& matched) const {
+  std::string timeline;
+  if (matched.empty() || !hasReadingPosition) return timeline;
+  timeline.resize(ConceptEngine::STORY_EXTENDED_BYTES);
+  if (ConceptEngine::weaveExtendedRefresher(matched.data(), matched.size(), APP_STATE.openEpubPath.c_str(), storyCutoff,
+                                            timeline.data(), timeline.size())) {
+    timeline.resize(strlen(timeline.c_str()));
+  } else {
+    timeline.clear();
+  }
+  return timeline;
+}
+
 // Concept-engine extras for a definition about to be shown: the sense that
-// fits the passage marked at the top, the story refresher (if any), a
-// "Related:" echo of the closest page read before (or Inbox item) at cosine
-// >= 0.65, a PE-Writer "Riff:" on `subject` (also saved to the margin notes
-// file), and this passage recorded for later echoes.
-void DictionaryWordSelectActivity::addConceptNotes(std::string& definition, const bool html, const std::string& story,
-                                                   const std::string& subject) {
+// fits the passage marked at the top, then the sections beside it: the story
+// refresher and its timeline (if any); "Related" passages (pages read before,
+// Inbox items at cosine >= 0.65, and revealed story scenes and echoes) with
+// their excerpts; a PE-Writer riff on `subject` and its three-sentence
+// version (the short one is also saved to the margin notes file). The
+// passage is recorded for later echoes.
+DictionaryLookup::LookupSections DictionaryWordSelectActivity::addConceptNotes(std::string& definition, const bool html,
+                                                                               const std::string& story,
+                                                                               std::string storyLong,
+                                                                               const std::string& subject,
+                                                                               const std::string& storyWord) {
   const std::string context = contextAround(CONTEXT_WORDS);
   int8_t contextVec[ConceptEngine::DIM];
   ConceptEngine::encodeText(context, contextVec);
@@ -349,37 +377,33 @@ void DictionaryWordSelectActivity::addConceptNotes(std::string& definition, cons
   } else {
     definition = ConceptEngine::rankDictionarySenses(contextVec, definition, marker);
   }
-  const auto appendNote = [&](const std::string& line) {
-    if (html) {
-      definition += "<p>" + escapeHtml(line) + "</p>";
-    } else {
-      definition += definition.empty() ? line : "\n\n" + line;
-    }
-  };
-  if (!story.empty()) appendNote(story);
+  DictionaryLookup::LookupSections sections;
+  sections.storyShort = withoutPrefix(story, "Story: ");
+  sections.storyLong = std::move(storyLong);
 
   const std::string& bookPath = APP_STATE.openEpubPath;
   const uint64_t book = ConceptEngine::fnv1a64(bookPath);
   // A story refresher already ties the word to this book: only the small
   // episodic index is worth a scan then, not the Inbox shelf.
-  const auto matches = ConceptEngine::queryEpisodicAndShelf(contextVec, 4, story.empty());
-  const ConceptEngine::Match* related = nullptr;
-  for (const auto& match : matches) {
+  auto matches = ConceptEngine::queryEpisodicAndShelf(contextVec, ConceptEngine::RELATED_EXTENDED_ITEMS, story.empty());
+  std::vector<ConceptEngine::Match> related;
+  for (auto& match : matches) {
     if (match.dot < ConceptEngine::RELATED_MIN_DOT) break;
     if (match.pathHash == book && (match.shelf || !hasReadingPosition || match.page == readingPosition)) continue;
-    appendNote("Related: " + ConceptEngine::describeMatch(match));
-    related = &match;
-    break;
+    related.push_back(std::move(match));
   }
 
-  // The riff reads the passage, the echo (if any) and the story role; no
-  // pe-writer.bin / writer-clauses.bin on the card means no riff.
+  // The riff reads the passage, the closest echo (if any) and the story role;
+  // no pe-writer.bin / writer-clauses.bin on the card means no riff.
   std::string riff;
+  std::string riffLong;
   const std::string subjectField = writerField(subject);
-  if (ConceptEngine::generateMarginRiff(ConceptEngine::MODELS_DIR, contextVec, related ? related->vec : nullptr,
-                                        subjectField.c_str(), storyRole(story).c_str(),
-                                        related ? writerField(related->label).c_str() : "", riff)) {
-    appendNote("Riff: " + riff);
+  const ConceptEngine::Match* echo = related.empty() ? nullptr : &related.front();
+  const std::string echoTitle = echo ? writerField(echo->label) : std::string();
+  ConceptEngine::generateExtendedMarginRiff(ConceptEngine::MODELS_DIR, contextVec, echo ? echo->vec : nullptr,
+                                            subjectField.c_str(), storyRole(story).c_str(), echoTitle.c_str(), riffLong,
+                                            &riff);
+  if (!riff.empty()) {
     ConceptEngine::Match at;
     at.label = bookTitle;
     if (at.label.empty()) {
@@ -390,9 +414,25 @@ void DictionaryWordSelectActivity::addConceptNotes(std::string& definition, cons
     const std::string where = hasReadingPosition ? ConceptEngine::describeMatch(at) : at.label;
     ConceptEngine::appendMarginNote(where + " \xE2\x80\x94 " + subjectField + ": " + riff);
   }
+  sections.riffShort = std::move(riff);
+  sections.riffLong = std::move(riffLong);
+
+  // Revealed scenes of this book join the pages read before, best first (the
+  // word's own cross-book echo is pinned on top).
+  if (hasReadingPosition && !bookPath.empty()) {
+    auto scenes = ConceptEngine::queryStoryEchoes(contextVec, bookPath.c_str(), storyCutoff, storyWord);
+    for (auto& scene : scenes) related.push_back(std::move(scene));
+    std::stable_sort(related.begin(), related.end(),
+                     [](const ConceptEngine::Match& a, const ConceptEngine::Match& b) { return a.dot > b.dot; });
+  }
+  sections.relatedShort = ConceptEngine::formatRelatedNotes(related, false);
+  sections.relatedLong = ConceptEngine::formatRelatedNotes(related, true);
+  if (sections.relatedLong == sections.relatedShort) sections.relatedLong.clear();
+
   if (hasReadingPosition && !bookPath.empty()) {
     ConceptEngine::appendEpisodicPage(bookPath, readingPosition, contextAround(EPISODE_WORDS));
   }
+  return sections;
 }
 
 void DictionaryWordSelectActivity::loop() {

@@ -6,6 +6,7 @@
 #include <string>
 #include <vector>
 
+#include "DictionaryLookupSections.h"
 #include "DictionaryPageWords.h"
 #include "ReaderWordPage.h"
 #include "activities/Activity.h"
@@ -73,7 +74,14 @@ class DictionaryWordSelectActivity final : public Activity {
   void drawHints() const;
   std::string contextAround(int radius) const;
   std::string weaveStory(std::string& matched) const;
-  void addConceptNotes(std::string& definition, bool html, const std::string& story, const std::string& subject);
+  // The longer story timeline for `matched` (a word weaveStory found), or
+  // empty.
+  std::string weaveTimeline(const std::string& matched) const;
+  // Ranks `definition`'s senses for the passage and returns the Story,
+  // Related and Riff sections for it (`storyWord`: the story-graph word).
+  DictionaryLookup::LookupSections addConceptNotes(std::string& definition, bool html, const std::string& story,
+                                                   std::string storyLong, const std::string& subject,
+                                                   const std::string& storyWord);
 
   std::unique_ptr<ReaderWordPage> page;
   const int marginLeft;

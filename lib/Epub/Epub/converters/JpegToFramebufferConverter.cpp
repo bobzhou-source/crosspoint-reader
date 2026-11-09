@@ -55,7 +55,7 @@ struct JpegContext {
   int16_t* diffusionDown{nullptr};
   int16_t* diffusionCarry{nullptr};
   int diffusionCarryRows{0};
-  // CfC v2 dither head (contrast gain, error bleed) for the smooth path.
+  // LiquidDisplay dither head (contrast, bleed, unsharp, paper white) for the smooth path.
   smooth_resample::DitherShaper* shaper{nullptr};
 
   uint32_t lastYieldMs{0};  // throttle state for yieldDuringDecode()
@@ -222,8 +222,8 @@ int jpegDrawCallback(JPEGDRAW* pDraw) {
         });
         const int outX = cfgX + dstX;
         const bool spanStart = dstX == dstXStart;
-        const uint8_t level = smooth_resample::diffuse(ctx->shaper->shape(gray, spanStart), ctx->diffusionDown, dstX,
-                                                       spanStart, carry, ctx->shaper->bleedQ8());
+        const uint8_t level = smooth_resample::diffuse(ctx->shaper->shape(gray, spanStart, dstX), ctx->diffusionDown,
+                                                       dstX, spanStart, carry, ctx->shaper->bleedQ8());
         pw.writePixel(outX, level);
         if (caching) cw.writePixel(outX, level);
       }
@@ -542,7 +542,7 @@ bool JpegToFramebufferConverter::decodeToFramebuffer(const std::string& imagePat
       ctx.diffusionDown = diffusion.get();
       ctx.diffusionCarry = ctx.diffusionDown + destWidth;
       ctx.diffusionCarryRows = maxBlockDstRows;
-      ctx.shaper = &shaper.emplace();
+      ctx.shaper = &shaper.emplace(destWidth, smooth_resample::upscalePermille(destWidth, srcWidth));
     }
   }
 

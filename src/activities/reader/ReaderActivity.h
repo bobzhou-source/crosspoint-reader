@@ -1,6 +1,7 @@
 #pragma once
 
 #include <AdaptiveRefreshPolicy.h>
+#include <Epub/PagePicture.h>
 #include <Epub/converters/SmoothResample.h>
 
 #include <atomic>
@@ -25,10 +26,14 @@ class ReaderActivity : public Activity {
   // one) and restarts that clock; the refresh policy relaxes ghosting debt over
   // it. Call once per page frame, right before deciding its refresh.
   uint32_t takeFrameDwellMs();
-  // smooth_resample::DitherProvider: this policy's CfC dither head.
-  static smooth_resample::DitherParams ditherFor(void* context, uint16_t edgePermille, uint16_t midGrayPermille);
+  // smooth_resample::DitherProvider: this policy's LiquidDisplay dither head (y1-y3).
+  static smooth_resample::DitherParams ditherFor(void* context, uint16_t edgePermille, uint16_t midGrayPermille,
+                                                 uint16_t upscalePermille);
+  // The picture viewer's page_picture::RotationAdvisor: this policy's
+  // orientation head (y4). A taught turn is saved like a manual refresh.
+  page_picture::RotationAdvisor rotationAdvisor() { return {&recommendRotation, &recordRotation, this}; }
   // Main task, from loop(): writes liquid-refresh.bin when a manual refresh
-  // taught the refresh policy since the last save.
+  // or picture turn taught the refresh policy since the last save.
   void saveLearnedRefresh();
 
   std::unique_ptr<EndOfBookOptions> endOfBookOptions;
@@ -137,9 +142,14 @@ class ReaderActivity : public Activity {
   bool benchmarkFinished = false;
 
   static void recordClear(void* context, const AdaptiveRefreshPolicy::ClearRecord& record);
+  // rotationAdvisor()'s members; render lock held by the viewer.
+  static bool recommendRotation(void* context, uint16_t sourceWidth, uint16_t sourceHeight, uint16_t viewWidth,
+                                uint16_t viewHeight, uint16_t edgePermille, uint16_t midGrayPermille);
+  static void recordRotation(void* context, uint16_t sourceWidth, uint16_t sourceHeight, uint16_t viewWidth,
+                             uint16_t viewHeight, bool rotated, uint16_t edgePermille, uint16_t midGrayPermille);
   // Page frames: the dwell clock behind takeFrameDwellMs().
   uint32_t lastFrameMs = 0;
   bool lastFrameShown = false;
-  // A manual refresh taught the policy; saveLearnedRefresh() writes it.
+  // A manual refresh or picture turn taught the policy; saveLearnedRefresh() writes it.
   std::atomic<bool> learnedRefreshDirty{false};
 };

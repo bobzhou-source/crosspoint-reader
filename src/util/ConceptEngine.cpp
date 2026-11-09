@@ -1442,7 +1442,69 @@ std::string lookupEngramGloss(std::string_view word, const char* engramPath) {
   return gloss;
 }
 
-bool appendEpisodicVector(std::string_view bookPath, const uint32_t pageIndex, const int8_t vec[DIM]) {
+namespace {
+
+// ---- episodic.exc excerpt sidecar ----------------------------------------------
+constexpr size_t EXC_SLOT_BYTES = 176;
+constexpr size_t EXC_TEXT_OFFSET = 16;
+constexpr size_t EXC_TEXT_BYTES = 160;
+static_assert(EXCERPT_BYTES < EXC_TEXT_BYTES, "excerpt fits its slot with a NUL");
+
+std::string excerptPath() {
+  std::string path(paths.episodic ? paths.episodic : "");
+  if (path.empty()) return path;
+  if (path.size() >= 4 && path.compare(path.size() - 4, 4, ".idx") == 0) path.resize(path.size() - 4);
+  return path + ".exc";
+}
+
+// Writes the sidecar slot of episodic record `index`. The file is padded with
+// empty slots up to it (storage cannot seek past the end).
+bool writeExcerptSlot(const uint32_t index, const uint64_t pathHash, const uint32_t page, std::string_view excerpt) {
+  const std::string path = excerptPath();
+  if (path.empty()) return false;
+  HalFile file = Storage.open(path.c_str(), O_RDWR | O_CREAT);
+  if (!file) return false;
+  uint8_t slot[EXC_SLOT_BYTES] = {};
+  const size_t at = static_cast<size_t>(index) * EXC_SLOT_BYTES;
+  size_t size = file.fileSize() / EXC_SLOT_BYTES * EXC_SLOT_BYTES;
+  bool ok = true;
+  if (size < at) {
+    ok = file.seekSet(size);
+    for (; ok && size < at; size += EXC_SLOT_BYTES) ok = file.write(slot, sizeof(slot)) == sizeof(slot);
+  }
+  memcpy(slot, &pathHash, sizeof(pathHash));
+  memcpy(slot + 8, &page, sizeof(page));
+  const std::string_view text = utf8Prefix(excerpt, EXC_TEXT_BYTES - 1);
+  memcpy(slot + EXC_TEXT_OFFSET, text.data(), text.size());
+  ok = ok && file.seekSet(at) && file.write(slot, sizeof(slot)) == sizeof(slot);
+  file.close();
+  return ok;
+}
+
+// Fills the excerpt of every episodic match whose sidecar slot still belongs
+// to its record (same path hash and page).
+void attachExcerpts(std::vector<Match>& matches) {
+  const bool any = std::any_of(matches.begin(), matches.end(), [](const Match& m) { return !m.shelf && !m.story; });
+  const std::string path = any ? excerptPath() : std::string();
+  if (path.empty() || !Storage.exists(path.c_str())) return;
+  HalFile file;
+  if (!Storage.openFileForRead("CPT", path, file)) return;
+  uint8_t slot[EXC_SLOT_BYTES];
+  for (Match& match : matches) {
+    if (match.shelf || match.story) continue;
+    if (!file.seekSet(static_cast<size_t>(match.index) * EXC_SLOT_BYTES) ||
+        file.read(slot, sizeof(slot)) != static_cast<int>(sizeof(slot))) {
+      continue;
+    }
+    if (readU64(slot) != match.pathHash || readU32(slot + 8) != match.page) continue;
+    match.excerpt.assign(fixedText(slot + EXC_TEXT_OFFSET, EXC_TEXT_BYTES));
+  }
+  file.close();
+}
+
+// appendEpisodicVector, plus the sidecar excerpt when `excerpt` is not empty.
+bool appendEpisodic(std::string_view bookPath, const uint32_t pageIndex, const int8_t vec[DIM],
+                    std::string_view excerpt) {
   if (bookPath.empty()) return false;
   HalFile file = Storage.open(paths.episodic, O_RDWR | O_CREAT);
   if (!file) return false;
@@ -1492,29 +1554,80 @@ bool appendEpisodicVector(std::string_view bookPath, const uint32_t pageIndex, c
     written = file.seekSet(8) && file.write(&newCount, sizeof(newCount)) == sizeof(newCount);
   }
   file.close();
+  if (written && !excerpt.empty()) writeExcerptSlot(target, pathHash, pageIndex, excerpt);
   return written;
+}
+
+}  // namespace
+
+bool appendEpisodicVector(std::string_view bookPath, const uint32_t pageIndex, const int8_t vec[DIM]) {
+  return appendEpisodic(bookPath, pageIndex, vec, {});
+}
+
+std::string excerptAround(std::string_view text, const size_t maxBytes) {
+  std::string flat;
+  flat.reserve(text.size());
+  for (const char c : text) {
+    if (c == ' ' || c == '\n' || c == '\r' || c == '\t' || c == '\0') {
+      if (!flat.empty() && flat.back() != ' ') flat += ' ';
+    } else {
+      flat += c;
+    }
+  }
+  if (!flat.empty() && flat.back() == ' ') flat.pop_back();
+  if (flat.size() <= maxBytes) return flat;
+  constexpr std::string_view ELLIPSIS = "\xE2\x80\xA6";
+  if (maxBytes <= 2 * ELLIPSIS.size() + 8) return std::string(utf8Prefix(flat, maxBytes));
+  const size_t budget = maxBytes - 2 * ELLIPSIS.size();
+  size_t start = (flat.size() - budget) / 2;
+  size_t end = start + budget;
+  while (start < end && continuation(static_cast<uint8_t>(flat[start]))) ++start;
+  while (end > start && continuation(static_cast<uint8_t>(flat[end]))) --end;
+  // Whole words when a space lies within a quarter of the window of each cut.
+  const size_t slack = budget / 4;
+  if (flat[start - 1] != ' ') {
+    const size_t space = flat.find(' ', start);
+    if (space != std::string::npos && space < start + slack && space + 1 < end) start = space + 1;
+  }
+  if (flat[end] != ' ') {
+    const size_t space = flat.rfind(' ', end - 1);
+    if (space != std::string::npos && space + slack > end && space > start) end = space;
+  }
+  while (start < end && flat[start] == ' ') ++start;
+  while (end > start && flat[end - 1] == ' ') --end;
+  std::string out(ELLIPSIS);
+  out.append(flat, start, end - start);
+  out.append(ELLIPSIS);
+  return out;
 }
 
 bool appendEpisodicPage(std::string_view bookPath, const uint32_t pageIndex, std::string_view pageText) {
   int8_t vec[DIM];
   encodeText(pageText, vec);
-  return appendEpisodicVector(bookPath, pageIndex, vec);
+  return appendEpisodic(bookPath, pageIndex, vec, excerptAround(pageText));
 }
 
 std::vector<Match> queryEpisodicAndShelf(const int8_t queryVec[DIM], const size_t maxResults, const bool includeShelf) {
   std::vector<Match> top;
   for (const bool shelf : {false, true}) {
     if (shelf && !includeShelf) break;
-    scanIndex(shelf ? paths.shelf : paths.episodic, [&](uint32_t, const uint8_t* record) {
+    scanIndex(shelf ? paths.shelf : paths.episodic, [&](const uint32_t index, const uint8_t* record) {
       const int32_t score = recordDot(record, queryVec);
       if (top.size() < maxResults || score > top.back().dot) {
-        Match match{readU64(record), readU32(record + 8), score, shelf, recordLabel(record)};
+        Match match;
+        match.pathHash = readU64(record);
+        match.page = readU32(record + 8);
+        match.dot = score;
+        match.shelf = shelf;
+        match.label = recordLabel(record);
         memcpy(match.vec, record + ICPT_VEC_OFFSET, DIM);
+        match.index = index;
         insertTop(top, std::move(match), maxResults);
       }
       return true;
     });
   }
+  attachExcerpts(top);
   return top;
 }
 
@@ -1580,7 +1693,7 @@ bool recordPageDwell(std::string_view bookPath, const uint32_t pageIndex, std::s
   int8_t vec[DIM];
   encodeText(slice, vec);
   setCurrentContext(vec);
-  if (dwellMs >= EPISODE_DWELL_MS && !bookPath.empty()) appendEpisodicVector(bookPath, pageIndex, vec);
+  if (dwellMs >= EPISODE_DWELL_MS && !bookPath.empty()) appendEpisodic(bookPath, pageIndex, vec, excerptAround(slice));
   return true;
 }
 
@@ -1622,6 +1735,11 @@ bool PageDwellQueue::take(Page& out, const uint32_t nowMs, const uint32_t settle
 std::string describeMatch(const Match& match) {
   if (match.shelf) return match.label;
   char position[32];
+  if (match.story) {
+    if (match.page == 0) return match.label;
+    snprintf(position, sizeof(position), " Ch.%u", static_cast<unsigned>(match.page));
+    return match.label + position;
+  }
   const uint32_t chapter = match.page >> 16;
   if (chapter > 0) {
     snprintf(position, sizeof(position), " ch.%u p.%u", static_cast<unsigned>(chapter),
@@ -1630,6 +1748,67 @@ std::string describeMatch(const Match& match) {
     snprintf(position, sizeof(position), " p.%u", static_cast<unsigned>(match.page + 1));
   }
   return match.label + position;
+}
+
+namespace {
+
+constexpr std::string_view ELLIPSIS_MARK = "\xE2\x80\xA6";
+
+// `text` cut to at most `maxBytes`: whole when it fits, else on the last
+// space in its final third (a code point boundary without one) with "…".
+std::string shortenOnWord(std::string_view text, const size_t maxBytes) {
+  if (text.size() <= maxBytes) return std::string(text);
+  if (maxBytes <= ELLIPSIS_MARK.size()) return {};
+  std::string_view head = utf8Prefix(text, maxBytes - ELLIPSIS_MARK.size());
+  const size_t space = head.rfind(' ');
+  if (space != std::string_view::npos && space * 3 >= head.size() * 2) head = head.substr(0, space);
+  while (!head.empty() && strchr(" ,;:", head.back()) != nullptr) head.remove_suffix(1);
+  if (head.size() >= ELLIPSIS_MARK.size() && head.substr(head.size() - ELLIPSIS_MARK.size()) == ELLIPSIS_MARK) {
+    head.remove_suffix(ELLIPSIS_MARK.size());
+  }
+  return std::string(head) + std::string(ELLIPSIS_MARK);
+}
+
+std::string relatedWhere(const Match& match) {
+  if (match.crossBook) return "Echo: " + match.label;
+  return match.shelf ? match.label + " (Inbox)" : describeMatch(match);
+}
+
+}  // namespace
+
+std::string formatRelatedNotes(const std::vector<Match>& matches, const bool extended) {
+  constexpr std::string_view OPEN = "\xE2\x80\x9C";
+  constexpr std::string_view CLOSE = "\xE2\x80\x9D";
+  constexpr std::string_view DASH = " \xE2\x80\x94 ";
+  std::string out;
+  size_t items = 0;
+  for (const Match& match : matches) {
+    if (items >= (extended ? RELATED_EXTENDED_ITEMS : RELATED_COMPACT_ITEMS)) break;
+    const std::string where = relatedWhere(match);
+    std::string item;
+    if (extended) {
+      item = "\xE2\x80\xA2 " + where;
+      if (!match.excerpt.empty()) {
+        item += '\n';
+        item.append(OPEN).append(match.excerpt).append(CLOSE);
+      }
+      if (out.size() + (out.empty() ? 0 : 2) + item.size() > RELATED_EXTENDED_BYTES) continue;
+      if (!out.empty()) out += "\n\n";
+    } else {
+      item = where;
+      const size_t fixed = where.size() + DASH.size() + OPEN.size() + CLOSE.size();
+      if (!match.excerpt.empty() && fixed + 16 < RELATED_COMPACT_LINE_BYTES) {
+        item.append(DASH).append(OPEN);
+        item += shortenOnWord(match.excerpt, RELATED_COMPACT_LINE_BYTES - fixed);
+        item.append(CLOSE);
+      }
+      item = std::string(utf8Prefix(item, RELATED_COMPACT_LINE_BYTES));
+      if (!out.empty()) out += '\n';
+    }
+    out += item;
+    ++items;
+  }
+  return out;
 }
 
 uint16_t cspwHalfLife(const uint8_t salience) {
@@ -1723,6 +1902,123 @@ bool runChronoSlots(const int8_t (*scenes)[DIM], const uint32_t* pages, const si
   return true;
 }
 
+namespace {
+
+// The entity record for `surface` at `cutoff` and its event range: a later
+// name only resolves once the story has revealed it, the book's own record
+// comes before the wildcard one, and (hard spoiler gate) an entity is never
+// found before its first appearance.
+bool findStoryEntity(StoryGraph& graph, std::string_view surface, const char* bookPath, const uint32_t cutoff,
+                     uint8_t entity[SGRF_ENTITY_BYTES], uint32_t& eventStart, uint32_t& eventCount) {
+  uint64_t term = fnv1a64(surface);
+  uint64_t canonical = 0;
+  if (graph.resolveAlias(term, cutoff, canonical)) term = canonical;
+  const uint64_t book = bookPath && *bookPath ? fnv1a64(bookPath) : 0;
+  if (!(book != 0 && graph.findEntity(term, book, entity)) && !graph.findEntity(term, 0, entity)) return false;
+  if (cutoff > 0 && readU32(entity + 16) > cutoff) return false;
+  eventStart = readU32(entity + 20);
+  eventCount = readU16(entity + 24);
+  return eventStart <= graph.events && eventCount <= graph.events - eventStart;
+}
+
+// Chronological timeline picks: the first, the last, and the most salient
+// events between them (the earlier one stays on ties).
+struct TimelinePick {
+  static constexpr size_t MIDDLES = STORY_TIMELINE_SCENES - 2;
+  int32_t first = -1, last = -1;
+  uint8_t lastSalience = 0;
+  int32_t middle[MIDDLES] = {};
+  uint8_t middleSalience[MIDDLES] = {};
+  size_t middles = 0;
+
+  void add(const int32_t index, const uint8_t salience) {
+    if (first < 0) {
+      first = index;
+      return;
+    }
+    if (last >= 0) keepMiddle(last, lastSalience);
+    last = index;
+    lastSalience = salience;
+  }
+
+  void keepMiddle(const int32_t index, const uint8_t salience) {
+    if (middles < MIDDLES) {
+      middle[middles] = index;
+      middleSalience[middles++] = salience;
+      return;
+    }
+    size_t weakest = 0;
+    for (size_t i = 1; i < middles; ++i) {
+      if (middleSalience[i] <= middleSalience[weakest]) weakest = i;
+    }
+    if (salience <= middleSalience[weakest]) return;
+    for (size_t i = weakest; i + 1 < middles; ++i) {
+      middle[i] = middle[i + 1];
+      middleSalience[i] = middleSalience[i + 1];
+    }
+    middle[middles - 1] = index;  // the newest index: order stays chronological
+    middleSalience[middles - 1] = salience;
+  }
+
+  size_t scenes(int32_t out[STORY_TIMELINE_SCENES]) const {
+    size_t n = 0;
+    if (first >= 0) out[n++] = first;
+    for (size_t i = 0; i < middles; ++i) out[n++] = middle[i];
+    if (last >= 0) out[n++] = last;
+    return n;
+  }
+};
+
+const char* slotHintLabel(const uint8_t hint) {
+  switch (hint) {
+    case 0:
+      return "role";
+    case 1:
+      return "origin";
+    case 2:
+      return "arc";
+    case SLOT_HINT_CROSS_BOOK:
+      return "echo";
+    default:
+      return "scene";
+  }
+}
+
+void copyCut(const std::string& text, char* out, const size_t cap) {
+  size_t n = std::min(text.size(), cap - 1);
+  while (n > 0 && n < text.size() && continuation(static_cast<uint8_t>(text[n]))) --n;
+  memcpy(out, text.data(), n);
+  out[n] = '\0';
+}
+
+// A Related match for one story-graph event of an entity named `name`.
+Match storyMatch(std::string_view name, const uint8_t* event, const uint32_t index, const uint64_t book,
+                 const int32_t score) {
+  Match match;
+  match.story = true;
+  match.pathHash = book;
+  match.dot = score;
+  match.index = index;
+  match.crossBook = event[6] == SLOT_HINT_CROSS_BOOK;
+  memcpy(match.vec, event + SGRF_VEC_OFFSET, DIM);
+  const std::string_view gloss = fixedText(event + SGRF_GLOSS_OFFSET, SGRF_GLOSS_BYTES);
+  const std::string_view target = fixedText(event + SGRF_TARGET_OFFSET, SGRF_TARGET_BYTES);
+  if (match.crossBook) {
+    match.label.assign(target.empty() ? gloss : target);
+    if (!target.empty()) match.excerpt.assign(gloss);
+    return match;
+  }
+  match.page = readU16(event + 4);
+  match.label.assign(name.empty() ? std::string_view("Earlier scene") : name);
+  match.excerpt.assign(gloss);
+  if (!target.empty() && gloss.find(target) == std::string_view::npos) {
+    match.excerpt.append(" \xE2\x80\x94 ").append(target);
+  }
+  return match;
+}
+
+}  // namespace
+
 bool weaveEntityRefresher(const char* word, const size_t wordLen, const char* bookPath, const uint32_t currentCutoff,
                           char* outStory, const size_t outStoryCap) {
   if (!outStory || outStoryCap == 0) return false;
@@ -1731,19 +2027,10 @@ bool weaveEntityRefresher(const char* word, const size_t wordLen, const char* bo
   StoryGraph graph;
   if (!graph.open(paths.storyGraph)) return false;
 
-  // A later name of an entity only resolves once the story has revealed it.
   const std::string_view surface(word, wordLen);
-  uint64_t term = fnv1a64(surface);
-  uint64_t canonical = 0;
-  if (graph.resolveAlias(term, currentCutoff, canonical)) term = canonical;
   uint8_t entity[SGRF_ENTITY_BYTES];
-  const uint64_t book = bookPath && *bookPath ? fnv1a64(bookPath) : 0;
-  if (!(book != 0 && graph.findEntity(term, book, entity)) && !graph.findEntity(term, 0, entity)) return false;
-  // Hard spoiler gate: never name an entity before its first appearance.
-  if (currentCutoff > 0 && readU32(entity + 16) > currentCutoff) return false;
-  const uint32_t eventStart = readU32(entity + 20);
-  const uint32_t eventCount = readU16(entity + 24);
-  if (eventStart > graph.events || eventCount > graph.events - eventStart) return false;
+  uint32_t eventStart = 0, eventCount = 0;
+  if (!findStoryEntity(graph, surface, bookPath, currentCutoff, entity, eventStart, eventCount)) return false;
 
   auto work = makeUniqueNoThrow<WeaveWork>();
   if (!work) {
@@ -1812,12 +2099,275 @@ bool weaveEntityRefresher(const char* word, const size_t wordLen, const char* bo
     if (!echoPart.empty()) text += " | Echo: " + echoPart;
   }
 
-  size_t n = std::min(text.size(), outStoryCap - 1);
-  while (n > 0 && n < text.size() && continuation(static_cast<uint8_t>(text[n]))) --n;
-  memcpy(outStory, text.data(), n);
-  outStory[n] = '\0';
+  copyCut(text, outStory, outStoryCap);
   return true;
 }
+
+bool weaveExtendedRefresher(const char* word, const size_t wordLen, const char* bookPath, const uint32_t currentCutoff,
+                            char* outStory, const size_t outStoryCap) {
+  if (!outStory || outStoryCap == 0) return false;
+  outStory[0] = '\0';
+  if (!word || wordLen == 0) return false;
+  StoryGraph graph;
+  if (!graph.open(paths.storyGraph)) return false;
+
+  const std::string_view surface(word, wordLen);
+  uint8_t entity[SGRF_ENTITY_BYTES];
+  uint32_t eventStart = 0, eventCount = 0;
+  if (!findStoryEntity(graph, surface, bookPath, currentCutoff, entity, eventStart, eventCount)) return false;
+
+  auto batch = makeUniqueNoThrow<uint8_t[]>(SGRF_EVENT_BATCH * SGRF_EVENT_BYTES);
+  auto scene = makeUniqueNoThrow<StoryScene>();
+  if (!batch || !scene) {
+    LOG_ERR("CPT", "OOM: story timeline");
+    return false;
+  }
+  TimelinePick story;
+  TimelinePick cross;
+  for (uint32_t first = 0; first < eventCount; first += SGRF_EVENT_BATCH) {
+    const uint32_t n = std::min<uint32_t>(SGRF_EVENT_BATCH, eventCount - first);
+    if (!graph.readAt(graph.eventsOffset + static_cast<size_t>(eventStart + first) * SGRF_EVENT_BYTES, batch.get(),
+                      n * SGRF_EVENT_BYTES)) {
+      return false;
+    }
+    for (uint32_t i = 0; i < n; ++i) {
+      const uint8_t* event = batch.get() + i * SGRF_EVENT_BYTES;
+      if (currentCutoff != 0 && readU32(event) > currentCutoff) continue;  // event spoiler gate
+      (event[6] == SLOT_HINT_CROSS_BOOK ? cross : story).add(static_cast<int32_t>(first + i), event[7]);
+    }
+  }
+  int32_t picks[STORY_TIMELINE_SCENES];
+  const size_t count = (story.first >= 0 ? story : cross).scenes(picks);
+  if (count == 0) return false;
+
+  const std::string_view name = fixedText(entity + SGRF_NAME_OFFSET, SGRF_NAME_BYTES);
+  std::string text(name.empty() ? surface : name);
+  for (size_t m = 0; m < count; ++m) {
+    if (!scene->load(graph, eventStart + static_cast<uint32_t>(picks[m]))) return false;
+    std::string line = "\n\xE2\x80\xA2 ";
+    if (scene->page > 0) {
+      char chapter[16];
+      snprintf(chapter, sizeof(chapter), "Ch.%u: ", static_cast<unsigned>(scene->page));
+      line += chapter;
+    }
+    line.append("[").append(slotHintLabel(scene->record[6])).append("] ");
+    line.append(scene->gloss);
+    if (!scene->target.empty() && scene->gloss.find(scene->target) == std::string_view::npos) {
+      line.append(" -> ").append(scene->target);
+    }
+    if (text.size() + line.size() < outStoryCap) text += line;
+  }
+  graph.file.close();
+  copyCut(text, outStory, outStoryCap);
+  return true;
+}
+
+std::vector<Match> queryStoryEchoes(const int8_t queryVec[DIM], const char* bookPath, const uint32_t currentCutoff,
+                                    std::string_view focusWord, const size_t maxResults) {
+  std::vector<Match> top;
+  if (!queryVec || maxResults == 0 || !bookPath || !*bookPath) return top;
+  StoryGraph graph;
+  if (!graph.open(paths.storyGraph)) return top;
+  auto batch = makeUniqueNoThrow<uint8_t[]>(SGRF_EVENT_BATCH * SGRF_EVENT_BYTES);
+  if (!batch) {
+    LOG_ERR("CPT", "OOM: story echoes");
+    return top;
+  }
+  const uint64_t book = fnv1a64(bookPath);
+  // The read budget, in 256-byte event units (four entity rows per unit).
+  size_t budget = STORY_ECHO_SCAN_EVENTS;
+
+  // The focus entity: only its newest revealed cross-book echo.
+  uint8_t entity[SGRF_ENTITY_BYTES];
+  uint64_t focusTerm = 0;
+  bool hasEcho = false;
+  Match echo;
+  uint32_t eventStart = 0, eventCount = 0;
+  if (!focusWord.empty() &&
+      findStoryEntity(graph, focusWord, bookPath, currentCutoff, entity, eventStart, eventCount)) {
+    focusTerm = readU64(entity);
+    const std::string name(fixedText(entity + SGRF_NAME_OFFSET, SGRF_NAME_BYTES));
+    for (uint32_t first = 0; first < eventCount && budget > 0; first += SGRF_EVENT_BATCH) {
+      const uint32_t n = std::min<uint32_t>({SGRF_EVENT_BATCH, eventCount - first, static_cast<uint32_t>(budget)});
+      if (!graph.readAt(graph.eventsOffset + static_cast<size_t>(eventStart + first) * SGRF_EVENT_BYTES, batch.get(),
+                        n * SGRF_EVENT_BYTES)) {
+        return top;
+      }
+      budget -= n;
+      for (uint32_t i = 0; i < n; ++i) {
+        const uint8_t* event = batch.get() + i * SGRF_EVENT_BYTES;
+        if (event[6] != SLOT_HINT_CROSS_BOOK || (currentCutoff != 0 && readU32(event) > currentCutoff)) continue;
+        // Pinned ahead of every scored match.
+        echo = storyMatch(name, event, eventStart + first + i, book, INT32_MAX);
+        hasEcho = true;
+      }
+    }
+  }
+
+  // Thematic scenes of the book's other revealed entities.
+  uint8_t rows[SGRF_EVENT_BATCH * SGRF_ENTITY_BYTES];
+  for (uint32_t e0 = 0; e0 < graph.entities && budget > 0; e0 += SGRF_EVENT_BATCH) {
+    const uint32_t rowCount = std::min<uint32_t>(SGRF_EVENT_BATCH, graph.entities - e0);
+    if (!graph.readAt(graph.entitiesOffset + static_cast<size_t>(e0) * SGRF_ENTITY_BYTES, rows,
+                      rowCount * SGRF_ENTITY_BYTES)) {
+      break;
+    }
+    budget -= std::min<size_t>(budget, (rowCount + 3) / 4);
+    for (uint32_t r = 0; r < rowCount && budget > 0; ++r) {
+      const uint8_t* row = rows + r * SGRF_ENTITY_BYTES;
+      if (readU64(row + 8) != book || readU64(row) == focusTerm) continue;
+      if (currentCutoff != 0 && readU32(row + 16) > currentCutoff) continue;
+      const uint32_t start = readU32(row + 20);
+      const uint32_t count = readU16(row + 24);
+      if (start > graph.events || count > graph.events - start) continue;
+      const std::string_view name = fixedText(row + SGRF_NAME_OFFSET, SGRF_NAME_BYTES);
+      for (uint32_t first = 0; first < count && budget > 0; first += SGRF_EVENT_BATCH) {
+        const uint32_t n = std::min<uint32_t>({SGRF_EVENT_BATCH, count - first, static_cast<uint32_t>(budget)});
+        if (!graph.readAt(graph.eventsOffset + static_cast<size_t>(start + first) * SGRF_EVENT_BYTES, batch.get(),
+                          n * SGRF_EVENT_BYTES)) {
+          return top;
+        }
+        budget -= n;
+        for (uint32_t i = 0; i < n; ++i) {
+          const uint8_t* event = batch.get() + i * SGRF_EVENT_BYTES;
+          if (event[6] == SLOT_HINT_CROSS_BOOK || (currentCutoff != 0 && readU32(event) > currentCutoff)) continue;
+          const int32_t score = dot(queryVec, reinterpret_cast<const int8_t*>(event + SGRF_VEC_OFFSET));
+          if (score < RELATED_MIN_DOT) continue;
+          if (top.size() < maxResults || score > top.back().dot) {
+            insertTop(top, storyMatch(name, event, start + first + i, book, score), maxResults);
+          }
+        }
+      }
+    }
+  }
+  graph.file.close();
+  if (hasEcho) {
+    top.insert(top.begin(), std::move(echo));
+    if (top.size() > maxResults) top.pop_back();
+  }
+  return top;
+}
+
+namespace {
+
+// pe-writer.bin in PSRAM plus an open writer-clauses.bin, for one call.
+struct PeSession {
+  HalFile clauses;
+  HalMemory::PsramBuffer weights;
+  PeWriter pe;
+  std::unique_ptr<PeWork> work;
+
+  bool open(const std::string& modelsDir) {
+    const std::string writerPath = joinPath(modelsDir, PE_WRITER_FILE);
+    const std::string clausesPath = joinPath(modelsDir, WRITER_CLAUSES_FILE);
+    if (!Storage.exists(writerPath.c_str()) || !Storage.exists(clausesPath.c_str())) return false;
+    if (!Storage.openFileForRead("PEW", clausesPath, clauses) || !readClausesHeader(clauses)) {
+      LOG_ERR("PEW", "Bad writer-clauses.bin");
+      return false;
+    }
+    {
+      HalFile file;
+      if (!Storage.openFileForRead("PEW", writerPath, file)) return false;
+      if (file.fileSize() != PEWR_BYTES) {
+        LOG_ERR("PEW", "pe-writer.bin size %u, expected %u", static_cast<unsigned>(file.fileSize()),
+                static_cast<unsigned>(PEWR_BYTES));
+        return false;
+      }
+      weights = HalMemory::allocatePsram(PEWR_BYTES);
+      if (!weights) {
+        LOG_ERR("PEW", "OOM: pe-writer weights");
+        return false;
+      }
+      if (!readFully(file, weights.get(), PEWR_BYTES)) return false;
+    }
+    if (!pe.init(weights.get())) {
+      LOG_ERR("PEW", "Bad pe-writer.bin header");
+      return false;
+    }
+    work = makeUniqueNoThrow<PeWork>();
+    if (!work) {
+      LOG_ERR("PEW", "OOM: pe-writer work");
+      return false;
+    }
+    return true;
+  }
+
+  // The v1 path: planner, one routed bucket and best clause per step, decoder.
+  bool writeCompact(const int8_t cPage[DIM], const int8_t cEcho[DIM], const PeEntities& ents) {
+    static const int8_t noEcho[DIM] = {};
+    runPlanner(pe, cPage, cEcho ? cEcho : noEcho, *work);
+    for (size_t s = 0; s < PE_PLAN_STEPS; ++s) {
+      work->buckets[s] = routeBucket(pe, work->plan[s]);
+      if (!retrieveClause(clauses, work->buckets[s], work->plan[s], *work, work->clauses[s])) {
+        LOG_ERR("PEW", "writer-clauses.bin read failed");
+        return false;
+      }
+    }
+    runDecoder(pe, ents, *work);
+    return true;
+  }
+};
+
+// A clause as it reads inside a sentence: trimmed, without a broken UTF-8
+// tail or trailing punctuation.
+std::string cleanClause(std::string_view text) {
+  while (!text.empty() && static_cast<uint8_t>(text.front()) <= ' ') text.remove_prefix(1);
+  size_t lead = text.size();
+  while (lead > 0 && continuation(static_cast<uint8_t>(text[lead - 1]))) --lead;
+  if (lead > 0) {
+    const uint8_t b = static_cast<uint8_t>(text[lead - 1]);
+    const size_t need = b < 0x80 ? 1 : b >= 0xF0 ? 4 : b >= 0xE0 ? 3 : 2;
+    if (text.size() - (lead - 1) < need) text = text.substr(0, lead - 1);
+  }
+  for (bool trimmed = true; trimmed && !text.empty();) {
+    trimmed = false;
+    if (static_cast<uint8_t>(text.back()) <= ' ' || strchr(",;:.!?-", text.back()) != nullptr) {
+      text.remove_suffix(1);
+      trimmed = true;
+      continue;
+    }
+    for (const std::string_view mark : {"\xE3\x80\x82", "\xEF\xBC\x8C", "\xEF\xBC\x9B", "\xEF\xBC\x9A", "\xEF\xBC\x81",
+                                        "\xEF\xBC\x9F", "\xE3\x80\x81"}) {
+      if (text.size() >= mark.size() && text.substr(text.size() - mark.size()) == mark) {
+        text.remove_suffix(mark.size());
+        trimmed = true;
+        break;
+      }
+    }
+  }
+  return std::string(text);
+}
+
+struct RiffClause {
+  uint16_t id = 0xFFFF;
+  int32_t dot = INT32_MIN;
+  std::string text;
+};
+
+// The best clauses of `bucket` for `plan`, best first, at most `cap`.
+bool rankClauses(HalFile& file, const uint8_t bucket, const int8_t plan[DIM], PeWork& work,
+                 std::vector<RiffClause>& out, const size_t cap) {
+  if (!file.seekSet(WCLS_HEADER_BYTES + static_cast<size_t>(bucket) * WCLS_BUCKET_BYTES)) return false;
+  for (size_t first = 0; first < PEWR_SLOTS; first += WCLS_BATCH_SLOTS) {
+    if (!readFully(file, work.batch, sizeof(work.batch))) return false;
+    for (size_t i = 0; i < WCLS_BATCH_SLOTS; ++i) {
+      const uint8_t* slot = work.batch + i * WCLS_SLOT_BYTES;
+      const uint8_t textLen = slot[WCLS_TEXT_LEN_OFFSET];
+      if (textLen == 0) continue;
+      const int32_t score = dot(plan, reinterpret_cast<const int8_t*>(slot));
+      if (out.size() >= cap && score <= out.back().dot) continue;
+      RiffClause clause{static_cast<uint16_t>(bucket * PEWR_SLOTS + first + i), score,
+                        cleanClause(fixedText(slot + WCLS_TEXT_OFFSET, std::min<size_t>(textLen, WCLS_TEXT_MAX)))};
+      if (clause.text.empty()) continue;
+      auto at = std::find_if(out.begin(), out.end(), [score](const RiffClause& c) { return score > c.dot; });
+      out.insert(at, std::move(clause));
+      if (out.size() > cap) out.pop_back();
+    }
+  }
+  return true;
+}
+
+}  // namespace
 
 bool generateMarginRiff(const std::string& modelsDir, const int8_t cPage[DIM], const int8_t cEcho[DIM],
                         const char* subject, const char* role, const char* echoTitle, std::string& outRiff,
@@ -1825,60 +2375,110 @@ bool generateMarginRiff(const std::string& modelsDir, const int8_t cPage[DIM], c
                         uint16_t outTokens[PE_MAX_TOKENS]) {
   outRiff.clear();
   if (!cPage) return false;
-  const std::string writerPath = joinPath(modelsDir, PE_WRITER_FILE);
-  const std::string clausesPath = joinPath(modelsDir, WRITER_CLAUSES_FILE);
-  if (!Storage.exists(writerPath.c_str()) || !Storage.exists(clausesPath.c_str())) return false;
-
-  HalFile clauses;
-  if (!Storage.openFileForRead("PEW", clausesPath, clauses) || !readClausesHeader(clauses)) {
-    LOG_ERR("PEW", "Bad writer-clauses.bin");
-    return false;
-  }
   // The weights live in PSRAM only for this call.
-  HalMemory::PsramBuffer weights;
-  {
-    HalFile file;
-    if (!Storage.openFileForRead("PEW", writerPath, file)) return false;
-    if (file.fileSize() != PEWR_BYTES) {
-      LOG_ERR("PEW", "pe-writer.bin size %u, expected %u", static_cast<unsigned>(file.fileSize()),
-              static_cast<unsigned>(PEWR_BYTES));
-      return false;
-    }
-    weights = HalMemory::allocatePsram(PEWR_BYTES);
-    if (!weights) {
-      LOG_ERR("PEW", "OOM: pe-writer weights");
-      return false;
-    }
-    if (!readFully(file, weights.get(), PEWR_BYTES)) return false;
-  }
-  PeWriter pe;
-  if (!pe.init(weights.get())) {
-    LOG_ERR("PEW", "Bad pe-writer.bin header");
-    return false;
-  }
-  auto work = makeUniqueNoThrow<PeWork>();
-  if (!work) {
-    LOG_ERR("PEW", "OOM: pe-writer work");
-    return false;
-  }
-
-  static const int8_t noEcho[DIM] = {};
-  runPlanner(pe, cPage, cEcho ? cEcho : noEcho, *work);
-  for (size_t s = 0; s < PE_PLAN_STEPS; ++s) {
-    work->buckets[s] = routeBucket(pe, work->plan[s]);
-    if (!retrieveClause(clauses, work->buckets[s], work->plan[s], *work, work->clauses[s])) {
-      LOG_ERR("PEW", "writer-clauses.bin read failed");
-      return false;
-    }
-  }
-  clauses.close();
-
+  PeSession session;
+  if (!session.open(modelsDir)) return false;
   const PeEntities ents{subject ? subject : "", role ? role : "", echoTitle ? echoTitle : ""};
-  runDecoder(pe, ents, *work);
-  if (outPlan) memcpy(outPlan, work->plan, sizeof(work->plan));
-  if (outBuckets) memcpy(outBuckets, work->buckets, sizeof(work->buckets));
-  if (outTokens) memcpy(outTokens, work->tokens, sizeof(work->tokens));
-  renderRiff(pe, ents, *work, outRiff);
+  if (!session.writeCompact(cPage, cEcho, ents)) return false;
+  session.clauses.close();
+  const PeWork& work = *session.work;
+  if (outPlan) memcpy(outPlan, work.plan, sizeof(work.plan));
+  if (outBuckets) memcpy(outBuckets, work.buckets, sizeof(work.buckets));
+  if (outTokens) memcpy(outTokens, work.tokens, sizeof(work.tokens));
+  renderRiff(session.pe, ents, work, outRiff);
+  return !outRiff.empty();
+}
+
+bool generateExtendedMarginRiff(const std::string& modelsDir, const int8_t cPage[DIM], const int8_t cEcho[DIM],
+                                const char* subject, const char* role, const char* echoTitle, std::string& outRiff,
+                                std::string* outCompactRiff, uint16_t outClauseIds[RIFF_EXTENDED_CLAUSES]) {
+  outRiff.clear();
+  if (outCompactRiff) outCompactRiff->clear();
+  if (outClauseIds) std::fill(outClauseIds, outClauseIds + RIFF_EXTENDED_CLAUSES, 0xFFFF);
+  if (!cPage) return false;
+  PeSession session;
+  if (!session.open(modelsDir)) return false;
+  PeWork& work = *session.work;
+  const PeEntities ents{subject ? subject : "", role ? role : "", echoTitle ? echoTitle : ""};
+  if (outCompactRiff) {
+    if (!session.writeCompact(cPage, cEcho, ents)) return false;
+    renderRiff(session.pe, ents, work, *outCompactRiff);
+  } else {
+    static const int8_t noEcho[DIM] = {};
+    runPlanner(session.pe, cPage, cEcho ? cEcho : noEcho, work);
+  }
+
+  constexpr size_t ROUTES = 2;
+  constexpr size_t PER_STEP = 2;
+  // Enough per bucket that PER_STEP survive every earlier sentence's picks.
+  constexpr size_t CANDIDATES = PER_STEP * PE_PLAN_STEPS;
+  std::vector<RiffClause> used;
+  used.reserve(RIFF_EXTENDED_CLAUSES);
+  std::string sentences[PE_PLAN_STEPS];
+  for (size_t s = 0; s < PE_PLAN_STEPS; ++s) {
+    // The two best-centroid buckets (lowest index on ties).
+    uint8_t routes[ROUTES] = {0, 0};
+    int32_t routeDots[ROUTES] = {INT32_MIN, INT32_MIN};
+    for (size_t b = 0; b < PEWR_BUCKETS; ++b) {
+      const int32_t score = dot(work.plan[s], session.pe.at(PEWR_OFF_CENTROIDS + b * DIM));
+      if (score > routeDots[0]) {
+        routes[1] = routes[0];
+        routeDots[1] = routeDots[0];
+        routes[0] = static_cast<uint8_t>(b);
+        routeDots[0] = score;
+      } else if (score > routeDots[1]) {
+        routes[1] = static_cast<uint8_t>(b);
+        routeDots[1] = score;
+      }
+    }
+    std::vector<RiffClause> ranked;
+    for (const uint8_t bucket : routes) {
+      std::vector<RiffClause> fromBucket;
+      if (!rankClauses(session.clauses, bucket, work.plan[s], work, fromBucket, CANDIDATES)) {
+        LOG_ERR("PEW", "writer-clauses.bin read failed");
+        return false;
+      }
+      for (RiffClause& clause : fromBucket) {
+        auto at = std::find_if(ranked.begin(), ranked.end(), [&](const RiffClause& c) { return clause.dot > c.dot; });
+        ranked.insert(at, std::move(clause));
+      }
+    }
+    std::string joined;
+    size_t picked = 0;
+    for (RiffClause& clause : ranked) {
+      if (picked == PER_STEP) break;
+      const bool repeat = std::any_of(used.begin(), used.end(),
+                                      [&](const RiffClause& u) { return u.id == clause.id || u.text == clause.text; });
+      if (repeat) continue;
+      if (!joined.empty()) joined += "; ";
+      joined += clause.text;
+      used.push_back(std::move(clause));
+      ++picked;
+    }
+    if (joined.empty()) continue;
+    std::string lead;
+    if (s == 0) {
+      lead = ents.subject.empty() ? std::string("This passage") : std::string(ents.subject);
+      if (!ents.role.empty() && ents.role != ents.subject) lead.append(", ").append(ents.role);
+    } else if (s == 1) {
+      lead = ents.echo.empty() ? std::string("In context") : "Beside " + std::string(ents.echo);
+    } else {
+      lead = "The tension";
+    }
+    sentences[s] = lead + ": " + joined + (endsCjk(joined) ? "\xE3\x80\x82" : ".");
+  }
+  session.clauses.close();
+  if (used.empty()) return false;
+
+  for (const std::string& sentence : sentences) {
+    if (sentence.empty()) continue;
+    if (outRiff.size() + (outRiff.empty() ? 0 : 1) + sentence.size() > RIFF_EXTENDED_MAX_BYTES) continue;
+    if (!outRiff.empty()) outRiff += ' ';
+    outRiff += sentence;
+  }
+  if (outClauseIds) {
+    for (size_t i = 0; i < used.size() && i < RIFF_EXTENDED_CLAUSES; ++i) outClauseIds[i] = used[i].id;
+  }
   return !outRiff.empty();
 }
 

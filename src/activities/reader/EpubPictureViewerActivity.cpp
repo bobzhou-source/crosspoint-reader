@@ -25,6 +25,9 @@ static_assert(page_picture::MAX_SOURCE_PIXELS == ImageToFramebufferDecoder::MAX_
               "viewer refusal must match the page decoders");
 static_assert(page_picture::MAX_SOURCE_DIMENSION == ImageToFramebufferDecoder::MAX_SOURCE_DIMENSION,
               "viewer refusal must match the page decoders");
+static_assert(page_picture::VIEW_MARGIN == AdaptiveRefreshPolicy::kOrientViewMargin &&
+                  page_picture::MAX_UPSCALE * 1000 == AdaptiveRefreshPolicy::kOrientMaxUpscalePermille,
+              "the orientation head must see the viewer's fit");
 
 // JPEG APPn segments (EXIF, ICC) precede the frame header; stop reading if a
 // header has not turned up by then.
@@ -37,11 +40,11 @@ constexpr size_t REPLAY_READ_BYTES = 4096;
 
 // The full-screen frame lives beside the source image in the book cache (and
 // goes with it when the cache is deleted). A distinct extension: page caches
-// are always "<stem>.pxc". Version 3 is the smoothed, error-diffused frame
-// shaped by the CfC v2 dither head; the turned layout has its own file so
-// toggling does not re-decode.
+// are always "<stem>.pxc". Version 4 is the smoothed, error-diffused frame
+// shaped by the LiquidDisplay dither head (y1-y3); the turned layout has its
+// own file so toggling does not re-decode.
 std::string viewCachePath(const std::string& imagePath, const bool rotate) {
-  return imagePath + (rotate ? ".pxv3r" : ".pxv3");
+  return imagePath + (rotate ? ".pxv4r" : ".pxv4");
 }
 
 bool probeSourceDimensions(const std::string& path, uint32_t& width, uint32_t& height) {
@@ -114,17 +117,29 @@ bool drawFromViewCache(GfxRenderer& renderer, const std::string& cachePath, cons
 }  // namespace
 
 EpubPictureViewerActivity::EpubPictureViewerActivity(GfxRenderer& renderer, MappedInputManager& mappedInput,
-                                                     std::string imagePath)
-    : Activity("EpubPictureViewer", renderer, mappedInput), imagePath(std::move(imagePath)) {}
+                                                     std::string imagePath,
+                                                     const page_picture::RotationAdvisor rotationAdvisor)
+    : Activity("EpubPictureViewer", renderer, mappedInput),
+      imagePath(std::move(imagePath)),
+      rotationAdvisor(rotationAdvisor) {}
 
+// Runs under the render lock (ActivityManager), as the advisor needs.
 void EpubPictureViewerActivity::onEnter() {
   Activity::onEnter();
   readerOrientation = renderer.getOrientation();
-  // Earlier frames (v1 point-sampled/Bayer, v2 without the dither head) are
-  // never read again.
-  for (const char* stale : {".pxv", ".pxv2", ".pxv2r"}) {
+  viewWidth = static_cast<uint16_t>(renderer.getScreenWidth());
+  viewHeight = static_cast<uint16_t>(renderer.getScreenHeight());
+  // Earlier frames (v1 point-sampled/Bayer, v2 without the dither head, v3
+  // without unsharp mask and paper-white snap) are never read again.
+  for (const char* stale : {".pxv", ".pxv2", ".pxv2r", ".pxv3", ".pxv3r"}) {
     const std::string legacy = imagePath + stale;
     if (Storage.exists(legacy.c_str())) Storage.remove(legacy.c_str());
+  }
+  if (!probeSourceDimensions(imagePath, sourceWidth, sourceHeight)) sourceWidth = sourceHeight = 0;
+  if (rotationAdvisor.recommend && sourceWidth != 0 && sourceHeight != 0) {
+    rotated = rotationAdvisor.recommend(rotationAdvisor.context, page_picture::advisorDimension(sourceWidth),
+                                        page_picture::advisorDimension(sourceHeight), viewWidth, viewHeight,
+                                        smooth_resample::lastEdgePermille, smooth_resample::lastMidGrayPermille);
   }
   requestUpdate();
 }
@@ -154,7 +169,15 @@ void EpubPictureViewerActivity::loop() {
   using Button = MappedInputManager::Button;
   if (mappedInput.wasReleased(Button::Up) || mappedInput.wasReleased(Button::Down) ||
       mappedInput.wasReleased(Button::Left) || mappedInput.wasReleased(Button::Right)) {
-    rotated = !rotated;
+    const bool turned = !rotated;
+    rotated = turned;
+    if (rotationAdvisor.record && sourceWidth != 0 && sourceHeight != 0) {
+      // The shown picture's own densities once it has been decoded.
+      RenderLock lock;
+      rotationAdvisor.record(rotationAdvisor.context, page_picture::advisorDimension(sourceWidth),
+                             page_picture::advisorDimension(sourceHeight), viewWidth, viewHeight, turned,
+                             smooth_resample::lastEdgePermille, smooth_resample::lastMidGrayPermille);
+    }
     requestUpdate();
   } else if (mappedInput.wasAnyReleased() || (touchMayClose && (tapped || backSwipe))) {
     finishWithExposure();
@@ -206,11 +229,8 @@ void EpubPictureViewerActivity::paint(const bool rotate) {
   renderer.setOrientation(readerOrientation);
   renderer.setRenderMode(GfxRenderer::BW);
 
-  uint32_t sourceWidth = 0;
-  uint32_t sourceHeight = 0;
-  const auto check = probeSourceDimensions(imagePath, sourceWidth, sourceHeight)
-                         ? page_picture::checkSource(sourceWidth, sourceHeight)
-                         : page_picture::SourceCheck::Invalid;
+  const auto check = sourceWidth != 0 && sourceHeight != 0 ? page_picture::checkSource(sourceWidth, sourceHeight)
+                                                           : page_picture::SourceCheck::Invalid;
   ImageToFramebufferDecoder* decoder = ImageDecoderFactory::getDecoder(imagePath);
   if (check == page_picture::SourceCheck::TooLarge) {
     LOG_INF("PIC", "Picture too large: %ux%u %s", sourceWidth, sourceHeight, imagePath.c_str());

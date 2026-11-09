@@ -39,6 +39,11 @@
 // - episodic.idx / inbox-concepts.idx: 16-byte header ("ICPT", version 1,
 //   count, dim = 128), then 192-byte records: u64 FNV-1a 64 of the path,
 //   u32 page_or_chunk, u32 timestamp_or_flags, char label[48], int8 vec[128].
+// - episodic.exc (the episodic path with ".exc" for ".idx"): the excerpt
+//   sidecar, no header, 176-byte slots parallel to the episodic.idx records:
+//   u64 path hash, u32 page (both must match the record at that index, else
+//   the slot is stale), u32 0, char excerpt[160] (NUL-terminated). The
+//   episodic.idx layout itself is unchanged.
 // - cspw.bin: 512-byte header ("CSPW", u16 version 2, u16 flags, u32 d_model
 //   = 192, d_slot = 128, n_slots = 4, n_frames = 256, n_phrases = 512, u32 0,
 //   float scales[16], zero pad), then row-major int8 up_proj[128][192],
@@ -106,6 +111,12 @@ struct Match {
   bool shelf = false;   // from inbox-concepts.idx rather than episodic.idx
   std::string label;
   int8_t vec[DIM] = {};  // the record's concept vector
+  // Passage text: the episodic excerpt saved with the page, or for story
+  // matches the scene gloss (and its place or target). Empty when unknown.
+  std::string excerpt;
+  uint32_t index = 0;      // record index in its .idx file (story: event index)
+  bool story = false;      // a story-graph.idx scene (page = its chapter_or_page)
+  bool crossBook = false;  // story scene with slot_hint 3 (a cross-book echo)
 };
 
 uint64_t fnv1a64(std::string_view bytes);
@@ -136,12 +147,22 @@ std::string lookupEngramGloss(std::string_view word, const char* engramPath = EN
 // Records a page (or the passage around a lookup) in episodic.idx. A record
 // for the same book and page is replaced; past the cap the oldest is reused.
 // timestamp_or_flags holds a logical sequence number (newest = largest), so
-// the order survives a device without a set clock.
+// the order survives a device without a set clock. appendEpisodicPage also
+// saves excerptAround(pageText) in the episodic.exc sidecar slot of that
+// record; appendEpisodicVector leaves the sidecar alone.
 bool appendEpisodicPage(std::string_view bookPath, uint32_t pageIndex, std::string_view pageText);
 bool appendEpisodicVector(std::string_view bookPath, uint32_t pageIndex, const int8_t vec[DIM]);
 
+// Longest saved episodic excerpt.
+constexpr size_t EXCERPT_BYTES = 150;
+// `text` with whitespace runs collapsed to one space, cut to at most
+// `maxBytes` around its middle (the held word, for a lookup's context) on
+// word boundaries (code point boundaries for unspaced text), with "…" marking
+// each cut side.
+std::string excerptAround(std::string_view text, size_t maxBytes = EXCERPT_BYTES);
+
 // Best matches across episodic.idx and, with `includeShelf`, inbox-concepts.idx,
-// highest first.
+// highest first. Episodic matches carry their sidecar excerpt when one is saved.
 std::vector<Match> queryEpisodicAndShelf(std::string_view queryText, size_t maxResults = 3);
 std::vector<Match> queryEpisodicAndShelf(const int8_t queryVec[DIM], size_t maxResults = 3, bool includeShelf = true);
 
@@ -172,8 +193,9 @@ bool readingContext(int8_t outVec[DIM]);
 
 // Main task: the reader left page `pageIndex` (an episodic position) of
 // `bookPath` after `dwellMs`. Encodes `slice` into the current context from
-// CONTEXT_DWELL_MS and appends it to episodic.idx from EPISODE_DWELL_MS.
-// False when the dwell was too short or the slice empty (nothing changed).
+// CONTEXT_DWELL_MS and appends it to episodic.idx (with its excerpt) from
+// EPISODE_DWELL_MS. False when the dwell was too short or the slice empty
+// (nothing changed).
 bool recordPageDwell(std::string_view bookPath, uint32_t pageIndex, std::string_view slice, uint32_t dwellMs);
 
 // Hands pages read at length from a reader's render task to its main task,
@@ -214,9 +236,21 @@ class PageDwellQueue {
 // UTF-8 code point.
 std::string_view utf8Prefix(std::string_view text, size_t maxBytes);
 
-// "<label> p.<N>" (episodic, "ch.<S> p.<N>" for EPUB positions) or "<label>"
-// (shelf).
+// "<label> p.<N>" (episodic, "ch.<S> p.<N>" for EPUB positions), "<label>"
+// (shelf), or "<label> Ch.<N>" (story scene; "<label>" when N is 0).
 std::string describeMatch(const Match& match);
+
+// "Related" passages from episodic, shelf and story matches, best first.
+// Compact: the first RELATED_COMPACT_ITEMS matches, one line each of at most
+// RELATED_COMPACT_LINE_BYTES: where, then a quoted excerpt shortened on a word
+// boundary. Extended: up to RELATED_EXTENDED_ITEMS items, each a "• where"
+// line and its whole excerpt, separated by blank lines, at most
+// RELATED_EXTENDED_BYTES (items that do not fit are left out whole).
+constexpr size_t RELATED_COMPACT_ITEMS = 2;
+constexpr size_t RELATED_COMPACT_LINE_BYTES = 140;
+constexpr size_t RELATED_EXTENDED_ITEMS = 4;
+constexpr size_t RELATED_EXTENDED_BYTES = 1200;
+std::string formatRelatedNotes(const std::vector<Match>& matches, bool extended);
 
 // ---- CS-PW story refresher ---------------------------------------------------
 
@@ -228,6 +262,34 @@ std::string describeMatch(const Match& match);
 // absent. Without cspw.bin it still writes the refresher with default frames.
 bool weaveEntityRefresher(const char* word, size_t wordLen, const char* bookPath, uint32_t currentCutoff,
                           char* outStory, size_t outStoryCap);
+
+// The longer "story so far" dossier for the same entity and gates: its name
+// line, then one "• Ch.<N>: [<hint>] <gloss> -> <target>" line per scene
+// (hint: role, origin, arc; "Ch." without a chapter, the target when empty
+// or already in the gloss are left out) in chronological order, from its
+// first appearance to its latest scene at or before `currentCutoff` (never a
+// later one). With more than STORY_TIMELINE_SCENES eligible scenes it keeps
+// the first, the latest and the most salient ones between them. Cross-book
+// echoes are left to queryStoryEchoes (the timeline uses them only when the
+// entity has no in-book scene). A line that does not fit `outStoryCap` is
+// left out whole.
+constexpr size_t STORY_EXTENDED_BYTES = 1536;
+constexpr size_t STORY_TIMELINE_SCENES = 6;
+bool weaveExtendedRefresher(const char* word, size_t wordLen, const char* bookPath, uint32_t currentCutoff,
+                            char* outStory, size_t outStoryCap);
+
+// Spoiler-safe story-graph scenes for "Related" passages, highest first:
+// first the newest cross-book echo (slot_hint 3) of `focusWord`'s entity at or
+// before the cutoff (dot = INT32_MAX: pinned ahead of scored matches), then
+// scenes of other entities of `bookPath` that are introduced and happen at or
+// before `currentCutoff` with a concept dot of at least RELATED_MIN_DOT
+// against `queryVec`. The focus entity's own in-book scenes are its Story and
+// are left out; other books' entities are never read (the reader's place in
+// them is unknown). Reads at most STORY_ECHO_SCAN_EVENTS x 256 bytes of
+// entity rows and events. Empty without story-graph.idx.
+constexpr size_t STORY_ECHO_SCAN_EVENTS = 512;
+std::vector<Match> queryStoryEchoes(const int8_t queryVec[DIM], const char* bookPath, uint32_t currentCutoff,
+                                    std::string_view focusWord, size_t maxResults = RELATED_EXTENDED_ITEMS);
 
 constexpr size_t CSPW_SLOTS = 4;
 constexpr size_t CSPW_MAX_SCENES = 4;
@@ -276,6 +338,26 @@ bool generateMarginRiff(const std::string& modelsDir, const int8_t cPage[DIM], c
                         const char* subject, const char* role, const char* echoTitle, std::string& outRiff,
                         int8_t outPlan[PE_PLAN_STEPS][DIM] = nullptr, uint8_t outBuckets[PE_PLAN_STEPS] = nullptr,
                         uint16_t outTokens[PE_MAX_TOKENS] = nullptr);
+
+// The longer riff: three complete sentences, one per thought step s = 0..2,
+// at most RIFF_EXTENDED_MAX_BYTES. Step s routes to its two best-centroid
+// buckets and takes its two best clauses from them that no earlier sentence
+// used (clause ids and texts are never repeated). Sentence 1 anchors on
+// `subject` and `role`, sentence 2 on `echoTitle` (the context when empty),
+// sentence 3 states the tension; every analytical phrase is a
+// writer-clauses.bin clause verbatim (trailing punctuation and broken UTF-8
+// tails trimmed), and each sentence ends in "." ("。" after CJK). A sentence
+// that would pass the cap is left out whole. With `outCompactRiff` the same
+// call also writes exactly what generateMarginRiff would (one model load for
+// both). `outClauseIds` gets bucket * 64 + slot per used clause, in order,
+// 0xFFFF for unused entries. False when a file is missing or malformed,
+// memory runs out, or no clause is available.
+constexpr size_t RIFF_EXTENDED_MAX_BYTES = 640;
+constexpr size_t RIFF_EXTENDED_CLAUSES = 2 * PE_PLAN_STEPS;
+bool generateExtendedMarginRiff(const std::string& modelsDir, const int8_t cPage[DIM], const int8_t cEcho[DIM],
+                                const char* subject, const char* role, const char* echoTitle, std::string& outRiff,
+                                std::string* outCompactRiff = nullptr,
+                                uint16_t outClauseIds[RIFF_EXTENDED_CLAUSES] = nullptr);
 
 // Appends `note` (newlines flattened, cut at 480 bytes) as the newest line of
 // `path`, dropping the oldest lines past MARGIN_NOTES_MAX. The file is

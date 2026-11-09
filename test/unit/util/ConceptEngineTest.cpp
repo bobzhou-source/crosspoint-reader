@@ -2068,3 +2068,299 @@ TEST_F(ConceptEngineTest, PeWriterMatchesGoldenVectors) {
   }
   EXPECT_EQ(exact, cases);
 }
+
+// ---- Lookup sections: excerpts, Related notes, story timeline, extended riff ----------------
+
+namespace {
+
+std::string timeline(const std::string& word, const char* book, const uint32_t cutoff, const size_t cap = 1536) {
+  std::vector<char> out(cap, '\x7f');
+  if (!ce::weaveExtendedRefresher(word.data(), word.size(), book, cutoff, out.data(), out.size())) return "<none>";
+  return out.data();
+}
+
+// The concept vector the graph file stores for the event whose gloss is `gloss`.
+std::array<int8_t, 128> eventVec(const std::vector<uint8_t>& graph, const std::string& gloss) {
+  std::array<int8_t, 128> vec{};
+  const auto at = std::search(graph.begin(), graph.end(), gloss.begin(), gloss.end());
+  EXPECT_NE(at, graph.end()) << gloss;
+  if (at == graph.end()) return vec;
+  const size_t event = static_cast<size_t>(at - graph.begin()) - 8;
+  memcpy(vec.data(), graph.data() + event + 128, 128);
+  return vec;
+}
+
+std::string words(const int count) {
+  std::string text;
+  for (int i = 0; i < count; ++i) {
+    char word[8];
+    snprintf(word, sizeof(word), "w%02d", i);
+    if (!text.empty()) text += (i % 7 == 0 ? "\n\t " : " ");
+    text += word;
+  }
+  return text;
+}
+
+}  // namespace
+
+TEST(ConceptEngineExcerpt, CollapsesSpaceAndCentersOnWholeWords) {
+  EXPECT_EQ(ce::excerptAround("  short\n\ttext  here "), "short text here");
+  EXPECT_EQ(ce::excerptAround(""), "");
+  const std::string excerpt = ce::excerptAround(words(60));
+  ASSERT_LE(excerpt.size(), ce::EXCERPT_BYTES);
+  EXPECT_GT(excerpt.size(), ce::EXCERPT_BYTES / 2);
+  EXPECT_EQ(excerpt.rfind("\xE2\x80\xA6w", 0), 0u) << excerpt;
+  EXPECT_EQ(excerpt.compare(excerpt.size() - 3, 3, "\xE2\x80\xA6"), 0) << excerpt;
+  EXPECT_NE(excerpt.find("w30"), std::string::npos) << excerpt;
+  EXPECT_EQ(excerpt.find("w00"), std::string::npos) << excerpt;
+  EXPECT_EQ(excerpt.find("  "), std::string::npos);
+  EXPECT_EQ(excerpt.find('\n'), std::string::npos);
+  // Each kept word is whole: the text between the marks splits into wNN words.
+  std::istringstream kept(excerpt.substr(3, excerpt.size() - 6));
+  std::string word;
+  while (kept >> word) EXPECT_EQ(word.size(), 3u) << word;
+  // CJK text is cut on code points.
+  std::string cjk;
+  for (int i = 0; i < 80; ++i) cjk += "斗";
+  const std::string cut = ce::excerptAround(cjk, 40);
+  EXPECT_LE(cut.size(), 40u);
+  EXPECT_EQ((cut.size() - 6) % 3, 0u);
+}
+
+TEST_F(ConceptEngineTest, EpisodicExcerptSidecarRoundTrips) {
+  const std::string whale = "Call me Ishmael. " + words(60) + " the whale breached beside the harpoon boat";
+  ASSERT_TRUE(ce::appendEpisodicPage("/books/Moby Dick.epub", ce::epubPosition(3, 11), whale));
+  ASSERT_TRUE(ce::appendEpisodicPage("/books/Cookbook.txt", 41, "whisk the eggs with sugar and butter"));
+  int8_t vec[128];
+  ce::encodeText("electrons orbit the nucleus", vec);
+  ASSERT_TRUE(ce::appendEpisodicVector("/books/Physics.epub", 7, vec));
+  // The .idx layout is unchanged; excerpts live in the sidecar.
+  EXPECT_EQ(fs::file_size(episodicPath), 16u + 3 * 192);
+  const fs::path sidecar = dir / "episodic.exc";
+  ASSERT_TRUE(fs::exists(sidecar));
+  EXPECT_EQ(fs::file_size(sidecar) % 176, 0u);
+
+  const auto cook = ce::queryEpisodicAndShelf("whisk eggs and sugar", 1);
+  ASSERT_EQ(cook.size(), 1u);
+  EXPECT_EQ(cook[0].excerpt, "whisk the eggs with sugar and butter");
+  EXPECT_EQ(cook[0].index, 1u);
+  const auto moby = ce::queryEpisodicAndShelf(whale, 1);
+  ASSERT_EQ(moby.size(), 1u);
+  EXPECT_EQ(moby[0].excerpt, ce::excerptAround(whale));
+  EXPECT_EQ(moby[0].index, 0u);
+  const auto physics = ce::queryEpisodicAndShelf(vec, 1, false);
+  ASSERT_EQ(physics.size(), 1u);
+  EXPECT_EQ(physics[0].excerpt, "");
+
+  // Revisiting a page replaces its excerpt with the new text.
+  ASSERT_TRUE(ce::appendEpisodicPage("/books/Cookbook.txt", 41, "fold the egg whites into the batter"));
+  EXPECT_EQ(fs::file_size(episodicPath), 16u + 3 * 192);
+  const auto folded = ce::queryEpisodicAndShelf("fold the egg whites into the batter", 1);
+  ASSERT_EQ(folded.size(), 1u);
+  EXPECT_EQ(folded[0].excerpt, "fold the egg whites into the batter");
+
+  // A sidecar slot whose book or page disagrees with the record is ignored.
+  fs::resize_file(sidecar, 0);
+  std::ofstream(sidecar, std::ios::binary) << std::string(176 * 3, '\x55');
+  const auto stale = ce::queryEpisodicAndShelf("fold the egg whites into the batter", 1);
+  ASSERT_EQ(stale.size(), 1u);
+  EXPECT_EQ(stale[0].excerpt, "");
+}
+
+TEST(ConceptEngineRelated, CompactLinesAndExtendedItems) {
+  ce::Match moby;
+  moby.label = "Moby Dick";
+  moby.page = ce::epubPosition(3, 11);
+  moby.excerpt = ce::excerptAround(words(60));
+  ce::Match essay;
+  essay.label = "Essay";
+  essay.shelf = true;
+  ce::Match scene;
+  scene.label = "Wu Tan City";
+  scene.story = true;
+  scene.page = 3;
+  scene.excerpt = "Xiao Clan's home city (Ch.3)";
+  ce::Match echo;
+  echo.label = "Martial Peak: fallen genius returns";
+  echo.story = true;
+  echo.crossBook = true;
+  echo.excerpt = "rise-from-ruin arc";
+  ce::Match fifth = moby;
+  fifth.label = "Fifth";
+  const std::vector<ce::Match> matches = {moby, essay, scene, echo, fifth};
+
+  EXPECT_EQ(ce::formatRelatedNotes({}, false), "");
+  EXPECT_EQ(ce::formatRelatedNotes({}, true), "");
+
+  const std::string compact = ce::formatRelatedNotes(matches, false);
+  const size_t newline = compact.find('\n');
+  ASSERT_NE(newline, std::string::npos);
+  const std::string first = compact.substr(0, newline);
+  EXPECT_EQ(compact.substr(newline + 1), "Essay (Inbox)");
+  EXPECT_EQ(first.rfind("Moby Dick ch.4 p.12 \xE2\x80\x94 \xE2\x80\x9C\xE2\x80\xA6", 0), 0u) << first;
+  EXPECT_LE(first.size(), ce::RELATED_COMPACT_LINE_BYTES);
+  EXPECT_EQ(first.compare(first.size() - 6, 6, "\xE2\x80\xA6\xE2\x80\x9D"), 0) << first;
+  EXPECT_LT(first.size(), moby.excerpt.size() + 30);
+
+  const std::string extended = ce::formatRelatedNotes(matches, true);
+  EXPECT_EQ(extended, "\xE2\x80\xA2 Moby Dick ch.4 p.12\n\xE2\x80\x9C" + moby.excerpt +
+                          "\xE2\x80\x9D\n\n\xE2\x80\xA2 Essay (Inbox)\n\n\xE2\x80\xA2 Wu Tan City Ch.3\n\xE2\x80\x9C"
+                          "Xiao Clan's home city (Ch.3)\xE2\x80\x9D\n\n\xE2\x80\xA2 Echo: Martial Peak: fallen genius "
+                          "returns\n\xE2\x80\x9Crise-from-ruin arc\xE2\x80\x9D");
+  EXPECT_EQ(extended.find("Fifth"), std::string::npos);
+  EXPECT_GT(extended.size(), compact.size());
+
+  // Items that would pass the byte cap are left out whole.
+  std::vector<ce::Match> big(4, moby);
+  for (auto& m : big) m.excerpt = std::string(400, 'x');
+  const std::string capped = ce::formatRelatedNotes(big, true);
+  EXPECT_LE(capped.size(), ce::RELATED_EXTENDED_BYTES);
+  EXPECT_EQ(std::count(capped.begin(), capped.end(), '\n'), 2 + 2);  // two items: one excerpt line each, one gap
+}
+
+TEST_F(ConceptEngineTest, StoryTimelineListsRevealedScenesInOrder) {
+  writeFile(storyPath, makeDoupoGraph());
+  const std::string ch4 = timeline("萧炎", DOUPO, chapter(4));
+  EXPECT_EQ(ch4,
+            "Xiao Yan (Dou Qi disciple)"
+            "\n\xE2\x80\xA2 Ch.1: [origin] introduced at Xiao Clan test (Ch.1)"
+            "\n\xE2\x80\xA2 Ch.2: [role] shamed at the Dou Qi test (Ch.2) -> Xiao Clan"
+            "\n\xE2\x80\xA2 Ch.3: [arc] clashed over 3-year pact (Ch.3) -> Wu Tan City");
+  // The compact refresher is a subset; echoes stay out of the timeline.
+  EXPECT_GT(ch4.size(), weave("萧炎", DOUPO, chapter(4)).size());
+  EXPECT_EQ(timeline("萧炎", DOUPO, chapter(6)), ch4);
+  EXPECT_EQ(ch4.find("Flame Emperor"), std::string::npos);
+  EXPECT_NE(timeline("萧炎", DOUPO, chapter(500)).find("Flame Emperor"), std::string::npos);
+  EXPECT_EQ(timeline("萧炎", DOUPO, chapter(1)),
+            "Xiao Yan (Dou Qi disciple)\n\xE2\x80\xA2 Ch.1: [origin] introduced at Xiao Clan test (Ch.1)");
+  // Unrevealed aliases and entities give nothing.
+  EXPECT_EQ(timeline("炎帝", DOUPO, chapter(6)), "<none>");
+  EXPECT_EQ(timeline("美杜莎", DOUPO, chapter(6)), "<none>");
+  // A small cap drops whole scene lines.
+  const std::string tight = timeline("萧炎", DOUPO, chapter(4), 120);
+  EXPECT_EQ(tight, ch4.substr(0, tight.size()));
+  EXPECT_EQ(tight.back(), ')');
+}
+
+TEST_F(ConceptEngineTest, StoryTimelineKeepsEndsAndMostSalientMiddles) {
+  const char* book = "/books/Saga.epub";
+  std::vector<SgEvent> events;
+  const uint8_t salience[] = {10, 50, 200, 30, 180, 20, 150, 160, 5};
+  for (uint16_t i = 0; i < 9; ++i) {
+    events.push_back({static_cast<uint32_t>(100 + i), static_cast<uint16_t>(i + 1), 0, salience[i],
+                      "scene " + std::to_string(i + 1), ""});
+  }
+  writeFile(storyPath, makeStoryGraph({{"hero", book, 0, "Hero", events}}, {}));
+  EXPECT_EQ(timeline("hero", book, 1000),
+            "Hero"
+            "\n\xE2\x80\xA2 Ch.1: [role] scene 1"
+            "\n\xE2\x80\xA2 Ch.3: [role] scene 3"
+            "\n\xE2\x80\xA2 Ch.5: [role] scene 5"
+            "\n\xE2\x80\xA2 Ch.7: [role] scene 7"
+            "\n\xE2\x80\xA2 Ch.8: [role] scene 8"
+            "\n\xE2\x80\xA2 Ch.9: [role] scene 9");
+}
+
+TEST_F(ConceptEngineTest, StoryEchoesAreSpoilerGatedAndBookScoped) {
+  const auto graph = makeDoupoGraph();
+  writeFile(storyPath, graph);
+  const auto home = eventVec(graph, "Xiao Clan's home city (Ch.3)");
+  const auto medusa = eventVec(graph, "Snake-People queen met in the desert (Ch.300)");
+
+  // Wu Tan City is revealed at chapter 3; the focus entity's own echo comes
+  // first once revealed (chapter 5), and never before.
+  const auto ch4 = ce::queryStoryEchoes(home.data(), DOUPO, chapter(4), "萧炎");
+  ASSERT_FALSE(ch4.empty());
+  EXPECT_FALSE(ch4[0].crossBook);
+  const auto homeHit = std::find_if(ch4.begin(), ch4.end(),
+                                    [](const ce::Match& m) { return m.label == "Wu Tan City (Xiao Clan seat)"; });
+  ASSERT_NE(homeHit, ch4.end());
+  EXPECT_TRUE(homeHit->story);
+  EXPECT_EQ(homeHit->page, 3u);
+  EXPECT_EQ(homeHit->excerpt, "Xiao Clan's home city (Ch.3)");
+  EXPECT_EQ(ce::describeMatch(*homeHit), "Wu Tan City (Xiao Clan seat) Ch.3");
+  EXPECT_EQ(memcmp(homeHit->vec, home.data(), 128), 0);
+  for (const auto& m : ch4) {
+    EXPECT_GE(m.dot, ce::RELATED_MIN_DOT);
+    EXPECT_EQ(m.pathHash, ce::fnv1a64(DOUPO));
+    EXPECT_EQ(m.label.find("Xiao Yan"), std::string::npos) << "focus scenes belong to the Story tab";
+    EXPECT_EQ(m.label.find("Medusa"), std::string::npos);
+  }
+
+  const auto ch6 = ce::queryStoryEchoes(home.data(), DOUPO, chapter(6), "萧炎");
+  ASSERT_FALSE(ch6.empty());
+  EXPECT_TRUE(ch6[0].crossBook);
+  EXPECT_EQ(ch6[0].label, "Martial Peak: fallen genius returns");
+  EXPECT_EQ(ch6[0].excerpt, "rise-from-ruin arc");
+  EXPECT_EQ(ch6[0].dot, INT32_MAX);
+
+  // Before chapter 3 the city is unrevealed; Medusa only from chapter 300.
+  for (const auto& m : ce::queryStoryEchoes(home.data(), DOUPO, chapter(2), "")) {
+    EXPECT_NE(m.label, "Wu Tan City (Xiao Clan seat)");
+  }
+  for (const auto& m : ce::queryStoryEchoes(medusa.data(), DOUPO, chapter(299), "")) {
+    EXPECT_EQ(m.label.find("Medusa"), std::string::npos);
+  }
+  const auto later = ce::queryStoryEchoes(medusa.data(), DOUPO, chapter(300), "");
+  ASSERT_FALSE(later.empty());
+  EXPECT_EQ(later[0].label, "Medusa (Snake-People queen)");
+  EXPECT_EQ(later[0].excerpt, "Snake-People queen met in the desert (Ch.300) \xE2\x80\x94 Tagoo Desert");
+
+  // Another book's reader sees none of these scenes.
+  EXPECT_TRUE(ce::queryStoryEchoes(home.data(), "/books/Other.txt", chapter(500), "萧炎").empty());
+  EXPECT_TRUE(ce::queryStoryEchoes(home.data(), DOUPO, chapter(500), "", 0).empty());
+}
+
+TEST_F(ConceptEngineTest, ExtendedRiffWritesThreeSentencesOfUniqueClauses) {
+  const PeModel model = makePeModel(777);
+  ClauseBank bank = makeClauseBank(4242);
+  for (size_t i = 0; i < bank.size(); ++i) {
+    if (bank[i].text.empty()) continue;
+    bank[i].text = "clause " + std::to_string(i) + " weighs loyalty against self-interest" + (i % 2 ? "." : " ");
+  }
+  writeFile(dir / "pe-writer.bin", serializePe(model));
+  writeFile(dir / "writer-clauses.bin", serializeClauses(bank));
+  Lcg rng{99};
+  for (int c = 0; c < 6; ++c) {
+    const auto page = randomBytes(rng, 128, 127);
+    const auto echo = randomBytes(rng, 128, 127);
+    const bool withEcho = c % 2 == 0;
+    std::string compactWant;
+    ce::generateMarginRiff(dir.string(), page.data(), withEcho ? echo.data() : nullptr, "Winston", "the last man",
+                           withEcho ? "Nineteen Eighty-Four" : "", compactWant);
+    std::string riff = "stale";
+    std::string compact = "stale";
+    uint16_t ids[ce::RIFF_EXTENDED_CLAUSES];
+    ASSERT_TRUE(ce::generateExtendedMarginRiff(dir.string(), page.data(), withEcho ? echo.data() : nullptr, "Winston",
+                                               "the last man", withEcho ? "Nineteen Eighty-Four" : "", riff, &compact,
+                                               ids))
+        << "case " << c;
+    EXPECT_EQ(compact, compactWant) << "case " << c;
+    EXPECT_GT(riff.size(), 240u) << riff;
+    EXPECT_LE(riff.size(), ce::RIFF_EXTENDED_MAX_BYTES);
+    EXPECT_EQ(riff.rfind("Winston, the last man: ", 0), 0u) << riff;
+    EXPECT_NE(riff.find(withEcho ? ". Beside Nineteen Eighty-Four: " : ". In context: "), std::string::npos) << riff;
+    EXPECT_NE(riff.find(". The tension: "), std::string::npos) << riff;
+    EXPECT_EQ(riff.back(), '.');
+    EXPECT_EQ(riff.find(".;"), std::string::npos) << riff;
+    EXPECT_EQ(riff.find(" ;"), std::string::npos) << riff;
+    EXPECT_EQ(riff.find(".."), std::string::npos) << riff;
+    std::vector<uint16_t> used(ids, ids + ce::RIFF_EXTENDED_CLAUSES);
+    for (const uint16_t id : used) {
+      ASSERT_LT(id, bank.size()) << "case " << c;
+      const std::string clause = "clause " + std::to_string(id) + " weighs";
+      EXPECT_NE(riff.find(clause), std::string::npos) << clause;
+    }
+    std::sort(used.begin(), used.end());
+    EXPECT_EQ(std::unique(used.begin(), used.end()), used.end()) << "case " << c;
+  }
+
+  // Without the model files there is no riff of either length.
+  fs::remove(dir / "writer-clauses.bin");
+  const auto page = randomBytes(rng, 128, 127);
+  std::string riff = "stale";
+  std::string compact = "stale";
+  EXPECT_FALSE(ce::generateExtendedMarginRiff(dir.string(), page.data(), nullptr, "", "", "", riff, &compact));
+  EXPECT_EQ(riff, "");
+  EXPECT_EQ(compact, "");
+}

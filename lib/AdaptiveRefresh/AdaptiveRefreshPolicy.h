@@ -66,11 +66,31 @@
 //     covered. Without an exposure that reason never fires, so every
 //     content-v2 / LiquidRefresh v1 decision above is unchanged.
 //   - computeImageDitherParams() probes the cell with an image's edge and
-//     mid-gray density (no state change) and returns y1, y2 for the decoders.
+//     mid-gray density (no state change) and returns y1, y2 (and v3's y3)
+//     for the decoders.
 //   - y0's readout (16 weights + bias) learns by e-prop: a 16-dim eligibility
 //     trace e = gamma*lambda*e + h over the fast turns since the last clear;
 //     recordManualRefresh() moves w += eta * (1 - p) * e, bounded around the
 //     fitted readout. It is persisted next to the v1 readout (LQRF v2).
+//
+// LiquidDisplay CfC v3: two more heads over the same cell.
+//   - y3 (unsharp + paper white): a readout over the dither probe's h plus
+//     the image's upscale ratio and the panel's live residual charge (mean
+//     of the cell state the panel carries now). High on line art, small text
+//     and enlarged figures (unsharpGainQ8 up to ~150, whiteClip ~238-246),
+//     ~0 on continuous-tone photos (whiteClip 253-255). The decoders snap
+//     luma >= whiteClip to paper white, apply the contrast S-curve, then
+//     unsharp-mask against a causal local mean before diffusion.
+//   - y4 (orientation): z = orientW . [rotation area gain, aspect mismatch,
+//     shrink, bias] + a fitted projection of the probe's h. The default
+//     weights can never reach z > 0 (the picture viewer keeps the reading
+//     orientation); recordManualRotation() moves orientW by e-prop (single
+//     step: e = features) towards what the user chose. Persisted in the LQRF
+//     v2 file's reserved bytes (tagged, so v1/v2 files still load).
+//   - Localized clears: in region mode, an ImageSticking clear whose image
+//     covered <= kRegionMaxTiles tiles, or a Debt clear only the peak-tile
+//     term pushed over the line, clears the bounding rect of those tiles
+//     (Refresh::Region) and takes their share of the debt with them.
 class AdaptiveRefreshPolicy {
  public:
   // Clear maps to the app's HALF refresh (FULL stays a manual/GfxRenderer promotion).
@@ -248,6 +268,8 @@ class AdaptiveRefreshPolicy {
   // Learned-state file: 64 bytes, "LQRF" on disk (little-endian magic). v2
   // keeps the v1 layout in its first 28 bytes and adds the CfC readout; a
   // 32-byte v1 file still loads (the CfC readout then stays the fitted one).
+  // The CfC v3 orientation weights sit in v2's reserved bytes 52-59 behind a
+  // tag: a v2 file written before them loads with the default orientation.
   static constexpr size_t kLearnedStateBytes = 64;
   static constexpr size_t kLearnedStateV1Bytes = 32;
   static constexpr uint32_t kLearnedStateMagic = 0x4652514Cu;
@@ -291,9 +313,37 @@ class AdaptiveRefreshPolicy {
   static constexpr int32_t kCfcLearnRate = 16;
   static constexpr int16_t kCfcReadoutDrift = 48;
 
+  // --- LiquidDisplay CfC v3 constants -------------------------------------
+  // y3 -> unsharp gain Q8 = clamp(Y / 64, 0, kUnsharpGainMaxQ8) (128 = 0.5x
+  // high-pass boost), whiteClip = 255 - (7 * gain + 32) / 64 within
+  // [kWhiteClipMin, 255]. A positive base readout Y is boosted by the upscale
+  // (Q7 of (upscale - 1) / 2, 1.0 at 3x) and the panel's residual charge.
+  static constexpr uint16_t kUnsharpGainMaxQ8 = 160;
+  static constexpr uint8_t kWhiteClipMin = 236;
+  static constexpr uint16_t kUpscaleFullPermille = 3000;
+  // Region mode: a localized clear covers at most this many of the 48 tiles.
+  static constexpr uint8_t kRegionMaxTiles = 20;
+  // Orientation head: features Q7 (f0 area gain, f1 aspect mismatch, f2
+  // shrink, f3 bias = 64). Mirrors page_picture::VIEW_MARGIN / MAX_UPSCALE.
+  enum OrientFeature : uint8_t { kOrientAreaGain, kOrientMismatch, kOrientShrink, kOrientBias, kOrientFeatures };
+  static constexpr int16_t kOrientViewMargin = 4;
+  static constexpr uint16_t kOrientMaxUpscalePermille = 3000;
+  static constexpr int8_t kOrientBiasFeature = 64;
+  static constexpr int8_t kOrientMismatchFeature = 64;
+  // Default weights: the largest reachable z (f0 127, f1 64, f2 128) plus the
+  // hidden projection cap stays below 0, so nothing rotates until taught.
+  static constexpr int8_t kOrientDefaultW[kOrientFeatures] = {4, 2, 2, -24};
+  static constexpr int32_t kOrientHiddenCap = 128;  // |hidden projection| in z units
+  // e-prop: p = clamp(128 + z / 16, 0, 256) (Q8), dw = eta (a - p) f with
+  // eta = kOrientLearnRate / 2^20; weights stay within kOrientDrift of the default.
+  static constexpr int32_t kOrientLearnRate = 232;
+  static constexpr int8_t kOrientDrift = 64;
+
   struct DitherParams {
     uint16_t contrastGainQ8 = 256;  // 256 = 1.0x around mid-gray 128
     uint16_t errorBleedQ8 = 256;    // 256 = full error diffusion
+    uint16_t unsharpGainQ8 = 0;     // 0..kUnsharpGainMaxQ8, 128 = 0.5x high-pass boost
+    uint8_t whiteClip = 252;        // luma >= whiteClip snaps to paper white
     bool operator==(const DitherParams&) const = default;
   };
   // The learnable y0 readout: weights and bias in 1/16 units.
@@ -363,12 +413,16 @@ class AdaptiveRefreshPolicy {
   // pages shown before the clear runs accumulate.
   void imagePageShown(Rect pictures = {});
 
-  // The next decide() may answer Region: the pending clear is the picture
-  // clear and region mode is on. Ask the renderer to prepare a windowed
-  // clear (and set Inputs::regionClearAvailable) only then.
+  // The next decide() may answer Region: region mode is on and either the
+  // pending clear is the picture clear, or nothing is pending and a CfC
+  // localized clear may come (a recorded image on <= kRegionMaxTiles tiles,
+  // or a tile hot spot while the debt readout is at least half way). Ask the
+  // renderer to prepare a windowed clear (and set Inputs::regionClearAvailable)
+  // only then.
   bool regionClearWanted() const {
-    return config_.imageClearRegion && config_.clearAfterImage && !initialClear_ && clearRequested_ &&
-           clearSource_ == ClearSource::Image;
+    if (!config_.imageClearRegion || initialClear_) return false;
+    if (clearRequested_) return config_.clearAfterImage && clearSource_ == ClearSource::Image;
+    return localizedClearPossible();
   }
 
   // The previous frame's ink is unknown (frames the policy never saw, buffer
@@ -397,10 +451,31 @@ class AdaptiveRefreshPolicy {
   // at once and decide() does not count dwellMs again.
   void recordImageExposure(uint32_t dwellMs, uint16_t areaPermille, uint16_t ditherPermille,
                            uint64_t coveredTileMask = 0);
-  // y1, y2 for an image about to be dithered, from the current cell state and
-  // the image's edge density (strong horizontal transitions) and mid-gray
-  // density, both in permille of its pixels. Pure.
-  DitherParams computeImageDitherParams(uint16_t edgeDensityPermille, uint16_t midGrayPermille) const;
+  // y1, y2 and y3 for an image about to be dithered, from the live cell state
+  // (the panel's residual charge) and the image's edge density (strong
+  // horizontal transitions) and mid-gray density, both in permille of its
+  // pixels, and its upscale ratio (permille, 1000 = 1:1, 3000 = 3x). Pure.
+  DitherParams computeImageDitherParams(uint16_t edgeDensityPermille, uint16_t midGrayPermille,
+                                        uint16_t upscalePermille = 1000) const;
+  // h after the dither probe for that image (what y1-y4 read). Pure.
+  void cfcProbeHiddenQ8(uint16_t edgeDensityPermille, uint16_t midGrayPermille, int16_t out[kCfcUnits]) const;
+
+  // y4: whether the picture viewer should open an imgW x imgH picture a
+  // quarter turn from a viewW x viewH reading screen. False until taught.
+  bool recommendImageRotation(uint16_t imgW, uint16_t imgH, uint16_t viewW, uint16_t viewH,
+                              uint16_t edgePermille = 60, uint16_t midGrayPermille = 400) const;
+  // The user turned the picture (userRotated: it is now shown turned) or
+  // back. One e-prop step of orientW towards that choice; true when a weight
+  // moved (the learned state needs saving).
+  bool recordManualRotation(uint16_t imgW, uint16_t imgH, uint16_t viewW, uint16_t viewH, bool userRotated,
+                            uint16_t edgePermille = 60, uint16_t midGrayPermille = 400);
+  // y4's input features (Q7) and z, for tests and the fit driver.
+  static void orientFeatures(uint16_t imgW, uint16_t imgH, uint16_t viewW, uint16_t viewH,
+                             int8_t out[kOrientFeatures]);
+  int32_t orientLogit(uint16_t imgW, uint16_t imgH, uint16_t viewW, uint16_t viewH, uint16_t edgePermille = 60,
+                      uint16_t midGrayPermille = 400) const;
+  int8_t orientWeight(uint8_t i) const { return i < kOrientFeatures ? orientW_[i] : 0; }
+  uint16_t orientUpdates() const { return orientUpdates_; }
   // Tiles (8x6 over a screenWidth x screenHeight logical screen) `rect` touches.
   static uint64_t tileMaskFor(Rect rect, uint16_t screenWidth, uint16_t screenHeight);
   int16_t cfcHiddenQ8(uint8_t unit) const { return unit < kCfcUnits ? cfcHiddenQ8_[unit] : 0; }
@@ -461,6 +536,19 @@ class AdaptiveRefreshPolicy {
   bool cfcLearn();
   void resetCfcEpisode();
   int16_t cfcGroupMean(uint8_t first) const;
+  // Localized (region) clears, region mode only.
+  bool localizedClearPossible() const;
+  // Tiles whose ghost (committed, or after this frame with `next`) stands at
+  // least half way from the screen mean to the hottest tile; 0 when flat.
+  uint64_t hotTiles(bool next) const;
+  // The tiles and their bounding rect a localized clear for `reason` would
+  // cover (with `sticking`, the image tiles join a debt clear); false when
+  // the clear needs the whole screen.
+  bool localizedRegion(const Inputs& in, Reason reason, bool sticking, Rect& region, uint64_t& tiles) const;
+  // A committed localized clear: zero those tiles' ghost and drop their share
+  // of the debt.
+  void regionTilesCleared(uint64_t tiles);
+  static Rect tileBounds(uint64_t tiles, uint16_t screenWidth, uint16_t screenHeight);
 
   Config config_;
   uint32_t debt_ = 0;            // weighted changed pixels since the last clear (saturating)
@@ -527,4 +615,8 @@ class AdaptiveRefreshPolicy {
   uint16_t cfcImageAreaPermille_ = 0;     // largest image area recorded since the last clear
   uint8_t cfcTraceTurns_ = 0;             // fast turns in the trace (saturating)
   bool cfcInverted_ = false;              // night output at the last decide()
+  // LiquidDisplay CfC v3.
+  uint64_t pendingRegionTiles_ = 0;       // tiles of a localized Region decision, set by decide()
+  int8_t orientW_[kOrientFeatures] = {};  // y4 orientation weights, learnable (set by the ctor)
+  uint16_t orientUpdates_ = 0;            // orientation e-prop updates applied (saturating)
 };

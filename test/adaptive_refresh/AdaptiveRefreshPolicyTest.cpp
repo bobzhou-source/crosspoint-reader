@@ -4,9 +4,11 @@
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
+#include <utility>
 #include <vector>
 
 #include "AdaptiveRefreshPolicy.h"
+#include "SmoothResample.h"
 
 namespace {
 
@@ -1159,4 +1161,337 @@ TEST(LiquidCfc, EpropLearnsTheGateReadoutAndLqrfV2KeepsIt) {
 
   // A v2 header cut to the v1 size is rejected.
   EXPECT_FALSE(Policy(false).loadLearnedState(buf, Policy::kLearnedStateV1Bytes));
+}
+
+// --- LiquidDisplay CfC v3: y3 unsharp + paper white, y4 orientation, localized clears ---
+
+TEST(LiquidDisplay, UnsharpAndPaperWhiteSharpenLineArtAndLeavePhotosSmooth) {
+  Policy p(false, cardConfig());
+  const auto diagram = p.computeImageDitherParams(250, 100);
+  EXPECT_GE(diagram.unsharpGainQ8, 80);
+  EXPECT_LE(diagram.unsharpGainQ8, 148);
+  EXPECT_GE(diagram.whiteClip, 238);
+  EXPECT_LE(diagram.whiteClip, 246);
+  const auto photo = p.computeImageDitherParams(0, 800);
+  EXPECT_LE(photo.unsharpGainQ8, 16) << "continuous tone keeps its grain smooth";
+  EXPECT_GE(photo.whiteClip, 253);
+  for (const uint16_t edge : {0, 25, 60, 120, 250, 400, 1000}) {
+    for (const uint16_t mid : {0, 100, 400, 800, 1000}) {
+      for (const uint16_t up : {500, 1000, 2000, 3000, 8000}) {
+        const auto d = p.computeImageDitherParams(edge, mid, up);
+        EXPECT_LE(d.unsharpGainQ8, Policy::kUnsharpGainMaxQ8);
+        EXPECT_GE(d.whiteClip, Policy::kWhiteClipMin);
+        EXPECT_EQ(d.whiteClip, 255 - (7 * d.unsharpGainQ8 + 32) / 64) << "the snap follows the sharpening";
+      }
+    }
+  }
+  // Any continuous-tone photo stays unsharpened at any enlargement.
+  for (const uint16_t up : {1000, 2000, 3000}) EXPECT_EQ(p.computeImageDitherParams(0, 800, up).unsharpGainQ8, 0);
+}
+
+TEST(LiquidDisplay, EnlargedFiguresSharpenMore) {
+  Policy p(false, cardConfig());
+  EXPECT_GT(p.computeImageDitherParams(60, 400, 2000).unsharpGainQ8, p.computeImageDitherParams(60, 400).unsharpGainQ8);
+  EXPECT_EQ(p.computeImageDitherParams(60, 400, 500), p.computeImageDitherParams(60, 400, 1000))
+      << "downscales sharpen like 1:1";
+  EXPECT_EQ(p.computeImageDitherParams(250, 100, 3000), p.computeImageDitherParams(250, 100, 9000))
+      << "the boost saturates at 3x";
+  for (const uint16_t edge : {25, 60, 120, 250}) {
+    for (const uint16_t mid : {100, 400, 800}) {
+      uint16_t previous = 0;
+      for (const uint16_t up : {1000, 1500, 2000, 2500, 3000}) {
+        const auto gain = p.computeImageDitherParams(edge, mid, up).unsharpGainQ8;
+        EXPECT_GE(gain, previous) << edge << "/" << mid << " at " << up;
+        previous = gain;
+      }
+    }
+  }
+}
+
+TEST(LiquidDisplay, AChargedPanelSharpensMoreAndSnapsWhiteHarder) {
+  Policy fresh(false, cardConfig());
+  Policy worn(false, cardConfig());
+  worn.recordImageExposure(20000, 700, 800);
+  ASSERT_GT(worn.cfcStickQ8(), 0);
+  Policy turned(false, cardConfig());
+  for (int i = 0; i < 6; ++i) ASSERT_EQ(step(turned, dwell(400, 600)).refresh, Refresh::Fast);
+  ASSERT_GT(turned.cfcChargeQ8(), 0);
+  for (const Policy* charged : {&worn, &turned}) {
+    for (const uint16_t edge : {60, 120, 250, 400}) {
+      for (const uint16_t mid : {100, 400, 800}) {
+        const auto a = fresh.computeImageDitherParams(edge, mid, 1500);
+        const auto b = charged->computeImageDitherParams(edge, mid, 1500);
+        EXPECT_GE(b.unsharpGainQ8, a.unsharpGainQ8) << edge << "/" << mid;
+        EXPECT_LE(b.whiteClip, a.whiteClip) << edge << "/" << mid;
+      }
+    }
+  }
+  EXPECT_GT(worn.computeImageDitherParams(250, 400).unsharpGainQ8, fresh.computeImageDitherParams(250, 400).unsharpGainQ8);
+  EXPECT_EQ(worn.computeImageDitherParams(0, 800).unsharpGainQ8, 0) << "photos stay smooth on a worn panel";
+}
+
+TEST(LiquidDisplay, LocalizedImageStickingClearsOnlyThePictureTiles) {
+  auto config = cardConfig();
+  config.imageClearRegion = true;
+  Policy p(false, config);
+  Records records;
+  p.setClearObserver(&Records::observe, &records);
+  ASSERT_EQ(step(p, dwell(300, 30000)).refresh, Refresh::Fast);
+  // A 240 x 400 picture in the top-left of the portrait screen: 4 x 3 tiles.
+  const uint64_t picture = Policy::tileMaskFor({0, 0, 240, 400}, kScreenW, kScreenH);
+  ASSERT_EQ(__builtin_popcountll(picture), 12);
+  p.recordImageExposure(40000, 250, 600, picture);
+  EXPECT_TRUE(p.regionClearWanted()) << "a 12-tile footprint can be cleared locally";
+  uint16_t over[Policy::kTileCount];
+  for (auto& t : over) t = 300;
+  p.recordTileTransitions(over, 0);
+  auto in = dwell(300, 40400);
+  in.screenWidth = kScreenW;
+  in.screenHeight = kScreenH;
+  in.regionClearAvailable = p.regionClearWanted();
+  const auto d = p.decide(in);
+  EXPECT_EQ(d.refresh, Refresh::Region);
+  EXPECT_EQ(d.reason, Reason::ImageSticking);
+  EXPECT_EQ(d.region, (Rect{0, 0, 240, 400}));
+  p.commit(d.refresh);
+  ASSERT_EQ(records.rows.size(), 1u);
+  EXPECT_TRUE(records.rows[0].regionOnly);
+  EXPECT_EQ(records.rows[0].reason, Reason::ImageSticking);
+  EXPECT_EQ(p.imageTileMask(), 0u) << "the cleared footprint ends the sticking episode";
+  EXPECT_EQ(p.cfcStickQ8(), 0);
+
+  // Without the panel's windowed clear, or with an unknown (whole-screen)
+  // footprint, the same page clears the whole screen.
+  Policy unavailable(false, config);
+  ASSERT_EQ(step(unavailable, dwell(300, 30000)).refresh, Refresh::Fast);
+  unavailable.recordImageExposure(40000, 250, 600, picture);
+  unavailable.recordTileTransitions(over, 0);
+  in.regionClearAvailable = false;
+  EXPECT_EQ(unavailable.decide(in).refresh, Refresh::Clear);
+  Policy everywhere(false, config);
+  ASSERT_EQ(step(everywhere, dwell(300, 30000)).refresh, Refresh::Fast);
+  everywhere.recordImageExposure(40000, 700, 600);
+  EXPECT_FALSE(everywhere.regionClearWanted());
+  everywhere.recordTileTransitions(over, 0);
+  in.regionClearAvailable = true;
+  const auto full = everywhere.decide(in);
+  EXPECT_EQ(full.refresh, Refresh::Clear);
+  EXPECT_EQ(full.reason, Reason::ImageSticking);
+  // Region mode off: never a localized clear.
+  Policy off(false, cardConfig());
+  ASSERT_EQ(step(off, dwell(300, 30000)).refresh, Refresh::Fast);
+  off.recordImageExposure(40000, 250, 600, picture);
+  EXPECT_FALSE(off.regionClearWanted());
+  off.recordTileTransitions(over, 0);
+  EXPECT_EQ(off.decide(in).refresh, Refresh::Clear);
+}
+
+TEST(LiquidDisplay, LocalizedTileDebtClearsOnlyTheHotTiles) {
+  uint16_t peak[Policy::kTileCount] = {};
+  for (int i = 0; i < 5; ++i) peak[i] = 960;
+  Policy p(false, regionMode());
+  Policy::Decision d{};
+  unsigned turns = 0;
+  for (; turns < 10; ++turns) {
+    p.recordTileTransitions(peak, 0);
+    auto in = exact(100);
+    in.screenWidth = kScreenW;
+    in.screenHeight = kScreenH;
+    in.regionClearAvailable = p.regionClearWanted();
+    d = p.decide(in);
+    p.commit(d.refresh);
+    if (d.refresh != Refresh::Fast) break;
+  }
+  EXPECT_LE(turns, 3u);
+  EXPECT_EQ(d.refresh, Refresh::Region);
+  EXPECT_EQ(d.reason, Reason::Debt);
+  EXPECT_EQ(d.region, (Rect{0, 0, 300, 134})) << "tiles 0-4 of the top row";
+  for (int i = 0; i < 5; ++i) EXPECT_EQ(p.tileGhostPermille(i), 0) << i;
+  EXPECT_LT(p.debtPixels(), 100u * (turns + 1)) << "the cleared tiles take their share of the debt";
+}
+
+TEST(LiquidDisplay, OrientationIsLearnedFromManualRotations) {
+  Policy p(false);
+  for (uint8_t i = 0; i < Policy::kOrientFeatures; ++i) EXPECT_EQ(p.orientWeight(i), Policy::kOrientDefaultW[i]);
+  // Untaught, nothing rotates, whatever its shape.
+  for (const auto& wh : {std::pair{800, 300}, std::pair{300, 800}, std::pair{500, 500}, std::pair{4000, 100}}) {
+    EXPECT_FALSE(p.recommendImageRotation(wh.first, wh.second, kScreenW, kScreenH)) << wh.first << "x" << wh.second;
+  }
+  EXPECT_FALSE(p.recommendImageRotation(0, 300, kScreenW, kScreenH));
+  EXPECT_FALSE(p.recordManualRotation(0, 300, kScreenW, kScreenH, true));
+  EXPECT_EQ(p.orientUpdates(), 0u);
+
+  // One rotation of a wide figure on the portrait reader.
+  EXPECT_TRUE(p.recordManualRotation(800, 300, kScreenW, kScreenH, true));
+  EXPECT_EQ(p.orientUpdates(), 1u);
+  EXPECT_TRUE(p.recommendImageRotation(800, 300, kScreenW, kScreenH));
+  EXPECT_TRUE(p.recommendImageRotation(1600, 500, kScreenW, kScreenH)) << "other wide pictures follow";
+  EXPECT_FALSE(p.recommendImageRotation(300, 800, kScreenW, kScreenH)) << "a tall one already fills the screen";
+  EXPECT_FALSE(p.recommendImageRotation(500, 500, kScreenW, kScreenH));
+
+  // Turning wide figures back unlearns it.
+  for (int i = 0; i < 4 && p.recommendImageRotation(800, 300, kScreenW, kScreenH); ++i) {
+    EXPECT_TRUE(p.recordManualRotation(800, 300, kScreenW, kScreenH, false));
+  }
+  EXPECT_FALSE(p.recommendImageRotation(800, 300, kScreenW, kScreenH));
+
+  // Endless rotations stay within the drift bound of the default.
+  for (int i = 0; i < 400; ++i) p.recordManualRotation(800, 300, kScreenW, kScreenH, true);
+  for (uint8_t i = 0; i < Policy::kOrientFeatures; ++i) {
+    EXPECT_LE(std::abs(p.orientWeight(i) - Policy::kOrientDefaultW[i]), Policy::kOrientDrift) << int(i);
+  }
+}
+
+TEST(LiquidDisplay, OrientationPersistsInTheLqrfV2Reserve) {
+  Policy p(false);
+  ASSERT_TRUE(p.recordManualRotation(800, 300, kScreenW, kScreenH, true));
+  uint8_t buf[Policy::kLearnedStateBytes];
+  ASSERT_EQ(p.saveLearnedState(buf, sizeof buf), 64u);
+  Policy restored(false);
+  ASSERT_TRUE(restored.loadLearnedState(buf, sizeof buf));
+  for (uint8_t i = 0; i < Policy::kOrientFeatures; ++i) EXPECT_EQ(restored.orientWeight(i), p.orientWeight(i));
+  EXPECT_EQ(restored.orientUpdates(), 1u);
+  EXPECT_TRUE(restored.recommendImageRotation(800, 300, kScreenW, kScreenH));
+  EXPECT_EQ(restored.cfcReadout(), p.cfcReadout());
+  restored.reset();
+  EXPECT_TRUE(restored.recommendImageRotation(800, 300, kScreenW, kScreenH)) << "a new book keeps it";
+  restored.resetLearnedState();
+  for (uint8_t i = 0; i < Policy::kOrientFeatures; ++i) EXPECT_EQ(restored.orientWeight(i), Policy::kOrientDefaultW[i]);
+  EXPECT_EQ(restored.orientUpdates(), 0u);
+
+  // A v2 file written before CfC v3 (orientation tag 0) keeps the defaults.
+  uint8_t v2[Policy::kLearnedStateBytes];
+  std::memcpy(v2, buf, sizeof v2);
+  v2[58] = 0;
+  const uint32_t check = fnv1a(v2, 60);
+  std::memcpy(v2 + 60, &check, 4);
+  Policy old(false);
+  ASSERT_TRUE(old.loadLearnedState(v2, sizeof v2));
+  for (uint8_t i = 0; i < Policy::kOrientFeatures; ++i) EXPECT_EQ(old.orientWeight(i), Policy::kOrientDefaultW[i]);
+  EXPECT_FALSE(old.recommendImageRotation(800, 300, kScreenW, kScreenH));
+  EXPECT_EQ(old.cfcReadout(), p.cfcReadout()) << "the rest of the v2 file still loads";
+}
+
+namespace {
+
+using smooth_resample::DitherShaper;
+
+smooth_resample::DitherParams gFixedParams;
+smooth_resample::DitherParams fixedParams(void*, uint16_t, uint16_t, uint16_t) { return gFixedParams; }
+
+// The policy as ReaderActivity::ditherFor binds it.
+smooth_resample::DitherParams policyParams(void* context, uint16_t edge, uint16_t mid, uint16_t up) {
+  const auto d = static_cast<const Policy*>(context)->computeImageDitherParams(edge, mid, up);
+  return {d.contrastGainQ8, d.errorBleedQ8, d.unsharpGainQ8, d.whiteClip};
+}
+
+struct ProviderScope {
+  ProviderScope(smooth_resample::DitherProvider provider, void* context) {
+    smooth_resample::setDitherProvider(provider, context);
+  }
+  ~ProviderScope() {
+    smooth_resample::setDitherProvider(nullptr, nullptr);
+    smooth_resample::lastEdgePermille = 60;
+    smooth_resample::lastMidGrayPermille = 400;
+  }
+};
+
+// Shape + diffuse a gray image (one span per row, as the PNG path); levels 0-3.
+std::vector<uint8_t> render(const std::vector<uint8_t>& gray, const int w, const int h) {
+  DitherShaper shaper(w);
+  std::vector<int16_t> down(w, 0);
+  std::vector<uint8_t> levels(gray.size());
+  for (int y = 0; y < h; ++y) {
+    int carry = 0;
+    for (int x = 0; x < w; ++x) {
+      const int v = shaper.shape(gray[y * w + x], x == 0, x);
+      levels[y * w + x] = smooth_resample::diffuse(v, down.data(), x, x == 0, carry, shaper.bleedQ8());
+    }
+  }
+  return levels;
+}
+
+}  // namespace
+
+TEST(LiquidDisplay, ShaperUnsharpOvershootsEdgesFromCausalNeighbours) {
+  gFixedParams = {256, 256, 128, 252};
+  ProviderScope scope(&fixedParams, nullptr);
+  DitherShaper shaper(16);
+  int dark = 0;
+  int light = 0;
+  for (int y = 0; y < 3; ++y) {
+    for (int x = 0; x < 16; ++x) {
+      const int out = shaper.shape(x < 8 ? 200 : 60, x == 0, x);
+      if (y == 2 && x == 7) light = out;
+      if (y == 2 && x == 8) dark = out;
+    }
+  }
+  EXPECT_EQ(light, 200) << "flat neighbourhood: unchanged";
+  EXPECT_EQ(dark, 60 + (60 - (60 + 200 + 200 + 60) / 4) * 128 / 256) << "dark side of the edge goes darker";
+  EXPECT_EQ(shaper.params().unsharpGainQ8, 128);
+
+  // A span start forgets the left neighbours; without row memory only they count.
+  DitherShaper narrow;
+  EXPECT_EQ(narrow.shape(60, true), 60);
+  EXPECT_EQ(narrow.shape(200, false), 200 + (200 - (200 + 60) / 2) * 128 / 256);
+  EXPECT_EQ(narrow.shape(60, true), 60);
+
+  gFixedParams = {256, 256, 0, 252};
+  DitherShaper plain(16);
+  EXPECT_EQ(plain.shape(200, true, 0), 200);
+  EXPECT_EQ(plain.shape(60, false, 1), 60) << "gain 0 is the plain filter";
+}
+
+TEST(LiquidDisplay, PaperWhiteSnapRemovesBackgroundPepper) {
+  constexpr int kW = 64;
+  constexpr int kH = 64;
+  std::vector<uint8_t> paper(kW * kH, 245);
+  gFixedParams = {256, 256, 0, 255};
+  ProviderScope scope(&fixedParams, nullptr);
+  const auto unsnapped = render(paper, kW, kH);
+  int pepper = 0;
+  for (const auto l : unsnapped) pepper += l < 3;
+  EXPECT_GT(pepper, 0) << "245 paper diffuses into level-2 dots";
+  gFixedParams = {256, 256, 0, 240};
+  const auto snapped = render(paper, kW, kH);
+  for (const auto l : snapped) ASSERT_EQ(l, 3);
+  EXPECT_EQ(DitherShaper(0).shape(245, true), 255);
+}
+
+TEST(LiquidDisplay, PolicyDrivenShaperKeepsAFigureCrispAndItsPaperWhite) {
+  // A scanned figure: 245 paper, 2 px black rules every 16 px, at 2x.
+  constexpr int kW = 96;
+  constexpr int kH = 96;
+  std::vector<uint8_t> figure(kW * kH, 245);
+  for (int y = 0; y < kH; ++y) {
+    for (int x = 0; x < kW; ++x) {
+      if (x % 16 < 2 || y % 16 < 2) figure[y * kW + x] = 20;
+    }
+  }
+  Policy p(false, cardConfig());
+  const auto params = p.computeImageDitherParams(250, 100, 2000);
+  ASSERT_GT(params.unsharpGainQ8, 0);
+  ASSERT_LT(params.whiteClip, 245);
+  ProviderScope scope(&policyParams, &p);
+  smooth_resample::lastEdgePermille = 250;
+  smooth_resample::lastMidGrayPermille = 100;
+  DitherShaper shaper(kW, smooth_resample::upscalePermille(2 * kW, kW));
+  EXPECT_EQ(shaper.params().unsharpGainQ8, params.unsharpGainQ8);
+  EXPECT_EQ(shaper.params().whiteClip, params.whiteClip);
+  const auto levels = render(figure, kW, kH);
+  int pepper = 0;
+  int rules = 0;
+  int black = 0;
+  for (int y = 0; y < kH; ++y) {
+    for (int x = 0; x < kW; ++x) {
+      const bool ink = x % 16 < 2 || y % 16 < 2;
+      const bool far = x % 16 >= 5 && x % 16 <= 12 && y % 16 >= 5 && y % 16 <= 12;
+      if (far) pepper += levels[y * kW + x] < 3;
+      if (ink) ++rules, black += levels[y * kW + x] == 0;
+    }
+  }
+  EXPECT_EQ(pepper, 0) << "paper stays white";
+  EXPECT_GT(black * 10, rules * 9) << "rules stay black";
+  EXPECT_EQ(smooth_resample::upscalePermille(2 * kW, kW), 2000);
+  EXPECT_EQ(smooth_resample::upscalePermille(0, kW), 1000);
 }

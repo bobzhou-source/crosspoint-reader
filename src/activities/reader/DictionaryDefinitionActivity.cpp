@@ -27,6 +27,22 @@ constexpr size_t MAX_LINE_BYTES = 191;
 // path, which holds no per-page copies.
 constexpr size_t MAX_STYLED_HTML_BYTES = 16 * 1024;
 
+// Rows above the body: the CJK match bar, then (sectioned view) the tabs and
+// the length toggle.
+constexpr int MATCH_BAR_HEIGHT = 44;
+constexpr int TAB_ROW_HEIGHT = 40;
+constexpr int TOGGLE_ROW_HEIGHT = 36;
+constexpr int ROW_GAP = 6;
+// Holding Confirm this long toggles Compact / Longer; a short press is the
+// next tab.
+constexpr unsigned long LENGTH_TOGGLE_MS = 700;
+// Section header rules: a short lead-in, then the rest of the line.
+constexpr int HEADER_LEAD_RULE = 16;
+constexpr int HEADER_RULE_GAP = 8;
+
+using DictionaryLookup::LineKind;
+using DictionaryLookup::Section;
+
 }  // namespace
 
 void DictionaryDefinitionActivity::onEnter() {
@@ -44,10 +60,80 @@ void DictionaryDefinitionActivity::layoutDefinition() {
   // Normalize StarDict multi-type separators so the wrap loop and the
   // C-string font APIs below both see the whole definition.
   std::replace(definition.begin(), definition.end(), '\0', '\n');
+  if (sectioned) {
+    // The tabs show plain text: the definition becomes the Def section.
+    sections.defLong = htmlToPlainText(definition);
+    sections.defShort = DictionaryLookup::compactDefinition(sections.defLong);
+    if (sections.defShort == sections.defLong) sections.defShort.clear();
+    layoutSections();
+    return;
+  }
   if (!(htmlDefinition && definition.size() <= MAX_STYLED_HTML_BYTES && layoutHtmlPages())) {
     definition = htmlToPlainText(definition);
     wrapText();
   }
+}
+
+void DictionaryDefinitionActivity::layoutSections() {
+  if (!sections.has(activeSection)) activeSection = Section::All;
+  definition = DictionaryLookup::composeSections(sections, activeSection, longer, headerOffsets);
+  wrapText();
+  std::vector<LineKind> kinds;
+  kinds.reserve(lines.size());
+  for (size_t i = 0; i < lines.size(); ++i) {
+    kinds.push_back(isHeaderLine(i) ? LineKind::Header : lines[i].len == 0 ? LineKind::Blank : LineKind::Text);
+  }
+  pageStarts = DictionaryLookup::paginateLines(kinds, linesPerPage);
+  totalPages = static_cast<int>(pageStarts.size());
+  currentPage = 0;
+}
+
+void DictionaryDefinitionActivity::selectSection(const Section section) {
+  if (section == activeSection) return;
+  {
+    RenderLock lock;
+    activeSection = section;
+    layoutSections();
+  }
+  requestUpdate();
+}
+
+void DictionaryDefinitionActivity::setLonger(const bool value) {
+  if (value == longer) return;
+  {
+    RenderLock lock;
+    longer = value;
+    layoutSections();
+  }
+  requestUpdate();
+}
+
+size_t DictionaryDefinitionActivity::availableSections(Section out[DictionaryLookup::SECTION_COUNT]) const {
+  size_t n = 0;
+  for (const Section section : {Section::All, Section::Def, Section::Story, Section::Related, Section::Riff}) {
+    if (sections.has(section)) out[n++] = section;
+  }
+  return n;
+}
+
+bool DictionaryDefinitionActivity::isHeaderLine(const size_t line) const {
+  return sectioned && line < lines.size() && lines[line].len > 0 &&
+         std::binary_search(headerOffsets.begin(), headerOffsets.end(), lines[line].start);
+}
+
+int DictionaryDefinitionActivity::pageFirstLine(const int page) const {
+  if (!sectioned) return page * linesPerPage;
+  return page >= 0 && page < static_cast<int>(pageStarts.size()) ? static_cast<int>(pageStarts[page])
+                                                                 : static_cast<int>(lines.size());
+}
+
+int DictionaryDefinitionActivity::pageEndLine(const int page) const {
+  const int first = pageFirstLine(page);
+  int end = std::min(first + linesPerPage, static_cast<int>(lines.size()));
+  if (sectioned && page + 1 < static_cast<int>(pageStarts.size())) {
+    end = std::min(end, static_cast<int>(pageStarts[page + 1]));
+  }
+  return end;
 }
 
 void DictionaryDefinitionActivity::changeMatch(const int direction) {
@@ -87,9 +173,13 @@ void DictionaryDefinitionActivity::onExit() {
   }
 }
 
+int DictionaryDefinitionActivity::controlsHeight() const {
+  return (dictionary ? MATCH_BAR_HEIGHT : 0) + (sectioned ? TAB_ROW_HEIGHT + ROW_GAP + TOGGLE_ROW_HEIGHT + ROW_GAP : 0);
+}
+
 DictionaryDefinitionActivity::BodyArea DictionaryDefinitionActivity::bodyArea() const {
   const Rect body = UITheme::getContentBounds(renderer);
-  return {body.width, body.height - (dictionary ? 44 : 0)};
+  return {body.width, body.height - controlsHeight()};
 }
 
 // Styled path: lay the HTML definition out through the EPUB chapter parser
@@ -129,7 +219,8 @@ void DictionaryDefinitionActivity::wrapText() {
   // SD-card fonts: merge every definition codepoint into the persistent
   // advance table up front. Otherwise each unseen codepoint measured below
   // falls back to an on-demand glyph load from SD (8-slot overflow ring).
-  renderer.ensureSdCardFontReady(fontId, definition.c_str(), 0x01 /* REGULAR */);
+  // Sectioned view: its headers are drawn bold.
+  renderer.ensureSdCardFontReady(fontId, definition.c_str(), sectioned ? 0x03 /* REGULAR | BOLD */ : 0x01);
 
   const BodyArea body = bodyArea();
   const int maxWidth = body.width;
@@ -230,6 +321,25 @@ void DictionaryDefinitionActivity::loop() {
     finish();
     return;
   }
+  if (sectioned) {
+    // Hold Confirm: Compact <-> Longer; press: the next tab with text.
+    if (mappedInput.wasLongPressed(MappedInputManager::Button::Confirm, LENGTH_TOGGLE_MS)) {
+      setLonger(!longer);
+      return;
+    }
+    if (mappedInput.wasReleased(MappedInputManager::Button::Confirm)) {
+      selectSection(DictionaryLookup::nextSection(sections, activeSection, 1));
+      return;
+    }
+    if (!dictionary && mappedInput.wasPressed(MappedInputManager::Button::Up)) {
+      setLonger(false);
+      return;
+    }
+    if (!dictionary && mappedInput.wasPressed(MappedInputManager::Button::Down)) {
+      setLonger(true);
+      return;
+    }
+  }
   if (dictionary && mappedInput.wasPressed(MappedInputManager::Button::Up)) {
     changeMatch(-1);
     return;
@@ -244,8 +354,27 @@ void DictionaryDefinitionActivity::loop() {
   int tx = 0;
   int ty = 0;
   if (mappedInput.wasScreenTapped(tx, ty)) {
-    if (dictionary && ty < UITheme::getContentBounds(renderer).y + 44) {
-      changeMatch(tx < renderer.getScreenWidth() / 2 ? -1 : 1);
+    const Rect content = UITheme::getContentBounds(renderer);
+    int rowY = content.y;
+    if (dictionary) {
+      if (ty < rowY + MATCH_BAR_HEIGHT) {
+        changeMatch(tx < renderer.getScreenWidth() / 2 ? -1 : 1);
+        return;
+      }
+      rowY += MATCH_BAR_HEIGHT;
+    }
+    if (sectioned && ty >= rowY && ty < rowY + TAB_ROW_HEIGHT + ROW_GAP / 2) {
+      Section available[DictionaryLookup::SECTION_COUNT];
+      const size_t n = availableSections(available);
+      if (n > 0 && content.width > 0) {
+        const int cell = std::clamp((tx - content.x) * static_cast<int>(n) / content.width, 0, static_cast<int>(n) - 1);
+        selectSection(available[cell]);
+      }
+      return;
+    }
+    rowY += TAB_ROW_HEIGHT + ROW_GAP;
+    if (sectioned && ty >= rowY - ROW_GAP / 2 && ty < rowY + TOGGLE_ROW_HEIGHT + ROW_GAP / 2) {
+      setLonger(tx >= content.x + content.width / 2);
       return;
     }
     if (tx < renderer.getScreenWidth() / 3) {
@@ -279,22 +408,67 @@ void DictionaryDefinitionActivity::loop() {
 // otherwise the wrapped line spans (copied into a stack buffer for NUL
 // termination). Called twice per render: once in font-cache scan mode, once
 // for the real paint.
-void DictionaryDefinitionActivity::drawBody(const int fontId, const int x, const int startY) const {
+void DictionaryDefinitionActivity::drawBody(const int fontId, const int x, const int startY, const int width) const {
   if (!pages.empty()) {
     pages[currentPage]->render(renderer, fontId, x, startY);
     return;
   }
   const int lineHeight = renderer.getLineHeight(fontId);
   char buf[MAX_LINE_BYTES + 1];
-  const int firstLine = currentPage * linesPerPage;
-  const int lastLine = std::min(firstLine + linesPerPage, static_cast<int>(lines.size()));
+  const int firstLine = pageFirstLine(currentPage);
+  const int lastLine = pageEndLine(currentPage);
   for (int i = firstLine; i < lastLine; i++) {
     if (lines[i].len == 0) continue;
     const size_t len = std::min(static_cast<size_t>(lines[i].len), MAX_LINE_BYTES);
     memcpy(buf, definition.c_str() + lines[i].start, len);
     buf[len] = '\0';
-    renderer.drawText(fontId, x, startY + (i - firstLine) * lineHeight, buf);
+    const int y = startY + (i - firstLine) * lineHeight;
+    if (!isHeaderLine(static_cast<size_t>(i))) {
+      renderer.drawText(fontId, x, y, buf);
+      continue;
+    }
+    // "── HEADER ─────": bold, ruled out to the right edge.
+    const int ruleY = y + lineHeight / 2;
+    const int textX = x + HEADER_LEAD_RULE + HEADER_RULE_GAP;
+    renderer.drawLine(x, ruleY, x + HEADER_LEAD_RULE, ruleY, 2, true);
+    renderer.drawText(fontId, textX, y, buf, true, EpdFontFamily::BOLD);
+    const int ruleX = textX + renderer.getTextWidth(fontId, buf, EpdFontFamily::BOLD) + HEADER_RULE_GAP;
+    if (ruleX < x + width) renderer.drawLine(ruleX, ruleY, x + width - 1, ruleY, 2, true);
   }
+}
+
+// The tab row (active tab inverted, only tabs with text) and the
+// Compact | Longer toggle (active half inverted).
+void DictionaryDefinitionActivity::drawSectionControls(const int x, const int y, const int width) const {
+  const int smallHeight = renderer.getLineHeight(SMALL_FONT_ID);
+  const auto drawRow = [&](const int rowY, const int rowHeight, const char* const* labels, const size_t count,
+                           const size_t active) {
+    renderer.drawRect(x, rowY, width, rowHeight);
+    const int textY = rowY + (rowHeight - smallHeight) / 2;
+    for (size_t k = 0; k < count; ++k) {
+      const int cellX = x + static_cast<int>(k) * width / static_cast<int>(count);
+      const int cellW = x + static_cast<int>(k + 1) * width / static_cast<int>(count) - cellX;
+      const bool on = k == active;
+      if (on) {
+        renderer.fillRect(cellX, rowY, cellW, rowHeight, true);
+      } else if (k > 0 && k != active + 1) {
+        renderer.drawLine(cellX, rowY, cellX, rowY + rowHeight - 1, true);
+      }
+      UITheme::drawCenteredText(renderer, Rect{cellX, rowY, cellW, rowHeight}, SMALL_FONT_ID, textY, labels[k], !on,
+                                on ? EpdFontFamily::BOLD : EpdFontFamily::REGULAR);
+    }
+  };
+  Section available[DictionaryLookup::SECTION_COUNT];
+  const char* tabLabels[DictionaryLookup::SECTION_COUNT];
+  const size_t count = availableSections(available);
+  size_t active = 0;
+  for (size_t k = 0; k < count; ++k) {
+    tabLabels[k] = DictionaryLookup::sectionLabel(available[k]);
+    if (available[k] == activeSection) active = k;
+  }
+  drawRow(y, TAB_ROW_HEIGHT, tabLabels, count, active);
+  static const char* const LENGTH_LABELS[] = {"Compact", "Longer"};
+  drawRow(y + TAB_ROW_HEIGHT + ROW_GAP, TOGGLE_ROW_HEIGHT, LENGTH_LABELS, 2, longer ? 1 : 0);
 }
 
 void DictionaryDefinitionActivity::render(RenderLock&&) {
@@ -309,10 +483,15 @@ void DictionaryDefinitionActivity::render(RenderLock&&) {
                  counter[0] ? counter : nullptr);
   if (dictionary) {
     const int half = body.width / 2;
-    UITheme::drawCenteredText(renderer, Rect{body.x, body.y, half, 44}, SMALL_FONT_ID, body.y, tr(STR_DICT_SHORTER));
-    UITheme::drawCenteredText(renderer, Rect{body.x + half, body.y, body.width - half, 44}, SMALL_FONT_ID, body.y,
-                              tr(STR_DICT_LONGER));
-    body.y += 44;
+    UITheme::drawCenteredText(renderer, Rect{body.x, body.y, half, MATCH_BAR_HEIGHT}, SMALL_FONT_ID, body.y,
+                              tr(STR_DICT_SHORTER));
+    UITheme::drawCenteredText(renderer, Rect{body.x + half, body.y, body.width - half, MATCH_BAR_HEIGHT}, SMALL_FONT_ID,
+                              body.y, tr(STR_DICT_LONGER));
+    body.y += MATCH_BAR_HEIGHT;
+  }
+  if (sectioned) {
+    drawSectionControls(body.x, body.y, body.width);
+    body.y += TAB_ROW_HEIGHT + ROW_GAP + TOGGLE_ROW_HEIGHT + ROW_GAP;
   }
 
   // Body: two-pass draw inside a prewarm scope (same pattern as the reader's
@@ -321,12 +500,12 @@ void DictionaryDefinitionActivity::render(RenderLock&&) {
   const int fontId = SETTINGS.getReaderFontId();
   auto* fcm = renderer.getFontCacheManager();
   auto scope = fcm->createPrewarmScope();
-  drawBody(fontId, body.x, body.y);  // scan pass: records codepoints only
+  drawBody(fontId, body.x, body.y, body.width);  // scan pass: records codepoints only
   scope.endScanAndPrewarm();
-  drawBody(fontId, body.x, body.y);
+  drawBody(fontId, body.x, body.y, body.width);
 
-  const auto labels =
-      mappedInput.mapLabels(tr(STR_BACK), "", (currentPage > 0 ? "<" : ""), (currentPage + 1 < totalPages ? ">" : ""));
+  const auto labels = mappedInput.mapLabels(tr(STR_BACK), sectioned ? "Tab" : "", (currentPage > 0 ? "<" : ""),
+                                            (currentPage + 1 < totalPages ? ">" : ""));
   GUI.drawButtonHints(renderer, labels.btn1, labels.btn2, labels.btn3, labels.btn4);
   renderer.displayBuffer();
 }

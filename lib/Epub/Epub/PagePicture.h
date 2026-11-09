@@ -42,6 +42,24 @@ inline bool isTappable(const PagePicture& picture) {
   return picture.width >= MIN_TAP_EXTENT && picture.height >= MIN_TAP_EXTENT;
 }
 
+// The reader's orientation head (LiquidDisplay CfC y4) as the full-screen
+// viewer sees it: whether to open a sourceWidth x sourceHeight picture turned
+// on a viewWidth x viewHeight reading screen, and what the user then chose
+// with the direction buttons. edge/midGray: the last decode's densities
+// (permille). Both run under the render lock; null members mean no advice.
+struct RotationAdvisor {
+  using Recommend = bool (*)(void* context, uint16_t sourceWidth, uint16_t sourceHeight, uint16_t viewWidth,
+                             uint16_t viewHeight, uint16_t edgePermille, uint16_t midGrayPermille);
+  using Record = void (*)(void* context, uint16_t sourceWidth, uint16_t sourceHeight, uint16_t viewWidth,
+                          uint16_t viewHeight, bool rotated, uint16_t edgePermille, uint16_t midGrayPermille);
+  Recommend recommend = nullptr;
+  Record record = nullptr;
+  void* context = nullptr;
+};
+
+// A source dimension as the advisor takes it (saturating).
+inline uint16_t advisorDimension(const uint32_t v) { return v > UINT16_MAX ? UINT16_MAX : static_cast<uint16_t>(v); }
+
 // Index of the tappable picture under screen point (x, y), or -1. The
 // picture's box grows by TAP_PAD on every side; the first hit wins.
 inline int pictureAtPoint(const std::vector<PagePicture>& pictures, const int x, const int y, const int marginLeft,

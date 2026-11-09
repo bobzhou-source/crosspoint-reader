@@ -63,10 +63,28 @@ uint32_t ReaderActivity::takeFrameDwellMs() {
 
 // Render task (picture decodes run inside page renders, under the render lock).
 smooth_resample::DitherParams ReaderActivity::ditherFor(void* context, const uint16_t edgePermille,
-                                                        const uint16_t midGrayPermille) {
-  const auto params =
-      static_cast<ReaderActivity*>(context)->refreshPolicy.computeImageDitherParams(edgePermille, midGrayPermille);
-  return {params.contrastGainQ8, params.errorBleedQ8};
+                                                        const uint16_t midGrayPermille,
+                                                        const uint16_t upscalePermille) {
+  const auto params = static_cast<ReaderActivity*>(context)->refreshPolicy.computeImageDitherParams(
+      edgePermille, midGrayPermille, upscalePermille);
+  return {params.contrastGainQ8, params.errorBleedQ8, params.unsharpGainQ8, params.whiteClip};
+}
+
+bool ReaderActivity::recommendRotation(void* context, const uint16_t sourceWidth, const uint16_t sourceHeight,
+                                       const uint16_t viewWidth, const uint16_t viewHeight,
+                                       const uint16_t edgePermille, const uint16_t midGrayPermille) {
+  return static_cast<ReaderActivity*>(context)->refreshPolicy.recommendImageRotation(
+      sourceWidth, sourceHeight, viewWidth, viewHeight, edgePermille, midGrayPermille);
+}
+
+void ReaderActivity::recordRotation(void* context, const uint16_t sourceWidth, const uint16_t sourceHeight,
+                                    const uint16_t viewWidth, const uint16_t viewHeight, const bool rotated,
+                                    const uint16_t edgePermille, const uint16_t midGrayPermille) {
+  auto* const self = static_cast<ReaderActivity*>(context);
+  if (self->refreshPolicy.recordManualRotation(sourceWidth, sourceHeight, viewWidth, viewHeight, rotated,
+                                               edgePermille, midGrayPermille)) {
+    self->learnedRefreshDirty.store(true, std::memory_order_release);
+  }
 }
 
 // Main task: snapshot the readout under the render lock, write it outside.
@@ -142,7 +160,8 @@ void ReaderActivity::onEnter() {
     // Benchmarks measure the compiled policy, never what this card learned.
     if (!isBenchmarkActivity()) refresh_policy_store::loadLearned(refreshPolicy);
     // Exact-size picture decodes (page pictures, the viewer) take their
-    // contrast gain and error bleed from this policy's CfC dither head.
+    // contrast gain, error bleed, unsharp gain and paper-white snap from this
+    // policy's LiquidDisplay dither head.
     smooth_resample::setDitherProvider(&ReaderActivity::ditherFor, this);
     loaded = loadBook();
   }
