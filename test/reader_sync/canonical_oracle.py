@@ -30,7 +30,7 @@ ROOT = Path(__file__).resolve().parents[2]
 HERE = Path(__file__).resolve().parent
 ARDUINOJSON = ROOT / ".pio/libdeps/x4pro-gh_release/ArduinoJson/src"
 SOURCE = ROOT / "src/network"
-DEVICE = "6A4B4C73-B747-33DA-BF3D-455A3C03D0CB"
+DEVICE = "00000000-0000-0000-0000-000000000000"
 NOW = 1767225600  # 2026-01-01T00:00:00Z
 
 sys.path.insert(0, str(ROOT / "companion/src"))

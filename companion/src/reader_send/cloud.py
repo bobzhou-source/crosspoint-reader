@@ -20,7 +20,7 @@ from urllib.parse import parse_qs, urlsplit
 from .cache import Cache
 from .common import ReaderError, atomic_write, bounded_read, digest
 
-DEFAULT_ORIGIN = "https://robertzhou.dev"
+DEFAULT_ORIGIN = os.environ.get("READER_SYNC_ORIGIN", "https://example.com")
 MAX_EPUB = 8 * 1024 * 1024
 MAX_METADATA = 16 * 1024
 MAX_ANNOTATION_BODY = 64 * 1024

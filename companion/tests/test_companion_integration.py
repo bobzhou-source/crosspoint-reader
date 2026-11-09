@@ -36,9 +36,9 @@ class CompanionIntegrationTest(unittest.TestCase):
         (store / "1.json").write_text(json.dumps(test_crossfire.ANNOTATION), encoding="utf-8")
         self.shelf = self.root / "shelf"
         self.shelf.mkdir()
-        self.book = test_book_hooks.make_epub(self.shelf / "Grey Eminence.epub", test_book_hooks.sample_chapters(5))
+        self.book = test_book_hooks.make_epub(self.shelf / "Sample Book.epub", test_book_hooks.sample_chapters(5))
         self.hooked = book_hooks.apply_hooks(self.book)
-        self.backup = self.shelf / "Grey Eminence.pre-hooks.epub"
+        self.backup = self.shelf / "Sample Book.pre-hooks.epub"
 
     def test_the_fixture_book_is_enriched_and_keeps_its_backup_beside_it(self):
         self.assertTrue(self.hooked.changed)
@@ -55,8 +55,8 @@ class CompanionIntegrationTest(unittest.TestCase):
         shelf = result["books"]["shelf"]
         self.assertEqual((shelf["planned"], shelf["copied"], shelf["errors"]), (1, 1, []))
         delivered = sorted(path.name for path in (self.card / BOOKS_DIR).rglob("*.epub"))
-        self.assertEqual(delivered, ["Grey Eminence.epub"])
-        self.assertEqual((self.card / BOOKS_DIR / "Grey Eminence.epub").read_bytes(), self.book.read_bytes())
+        self.assertEqual(delivered, ["Sample Book.epub"])
+        self.assertEqual((self.card / BOOKS_DIR / "Sample Book.epub").read_bytes(), self.book.read_bytes())
         self.assertEqual(result["annotations"]["crossfire"]["status"], "ok")
         self.assertEqual(len(list((self.card / BOOK_INBOX).glob("crossfire-*.epub"))), 1)
 
@@ -71,7 +71,7 @@ class CompanionIntegrationTest(unittest.TestCase):
         self.assertEqual(result["annotations"]["crossfire"]["status"], "ok")
         self.assertTrue(result["cleanup"]["dry_run"])
         self.assertEqual(result["cleanup"]["counts"]["trash"], 0)
-        self.assertEqual(sorted(path.name for path in (self.card / BOOKS_DIR).glob("*.epub")), ["Grey Eminence.epub"])
+        self.assertEqual(sorted(path.name for path in (self.card / BOOKS_DIR).glob("*.epub")), ["Sample Book.epub"])
 
     def test_inbox_cleanup_never_trashes_a_crossfire_card(self):
         sync_card(self.cache, self.config, volume=self.volume, crossfire=self.crossfire)

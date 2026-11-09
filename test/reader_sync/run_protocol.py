@@ -229,8 +229,8 @@ with tempfile.TemporaryDirectory(prefix="reader-sync-protocol-") as scratch:
         root = work / name
         (root / ".crosspoint").mkdir(parents=True)
         key = secrets.token_hex(32)
-        config = dict(version=1, origin="https://robertzhou.dev", device_key=key,
-                      device_id="6A4B4C73-B747-33DA-BF3D-455A3C03D0CB", enabled=True, interval_seconds=900)
+        config = dict(version=1, origin="https://example.com", device_key=key,
+                      device_id="00000000-0000-0000-0000-000000000000", enabled=True, interval_seconds=900)
         (root / ".crosspoint/reader-sync.json").write_text(json.dumps(config))
         state = State(root, key, payload or epub(), mode, items)
         if setup:

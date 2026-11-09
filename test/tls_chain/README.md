@@ -13,9 +13,9 @@ Prerequisite: install/build the `x4pro-gh_release` PlatformIO dependencies. Then
 ```sh
 python3 test/tls_chain/build_host.py /tmp/tls-baseline --baseline
 python3 test/tls_chain/build_host.py /tmp/tls-fixed
-/tmp/tls-baseline/probe robertzhou.dev
-/tmp/tls-fixed/probe robertzhou.dev
-/tmp/tls-fixed/probe robertzhou.dev tls12
+/tmp/tls-baseline/probe reader-sync.example.com
+/tmp/tls-fixed/probe reader-sync.example.com
+/tmp/tls-fixed/probe reader-sync.example.com tls12
 /tmp/tls-baseline/probe valid.x1.test-certs.letsencrypt.org
 /tmp/tls-fixed/probe valid.x1.test-certs.letsencrypt.org
 /tmp/tls-fixed/probe valid.x2.test-certs.letsencrypt.org

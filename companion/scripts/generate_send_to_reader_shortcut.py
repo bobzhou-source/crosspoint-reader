@@ -4,7 +4,7 @@
 The committed template (send-to-reader.template.wflow) is a plain, key-free
 Shortcuts workflow. It takes a URL from the share sheet (or from the input that
 `shortcuts run` supplies), POSTs `{"url": <url>}` to
-https://robertzhou.dev/reader/links, and shows the returned link id + status.
+https://example.com/reader/links, and shows the returned link id + status.
 
 This script injects the dedicated send-only bearer key *at generation time* from
 the macOS Keychain, signs the result with Apple's own signer, and writes a
@@ -27,13 +27,14 @@ import shutil
 import subprocess
 import sys
 import tempfile
+from pathlib import Path
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 DEFAULT_TEMPLATE = os.path.join(HERE, "send-to-reader.template.wflow")
-DEFAULT_OUT = "/Users/b/papyrix/Reader Workbench/Setup/Send to Reader.shortcut"
+DEFAULT_OUT = str(Path.home() / "papyrix/Reader Workbench/Setup/Send to Reader.shortcut")
 PLACEHOLDER = "__READER_SHARE_KEY__"
 DEFAULT_SERVICE = "reader-workbench:share-key"
-DEFAULT_ACCOUNT = "b"
+DEFAULT_ACCOUNT = os.environ.get("USER", "reader")
 KEY_RE = re.compile(r"^[0-9a-f]{64}$")
 
 

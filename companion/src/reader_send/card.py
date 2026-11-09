@@ -33,7 +33,7 @@ OPTIONAL_CONFIG_KEYS = {"inbox_cleanup"}
 FIRMWARE_NAME = "reader-workbench-rollback-reviewed.bin"
 FIRMWARE_CONFIG = Path(".crosspoint/reader-sync.json")
 FIRMWARE_CONFIG_VERSION = 1
-FIRMWARE_ORIGIN = "https://robertzhou.dev"
+FIRMWARE_ORIGIN = os.environ.get("READER_SYNC_ORIGIN", "https://example.com")
 FIRMWARE_INTERVAL = 900
 FIRMWARE_CONFIG_KEYS = {"version", "origin", "device_key", "device_id", "enabled", "interval_seconds"}
 # Optional since the event-driven sync: written by the device's Schedule row. A missing key means "events".

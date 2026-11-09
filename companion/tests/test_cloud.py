@@ -159,7 +159,7 @@ class CloudTest(unittest.TestCase):
         self.assertEqual(calls[0][4]["Content-Type"], "application/json")
 
     def test_origins_secrets_and_route_guard(self):
-        for bad in ("http://robertzhou.dev", "https://x/a", "https://x?", "https://x#", "https://x?secret=y", "https://u:p@x",
+        for bad in ("http://example.com", "https://x/a", "https://x?", "https://x#", "https://x?secret=y", "https://u:p@x",
                     "https://x:0", "https://x:65536", "https://x\n", "https://x\\@elsewhere"):
             with self.subTest(origin=bad), self.assertRaises(ReaderError):
                 origin_url(bad)

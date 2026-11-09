@@ -17,7 +17,7 @@ from reader_send.cache import Cache
 from reader_send.card import BOOK_INBOX, CardVolume, sync_card
 from reader_send.common import ReaderError
 
-UUID = "6A4B4C73-B747-33DA-BF3D-455A3C03D0CB"
+UUID = "00000000-0000-0000-0000-000000000000"
 
 DESIRE = (
     "The modern man believes that desire is a problem to be solved by technique. This is false. "

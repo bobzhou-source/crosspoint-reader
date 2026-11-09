@@ -20,7 +20,7 @@ from reader_send.novels import (CEILING_FILE_BYTES, CHAPTER, ECHO, VOLUME, Novel
                                 detect_headings, normalize_text, output_name, paragraphs_of, parse_filename,
                                 parse_numeral, strip_decoration)
 
-UUID = "6A4B4C73-B747-33DA-BF3D-455A3C03D0CB"
+UUID = "00000000-0000-0000-0000-000000000000"
 XHTML = "{http://www.w3.org/1999/xhtml}"
 NCX = "{http://www.daisy.org/z3986/2005/ncx/}"
 OPF = {"o": "http://www.idpf.org/2007/opf"}

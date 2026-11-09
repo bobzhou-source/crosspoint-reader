@@ -28,7 +28,7 @@ from reader_send.epub import build_epub
 from reader_send.extract import extract
 from reader_send.network import PublicHTTP
 
-UUID = "6A4B4C73-B747-33DA-BF3D-455A3C03D0CB"
+UUID = "00000000-0000-0000-0000-000000000000"
 
 
 def card_info(**overrides):

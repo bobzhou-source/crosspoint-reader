@@ -44,7 +44,7 @@
 
 namespace {
 
-constexpr char kDevice[] = "6A4B4C73-B747-33DA-BF3D-455A3C03D0CB";
+constexpr char kDevice[] = "00000000-0000-0000-0000-000000000000";
 constexpr int64_t kNow = 1767225600;  // 2026-01-01T00:00:00Z
 
 const char kBase64[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";

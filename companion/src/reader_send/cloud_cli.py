@@ -18,7 +18,7 @@ def add_parser(commands, cache_option, seconds):
 
     def options(command, *, defaults=False):
         command.add_argument("--origin", default=DEFAULT_ORIGIN if defaults else argparse.SUPPRESS,
-                             help="explicit HTTPS origin, default https://robertzhou.dev; no redirects")
+                             help="explicit HTTPS origin, default $READER_SYNC_ORIGIN or https://example.com; no redirects")
         command.add_argument("--timeout", type=seconds, default=30 if defaults else argparse.SUPPRESS)
         if not defaults:
             cache_option(command)
