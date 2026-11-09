@@ -34,6 +34,9 @@ void indexBuildYield(void*) { vTaskDelay(1); }
 // 256-byte input).
 constexpr int CONTEXT_WORDS = 8;
 constexpr int EPISODE_WORDS = 24;
+// The page text the margin riff points into for its evidence span (the
+// writer reads at most ConceptEngine::PE_PAGE_CONTEXT_MAX bytes of it).
+constexpr int PAGE_SPAN_WORDS = 40;
 // "Story: ..." refreshers are a few dozen words.
 constexpr size_t STORY_BYTES = 512;
 
@@ -400,9 +403,10 @@ DictionaryLookup::LookupSections DictionaryWordSelectActivity::addConceptNotes(s
   const std::string subjectField = writerField(subject);
   const ConceptEngine::Match* echo = related.empty() ? nullptr : &related.front();
   const std::string echoTitle = echo ? writerField(echo->label) : std::string();
+  const std::string pageContext = contextAround(PAGE_SPAN_WORDS);
   ConceptEngine::generateExtendedMarginRiff(ConceptEngine::MODELS_DIR, contextVec, echo ? echo->vec : nullptr,
                                             subjectField.c_str(), storyRole(story).c_str(), echoTitle.c_str(), riffLong,
-                                            &riff);
+                                            &riff, nullptr, pageContext);
   if (!riff.empty()) {
     ConceptEngine::Match at;
     at.label = bookTitle;

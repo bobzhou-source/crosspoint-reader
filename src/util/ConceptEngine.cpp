@@ -2291,21 +2291,6 @@ struct PeSession {
     }
     return true;
   }
-
-  // The v1 path: planner, one routed bucket and best clause per step, decoder.
-  bool writeCompact(const int8_t cPage[DIM], const int8_t cEcho[DIM], const PeEntities& ents) {
-    static const int8_t noEcho[DIM] = {};
-    runPlanner(pe, cPage, cEcho ? cEcho : noEcho, *work);
-    for (size_t s = 0; s < PE_PLAN_STEPS; ++s) {
-      work->buckets[s] = routeBucket(pe, work->plan[s]);
-      if (!retrieveClause(clauses, work->buckets[s], work->plan[s], *work, work->clauses[s])) {
-        LOG_ERR("PEW", "writer-clauses.bin read failed");
-        return false;
-      }
-    }
-    runDecoder(pe, ents, *work);
-    return true;
-  }
 };
 
 // A clause as it reads inside a sentence: trimmed, without a broken UTF-8
@@ -2367,31 +2352,669 @@ bool rankClauses(HalFile& file, const uint8_t bucket, const int8_t plan[DIM], Pe
   return true;
 }
 
+// ---- PE-Reasoner v3: page-span pointer, anti-hub routing, grounded riff ----
+// Bit-exact with pe_writer_model.py (span_lex, extract_evidence,
+// shortlist_clauses, pick_clauses, compose_grounded, extended_riff).
+constexpr size_t SPAN_SEGMENTS = 16;
+constexpr uint32_t SPAN_MAX_UNITS = 24;  // a Latin word is 2 units, a CJK character 1
+constexpr uint32_t SPAN_MIN_UNITS = 8;
+constexpr size_t SPAN_CANDIDATES = 64;
+constexpr size_t SPAN_MAX_BYTES = 128;
+constexpr int32_t SPAN_PROX = 32;
+// The span lexicon: tok_embed rows the frame-locked decoder never embeds (its
+// inputs are BOS, the slot specials and the 32 frame pieces, ids < 40).
+constexpr size_t SPAN_LEX_FIRST = 40;
+constexpr size_t SPAN_LEX_ROWS = PEWR_VOCAB - SPAN_LEX_FIRST;
+constexpr int HUB_SHIFT = 1;
+constexpr int32_t OVERLAP_PENALTY = 1 << 22;
+constexpr size_t SHORTLIST = 8;
+constexpr uint16_t TOK_REL_SYNTH = 10;     // "; in"
+constexpr uint16_t TOK_REL_CONFLICT = 11;  // ", while in"
+constexpr uint16_t TOK_REL_PARALLEL = 12;  // ", much as in"
+constexpr uint8_t ROLE_BUCKET_START[PE_PLAN_STEPS] = {0, 21, 42};
+constexpr uint8_t ROLE_BUCKETS[PE_PLAN_STEPS] = {21, 21, 22};
+
+constexpr std::string_view SPAN_STOPWORDS[] = {
+    "a",      "an",      "the",    "and",    "or",     "but",     "nor",     "so",      "yet",   "for",   "of",
+    "to",     "in",      "on",     "at",     "by",     "with",    "from",    "into",    "onto",  "upon",  "over",
+    "under",  "as",      "than",   "then",   "that",   "this",    "these",   "those",   "there", "here",  "which",
+    "who",    "whom",    "whose",  "what",   "when",   "where",   "why",     "how",     "it",    "its",   "it's",
+    "he",     "him",     "his",    "she",    "her",    "hers",    "they",    "them",    "their", "theirs", "we",
+    "us",     "our",     "you",    "your",   "yours",  "i",       "me",      "my",      "mine",  "is",    "are",
+    "was",    "were",    "be",     "been",   "being",  "am",      "do",      "does",    "did",   "done",  "have",
+    "has",    "had",     "having", "will",   "would",  "shall",   "should",  "can",     "could", "may",   "might",
+    "must",   "not",     "no",     "yes",    "all",    "any",     "some",    "each",    "every", "both",  "either",
+    "neither", "one",    "own",    "same",   "such",   "only",    "also",    "just",    "very",  "too",   "more",
+    "most",   "much",    "many",   "few",    "other",  "another", "again",   "ever",    "even",  "still", "out",
+    "up",     "down",    "off",    "about",  "after",  "before",  "while",   "if",      "because", "though",
+    "although", "until", "unless", "since",  "whether", "said",   "says",    "say",     "mr",    "mrs",   "miss",
+    "sir"};
+constexpr std::string_view SPAN_LEAD_DROP[] = {"and", "but", "or", "so", "then", "yet", "nor"};
+constexpr uint32_t SPAN_CJK_STOP[] = {0x7684, 0x4e86, 0x662f, 0x5728, 0x548c, 0x4e0e, 0x53ca, 0x4e5f,
+                                      0x5c31, 0x90fd, 0x800c, 0x7740, 0x6216, 0x4e4b, 0x5176, 0x8fd9,
+                                      0x90a3, 0x4e00, 0x4e0d, 0x6709, 0x6211, 0x4f60, 0x4ed6, 0x5979,
+                                      0x5b83, 0x4eec, 0x500b, 0x4e2a, 0x5417, 0x5462, 0x5427, 0x554a};
+
+uint32_t fnvByte(const uint32_t h, const uint8_t b) { return (h ^ b) * 16777619u; }
+
+uint8_t asciiLower(const char c) {
+  const auto b = static_cast<uint8_t>(c);
+  return b >= 'A' && b <= 'Z' ? static_cast<uint8_t>(b + 32) : b;
+}
+
+uint32_t fnvLower(std::string_view key, uint32_t h = 2166136261u) {
+  for (const char c : key) h = fnvByte(h, asciiLower(c));
+  return h;
+}
+
+enum SpanClass : uint8_t { SPAN_SPACE, SPAN_WORD, SPAN_JOIN, SPAN_CJK, SPAN_SOFT, SPAN_HARD };
+
+SpanClass spanClass(const int32_t cp) {
+  if (cp < 0) return SPAN_SPACE;
+  if ((cp >= 0x30 && cp <= 0x39) || (cp >= 0x41 && cp <= 0x5A) || (cp >= 0x61 && cp <= 0x7A)) return SPAN_WORD;
+  switch (cp) {
+    case 0x21: case 0x2E: case 0x3A: case 0x3B: case 0x3F: case 0x2026: case 0x3002: case 0xFF01: case 0xFF0E:
+    case 0xFF1A: case 0xFF1B: case 0xFF1F:
+      return SPAN_HARD;
+    case 0x28: case 0x29: case 0x2C: case 0x2013: case 0x2014: case 0x3001: case 0xFF08: case 0xFF09: case 0xFF0C:
+      return SPAN_SOFT;
+    case 0x27: case 0x2D: case 0x2019:
+      return SPAN_JOIN;
+    default:
+      break;
+  }
+  if (cp < 0xC0 || (cp >= 0x2000 && cp <= 0x206F) || (cp >= 0x3000 && cp <= 0x303F)) return SPAN_SPACE;
+  if (cp >= 0xFF00 && cp <= 0xFFEF &&
+      !((cp >= 0xFF10 && cp <= 0xFF19) || (cp >= 0xFF21 && cp <= 0xFF3A) || (cp >= 0xFF41 && cp <= 0xFF5A))) {
+    return SPAN_SPACE;
+  }
+  return cjkCodepoint(static_cast<uint32_t>(cp)) ? SPAN_CJK : SPAN_WORD;
+}
+
+// The code point at text[i] (-1 for an invalid byte) and its length.
+int32_t spanCodepoint(std::string_view text, const size_t i, size_t& n) {
+  uint32_t cp;
+  if (decodeAt(text, i, cp, n)) return static_cast<int32_t>(cp);
+  n = 1;
+  return -1;
+}
+
+struct SpanTok {
+  uint16_t start = 0, end = 0;
+  uint8_t kind = 0;   // 0 Latin word, 1 CJK character
+  uint8_t brk = 0;    // break before: 0 none, 1 soft, 2 hard
+  uint8_t seg = 0;
+  uint8_t units = 0;
+  bool content = false, query = false, leadDrop = false;
+  uint32_t hash = 0;  // fnv1a32 of the ASCII-lowercased bytes
+};
+
+// Latin words (inner ' - U+2019 kept, a doubled joiner is a dash) and single
+// CJK characters, at most `maxSegments` hard-break segments.
+void spanLex(std::string_view text, const size_t maxSegments, std::vector<SpanTok>& toks) {
+  toks.clear();
+  size_t seg = 0;
+  bool full = false;
+  const auto emit = [&](const size_t s, const size_t e, const uint8_t kind, const uint8_t brk) {
+    if (full) return;
+    if (!toks.empty() && brk == 2) ++seg;
+    if (seg >= maxSegments) {
+      full = true;
+      return;
+    }
+    SpanTok t;
+    t.start = static_cast<uint16_t>(s);
+    t.end = static_cast<uint16_t>(e);
+    t.kind = kind;
+    t.brk = brk;
+    t.seg = static_cast<uint8_t>(seg);
+    t.units = kind ? 1 : 2;
+    const std::string_view key = text.substr(s, e - s);
+    t.hash = fnvLower(key);
+    bool stop = false;
+    if (kind == 1) {
+      size_t n;
+      const int32_t cp = spanCodepoint(text, s, n);
+      stop = std::find(std::begin(SPAN_CJK_STOP), std::end(SPAN_CJK_STOP), static_cast<uint32_t>(cp)) !=
+             std::end(SPAN_CJK_STOP);
+      t.content = !stop;
+    } else {
+      std::string lower(key);
+      for (char& c : lower) c = static_cast<char>(asciiLower(c));
+      stop = std::find(std::begin(SPAN_STOPWORDS), std::end(SPAN_STOPWORDS), lower) != std::end(SPAN_STOPWORDS);
+      t.content = key.size() >= 3 && !stop;
+      t.leadDrop =
+          std::find(std::begin(SPAN_LEAD_DROP), std::end(SPAN_LEAD_DROP), lower) != std::end(SPAN_LEAD_DROP);
+    }
+    t.query = !stop;
+    toks.push_back(t);
+  };
+  uint8_t pend = 0, wbrk = 0;
+  bool inWord = false, joined = false;
+  size_t ws = 0, we = 0;
+  for (size_t i = 0; i < text.size() && !full;) {
+    size_t n;
+    const SpanClass c = spanClass(spanCodepoint(text, i, n));
+    if (c == SPAN_WORD) {
+      if (!inWord) {
+        inWord = true;
+        ws = i;
+        wbrk = pend;
+        pend = 0;
+      }
+      we = i + n;
+      joined = false;
+    } else if (c == SPAN_JOIN && inWord && !joined) {
+      joined = true;
+    } else {
+      if (inWord) {
+        emit(ws, we, 0, wbrk);
+        inWord = false;
+        if (c == SPAN_JOIN) pend = std::max<uint8_t>(pend, 1);
+      }
+      joined = false;
+      if (c == SPAN_CJK) {
+        emit(i, i + n, 1, pend);
+        pend = 0;
+      } else if (c == SPAN_HARD) {
+        pend = 2;
+      } else if (c == SPAN_SOFT) {
+        pend = std::max<uint8_t>(pend, 1);
+      }
+    }
+    i += n;
+  }
+  if (inWord) emit(ws, we, 0, wbrk);
+}
+
+bool hasHash(const std::vector<uint32_t>& set, const uint32_t h) {
+  return std::find(set.begin(), set.end(), h) != set.end();
+}
+
+bool sharesHash(const std::vector<uint32_t>& a, const std::vector<uint32_t>& b) {
+  return std::any_of(a.begin(), a.end(), [&](const uint32_t h) { return hasHash(b, h); });
+}
+
+std::vector<uint32_t> queryHashes(std::string_view text) {
+  std::vector<SpanTok> toks;
+  spanLex(text, SIZE_MAX, toks);
+  std::vector<uint32_t> out;
+  for (const SpanTok& t : toks) {
+    if (t.query && !hasHash(out, t.hash)) out.push_back(t.hash);
+  }
+  return out;
+}
+
+// Word 2-gram hashes (lowercased "w1 w2") of tokens [st, e).
+void spanGrams(std::string_view text, const std::vector<SpanTok>& toks, const size_t st, const size_t e,
+               std::vector<uint32_t>& out) {
+  out.clear();
+  for (size_t k = st; k + 1 < e; ++k) {
+    uint32_t h = fnvLower(text.substr(toks[k].start, toks[k].end - toks[k].start));
+    h = fnvByte(h, ' ');
+    h = fnvLower(text.substr(toks[k + 1].start, toks[k + 1].end - toks[k + 1].start), h);
+    if (!hasHash(out, h)) out.push_back(h);
+  }
+}
+
+std::vector<uint32_t> textGrams(std::string_view text) {
+  std::vector<SpanTok> toks;
+  spanLex(text, SIZE_MAX, toks);
+  std::vector<uint32_t> out;
+  spanGrams(text, toks, 0, toks.size(), out);
+  return out;
+}
+
+// encodeSpan . plan: the l2-normalised sum of the window's content-word
+// lexicon rows, dotted with a thought vector.
+int32_t spanPlanDot(const PeWriter& pe, const std::vector<SpanTok>& toks, const size_t st, const size_t e,
+                    const int8_t plan[DIM]) {
+  int32_t acc[DIM] = {};
+  for (size_t k = st; k < e; ++k) {
+    if (!toks[k].content) continue;
+    const int8_t* row = pe.at(PEWR_OFF_TOK + (SPAN_LEX_FIRST + toks[k].hash % SPAN_LEX_ROWS) * DIM);
+    for (size_t d = 0; d < DIM; ++d) acc[d] += row[d];
+  }
+  int8_t v[DIM];
+  normalize(acc, v);
+  return dot(v, plan);
+}
+
+// Page bytes of a window: quotes and brackets dropped; whitespace, control
+// and invalid bytes become one space.
+std::string cleanSpan(std::string_view raw) {
+  std::string out;
+  bool space = false;
+  for (size_t i = 0; i < raw.size();) {
+    size_t n;
+    const int32_t cp = spanCodepoint(raw, i, n);
+    if (cp < 0 || cp <= 0x20 || cp == 0x7F || cp == 0xA0) {
+      space = true;
+      i += n;
+      continue;
+    }
+    switch (cp) {
+      case 0x22: case 0x28: case 0x29: case 0x5B: case 0x5D: case 0xAB: case 0xBB: case 0x2018: case 0x201C:
+      case 0x201D: case 0x300C: case 0x300D: case 0x300E: case 0x300F: case 0xFF08: case 0xFF09:
+        i += n;
+        continue;
+      default:
+        break;
+    }
+    if (space && !out.empty()) out += ' ';
+    space = false;
+    out.append(raw.data() + i, n);
+    i += n;
+  }
+  return out;
+}
+
+struct SpanWindow {
+  uint16_t st = 0, e = 0;
+  uint8_t seg = 0;
+};
+
+// Candidate windows in segment / start order: from the segment start, after
+// each soft break and two tokens before each subject mention; leading
+// conjunctions skipped; at most SPAN_MAX_UNITS units and SPAN_MAX_BYTES bytes;
+// a window cut short ends at its last soft break (or loses trailing function
+// words) while it keeps the minimum length.
+void spanWindows(const std::vector<SpanTok>& t, const std::vector<uint16_t>& anchors, std::vector<SpanWindow>& out) {
+  out.clear();
+  uint32_t total = 0;
+  for (const SpanTok& tok : t) total += tok.units;
+  const uint32_t minUnits = std::min(SPAN_MIN_UNITS, total);
+  std::vector<size_t> starts;
+  for (size_t a = 0; a < t.size();) {
+    size_t b = a;
+    while (b < t.size() && t[b].seg == t[a].seg) ++b;
+    starts.clear();
+    starts.push_back(a);
+    for (size_t k = a + 1; k < b; ++k) {
+      if (t[k].brk >= 1) starts.push_back(k);
+    }
+    for (const uint16_t p : anchors) {
+      if (p >= a && p < b) starts.push_back(p >= a + 2 ? p - 2 : a);
+    }
+    std::sort(starts.begin(), starts.end());
+    starts.erase(std::unique(starts.begin(), starts.end()), starts.end());
+    for (const size_t st : starts) {
+      if (out.size() >= SPAN_CANDIDATES) return;
+      size_t s0 = st;
+      while (s0 + 1 < b && t[s0].kind == 0 && t[s0].leadDrop) ++s0;
+      size_t e = s0;
+      uint32_t u = 0;
+      while (e < b && u + t[e].units <= SPAN_MAX_UNITS) u += t[e++].units;
+      while (e - s0 > 1 && static_cast<size_t>(t[e - 1].end - t[s0].start) > SPAN_MAX_BYTES) u -= t[--e].units;
+      if (e < b) {
+        size_t cut = SIZE_MAX;
+        uint32_t acc = 0, cutUnits = 0;
+        for (size_t k = s0; k < e; ++k) {
+          if (k > s0 && t[k].brk >= 1 && acc >= minUnits) {
+            cut = k;
+            cutUnits = acc;
+          }
+          acc += t[k].units;
+        }
+        if (cut != SIZE_MAX) {
+          e = cut;
+          u = cutUnits;
+        } else {
+          while (e - s0 > 1 && t[e - 1].kind == 0 && !t[e - 1].query && u - t[e - 1].units >= minUnits) {
+            u -= t[--e].units;
+          }
+        }
+      }
+      if (u < minUnits || u == 0) continue;
+      const bool seen = std::any_of(out.begin(), out.end(), [&](const SpanWindow& w) { return w.st == s0 && w.e == e; });
+      if (seen) continue;
+      out.push_back({static_cast<uint16_t>(s0), static_cast<uint16_t>(e), t[s0].seg});
+    }
+    a = b;
+  }
+}
+
+struct Evidence {
+  std::string ev, ev2;
+  std::vector<uint32_t> grams, grams2;
+};
+
+// Step A plus the extended riff's second hop. False without a window.
+bool extractEvidence(const PeWriter& pe, std::string_view context, const PeEntities& ents,
+                     const int8_t plan[PE_PLAN_STEPS][DIM], Evidence& out) {
+  out = Evidence{};
+  context = context.substr(0, std::min(context.size(), PE_PAGE_CONTEXT_MAX));
+  std::vector<SpanTok> t;
+  spanLex(context, SPAN_SEGMENTS, t);
+  if (t.empty()) return false;
+  const std::vector<uint32_t> subj = queryHashes(ents.subject);
+  std::vector<uint32_t> roleHashes;
+  for (const uint32_t h : queryHashes(ents.role)) {
+    if (!hasHash(subj, h)) roleHashes.push_back(h);
+  }
+  std::vector<uint16_t> anchors;
+  for (size_t k = 0; k < t.size(); ++k) {
+    if (t[k].query && hasHash(subj, t[k].hash)) anchors.push_back(static_cast<uint16_t>(k));
+  }
+  std::vector<SpanWindow> wins;
+  spanWindows(t, anchors, wins);
+  const SpanWindow* pick = nullptr;
+  int32_t best = INT32_MIN;
+  for (const SpanWindow& w : wins) {
+    int32_t hs = 0, hr = 0, content = 0;
+    for (size_t k = w.st; k < w.e; ++k) {
+      if (t[k].query && hasHash(subj, t[k].hash)) {
+        ++hs;
+      } else if (t[k].query && hasHash(roleHashes, t[k].hash)) {
+        ++hr;
+      }
+      content += t[k].content;
+    }
+    int32_t dist = SPAN_PROX;
+    if (hs) {
+      dist = 0;
+    } else {
+      for (const uint16_t p : anchors) {
+        dist = std::min<int32_t>(dist, p < w.st ? w.st - p : p - (w.e - 1));
+      }
+    }
+    const int32_t score = 256 * std::min<int32_t>(hs, 2) + 64 * std::min<int32_t>(hr, 2) + 8 * (SPAN_PROX - dist) + 16 * content +
+                          (spanPlanDot(pe, t, w.st, w.e, plan[0]) >> 6);
+    if (!pick || score > best) {
+      best = score;
+      pick = &w;
+    }
+  }
+  if (!pick) return false;
+  out.ev = cleanSpan(context.substr(t[pick->st].start, t[pick->e - 1].end - t[pick->st].start));
+  if (out.ev.empty()) return false;
+  spanGrams(context, t, pick->st, pick->e, out.grams);
+
+  // Hop 2: a window of another segment linked to the subject or the evidence
+  // by a shared word, scored against thought 1.
+  std::vector<uint32_t> linked = subj;
+  for (size_t k = pick->st; k < pick->e; ++k) {
+    if (t[k].content && !hasHash(linked, t[k].hash)) linked.push_back(t[k].hash);
+  }
+  const SpanWindow* pick2 = nullptr;
+  int32_t best2 = INT32_MIN;
+  std::vector<uint32_t> grams;
+  for (const SpanWindow& w : wins) {
+    if (w.seg == pick->seg) continue;
+    spanGrams(context, t, w.st, w.e, grams);
+    if (sharesHash(grams, out.grams)) continue;
+    int32_t hits = 0, content = 0;
+    for (size_t k = w.st; k < w.e; ++k) {
+      if (t[k].query && hasHash(linked, t[k].hash)) ++hits;
+      content += t[k].content;
+    }
+    if (hits == 0) continue;
+    const int32_t score = 128 * std::min<int32_t>(hits, 3) + 16 * content + (spanPlanDot(pe, t, w.st, w.e, plan[1]) >> 6);
+    if (!pick2 || score > best2) {
+      best2 = score;
+      pick2 = &w;
+    }
+  }
+  if (pick2) {
+    out.ev2 = cleanSpan(context.substr(t[pick2->st].start, t[pick2->e - 1].end - t[pick2->st].start));
+    if (!out.ev2.empty()) spanGrams(context, t, pick2->st, pick2->e, out.grams2);
+  }
+  return true;
+}
+
+// hub = the l2-normalised sum of the 64 bucket centroids.
+void hubVector(const PeWriter& pe, int8_t hub[DIM]) {
+  int32_t acc[DIM] = {};
+  for (size_t b = 0; b < PEWR_BUCKETS; ++b) {
+    const int8_t* c = pe.at(PEWR_OFF_CENTROIDS + b * DIM);
+    for (size_t d = 0; d < DIM; ++d) acc[d] += c[d];
+  }
+  normalize(acc, hub);
+}
+
+struct GroundedClause {
+  uint16_t id = 0xFFFF;
+  uint8_t bucket = 0;
+  int32_t dot = 0, score = 0;
+  std::string text;  // cleaned
+  std::vector<uint32_t> grams;
+  PeClause slot;  // the decoder inputs (raw text)
+};
+
+// Step B ranking for thought step s: its partition's two best-centroid
+// buckets (lowest index on ties), every valid slot scored dot(slot, plan) -
+// (dot(slot, hub) >> HUB_SHIFT) - OVERLAP_PENALTY when it shares a 2-gram
+// with `avoid`; the SHORTLIST best, best first, earlier slots first on ties.
+bool shortlistClauses(HalFile& file, const PeWriter& pe, const int8_t hub[DIM], const int8_t plan[DIM],
+                      const size_t s, const std::vector<uint32_t>& avoid, PeWork& work, uint8_t& topRoute,
+                      std::vector<GroundedClause>& out) {
+  out.clear();
+  uint8_t routes[2] = {0, 0};
+  int32_t routeDots[2] = {INT32_MIN, INT32_MIN};
+  for (size_t b = ROLE_BUCKET_START[s]; b < static_cast<size_t>(ROLE_BUCKET_START[s] + ROLE_BUCKETS[s]); ++b) {
+    const int32_t score = dot(plan, pe.at(PEWR_OFF_CENTROIDS + b * DIM));
+    if (score > routeDots[0]) {
+      routes[1] = routes[0];
+      routeDots[1] = routeDots[0];
+      routes[0] = static_cast<uint8_t>(b);
+      routeDots[0] = score;
+    } else if (score > routeDots[1]) {
+      routes[1] = static_cast<uint8_t>(b);
+      routeDots[1] = score;
+    }
+  }
+  topRoute = routes[0];
+  for (const uint8_t bucket : routes) {
+    if (!file.seekSet(WCLS_HEADER_BYTES + static_cast<size_t>(bucket) * WCLS_BUCKET_BYTES)) return false;
+    for (size_t first = 0; first < PEWR_SLOTS; first += WCLS_BATCH_SLOTS) {
+      if (!readFully(file, work.batch, sizeof(work.batch))) return false;
+      for (size_t i = 0; i < WCLS_BATCH_SLOTS; ++i) {
+        const uint8_t* slot = work.batch + i * WCLS_SLOT_BYTES;
+        const uint8_t textLen = slot[WCLS_TEXT_LEN_OFFSET];
+        if (textLen == 0) continue;
+        const auto* vec = reinterpret_cast<const int8_t*>(slot);
+        const int32_t d = dot(plan, vec);
+        int32_t score = d - (dot(vec, hub) >> HUB_SHIFT);
+        if (out.size() >= SHORTLIST && score <= out.back().score) continue;
+        const std::string_view raw = fixedText(slot + WCLS_TEXT_OFFSET, std::min<size_t>(textLen, WCLS_TEXT_MAX));
+        std::string text = cleanClause(raw);
+        if (text.empty()) continue;
+        std::vector<uint32_t> grams = textGrams(text);
+        if (sharesHash(grams, avoid)) {
+          score -= OVERLAP_PENALTY;
+          if (out.size() >= SHORTLIST && score <= out.back().score) continue;
+        }
+        GroundedClause c;
+        c.id = static_cast<uint16_t>(bucket * PEWR_SLOTS + first + i);
+        c.bucket = bucket;
+        c.dot = d;
+        c.score = score;
+        c.text = std::move(text);
+        c.grams = std::move(grams);
+        c.slot.valid = true;
+        memcpy(c.slot.vec, vec, DIM);
+        for (size_t k = 0; k < WCLS_CLAUSE_TOKENS; ++k) {
+          const uint16_t tok = readU16(slot + WCLS_TOKS_OFFSET + 2 * k);
+          c.slot.toks[k] = tok < PEWR_VOCAB ? tok : 0;
+        }
+        c.slot.simQ7 = std::clamp<int32_t>(d >> 7, 0, 127);
+        memcpy(c.slot.text, raw.data(), raw.size());
+        c.slot.text[raw.size()] = '\0';
+        auto at = std::find_if(out.begin(), out.end(), [&](const GroundedClause& o) { return score > o.score; });
+        out.insert(at, std::move(c));
+        if (out.size() > SHORTLIST) out.pop_back();
+      }
+    }
+  }
+  return true;
+}
+
+// Greedy picks: the best score, less OVERLAP_PENALTY (once) when the clause
+// shares its text or a 2-gram with an earlier pick.
+void pickClauses(std::vector<GroundedClause>& shortlist, std::vector<GroundedClause>& taken, const size_t k,
+                 std::vector<GroundedClause>& picks) {
+  picks.clear();
+  for (size_t n = 0; n < k && !shortlist.empty(); ++n) {
+    size_t at = 0;
+    int32_t best = INT32_MIN;
+    for (size_t i = 0; i < shortlist.size(); ++i) {
+      const GroundedClause& c = shortlist[i];
+      int32_t score = c.score;
+      const bool overlap = std::any_of(taken.begin(), taken.end(), [&](const GroundedClause& t) {
+        return t.text == c.text || sharesHash(c.grams, t.grams);
+      });
+      if (overlap) score -= OVERLAP_PENALTY;
+      if (i == 0 || score > best) {
+        best = score;
+        at = i;
+      }
+    }
+    taken.push_back(shortlist[at]);
+    picks.push_back(std::move(shortlist[at]));
+    shortlist.erase(shortlist.begin() + static_cast<std::ptrdiff_t>(at));
+  }
+}
+
+bool pickStep(PeSession& session, const int8_t hub[DIM], const size_t s, const std::vector<uint32_t>& avoid,
+              std::vector<GroundedClause>& taken, const size_t k, uint8_t& topRoute,
+              std::vector<GroundedClause>& picks) {
+  std::vector<GroundedClause> shortlist;
+  if (!shortlistClauses(session.clauses, session.pe, hub, session.work->plan[s], s, avoid, *session.work, topRoute,
+                        shortlist)) {
+    LOG_ERR("PEW", "writer-clauses.bin read failed");
+    return false;
+  }
+  pickClauses(shortlist, taken, k, picks);
+  return true;
+}
+
+std::string_view relationConnector(const uint16_t tokens[PE_MAX_TOKENS]) {
+  for (size_t t = 0; t < PE_MAX_TOKENS && tokens[t] != TOK_EOS; ++t) {
+    if (tokens[t] == TOK_REL_CONFLICT) return "while in";
+    if (tokens[t] == TOK_REL_PARALLEL) return "much as in";
+    if (tokens[t] == TOK_REL_SYNTH) return "in";
+  }
+  return "in";
+}
+
+// Step C: "<subject> (<role>): <ev>; <conn> <echo>, <c0>, <c1>." -- the first
+// of two clauses, one, none, none without the echo that fits RIFF_MAX_BYTES.
+void composeGrounded(const PeEntities& ents, const std::string& ev, std::string_view conn,
+                     const std::string clauses[2], std::string& text) {
+  std::string head;
+  if (!ents.subject.empty()) {
+    head = std::string(ents.subject);
+    if (!ents.role.empty() && ents.role != ents.subject) head.append(" (").append(ents.role).append(")");
+    head += ": ";
+  }
+  std::vector<const std::string*> cl;
+  for (size_t i = 0; i < 2; ++i) {
+    if (!clauses[i].empty()) cl.push_back(&clauses[i]);
+  }
+  const auto build = [&](const size_t k, const bool withEcho) {
+    std::string t = head + ev;
+    std::string_view lead = ", ";
+    if (withEcho && !ents.echo.empty()) {
+      t.append("; ").append(conn).append(" ").append(ents.echo);
+    } else {
+      lead = "; ";
+    }
+    for (size_t i = 0; i < k; ++i) t.append(i == 0 ? lead : std::string_view(", ")).append(*cl[i]);
+    return t + ".";
+  };
+  const std::pair<size_t, bool> tries[] = {
+      {std::min<size_t>(2, cl.size()), true}, {std::min<size_t>(1, cl.size()), true}, {0, true}, {0, false}};
+  for (const auto& [k, withEcho] : tries) {
+    text = build(k, withEcho);
+    if (text.size() <= RIFF_MAX_BYTES) return;
+  }
+  size_t n = RIFF_MAX_BYTES;
+  while (n > 0 && continuation(static_cast<uint8_t>(text[n]))) --n;
+  text.resize(n);
+}
+
+// Planner, Step A, routing (v1, or Step B with evidence), decoder and riff.
+bool writeCompact(PeSession& session, const int8_t cPage[DIM], const int8_t cEcho[DIM], const PeEntities& ents,
+                  std::string_view pageContext, Evidence& evidence, bool& grounded, std::string& riff) {
+  static const int8_t noEcho[DIM] = {};
+  PeWork& work = *session.work;
+  runPlanner(session.pe, cPage, cEcho ? cEcho : noEcho, work);
+  grounded = !pageContext.empty() && extractEvidence(session.pe, pageContext, ents, work.plan, evidence);
+  std::string texts[2];
+  if (!grounded) {
+    for (size_t s = 0; s < PE_PLAN_STEPS; ++s) {
+      work.buckets[s] = routeBucket(session.pe, work.plan[s]);
+      if (!retrieveClause(session.clauses, work.buckets[s], work.plan[s], work, work.clauses[s])) {
+        LOG_ERR("PEW", "writer-clauses.bin read failed");
+        return false;
+      }
+    }
+  } else {
+    int8_t hub[DIM];
+    hubVector(session.pe, hub);
+    std::vector<GroundedClause> taken, picks;
+    for (size_t s = 0; s < PE_PLAN_STEPS; ++s) {
+      if (!pickStep(session, hub, s, evidence.grams, taken, 1, work.buckets[s], picks)) return false;
+      work.clauses[s] = PeClause{};
+      if (picks.empty()) continue;
+      work.buckets[s] = picks[0].bucket;
+      work.clauses[s] = picks[0].slot;
+      if (s < 2) texts[s] = picks[0].text;
+    }
+  }
+  runDecoder(session.pe, ents, work);
+  if (grounded) {
+    composeGrounded(ents, evidence.ev, relationConnector(work.tokens), texts, riff);
+  } else {
+    renderRiff(session.pe, ents, work, riff);
+  }
+  return true;
+}
+
+std::string extendedLead(const size_t s, const PeEntities& ents) {
+  if (s == 0) {
+    std::string lead = ents.subject.empty() ? std::string("This passage") : std::string(ents.subject);
+    if (!ents.role.empty() && ents.role != ents.subject) lead.append(", ").append(ents.role);
+    return lead;
+  }
+  if (s == 1) return ents.echo.empty() ? std::string("In context") : "Beside " + std::string(ents.echo);
+  return "The tension";
+}
+
+std::string endSentence(const std::string& lead, const std::string& joined) {
+  return lead + ": " + joined + (endsCjk(joined) ? "\xE3\x80\x82" : ".");
+}
+
 }  // namespace
 
 bool generateMarginRiff(const std::string& modelsDir, const int8_t cPage[DIM], const int8_t cEcho[DIM],
                         const char* subject, const char* role, const char* echoTitle, std::string& outRiff,
                         int8_t outPlan[PE_PLAN_STEPS][DIM], uint8_t outBuckets[PE_PLAN_STEPS],
-                        uint16_t outTokens[PE_MAX_TOKENS]) {
+                        uint16_t outTokens[PE_MAX_TOKENS], std::string_view pageContext) {
   outRiff.clear();
   if (!cPage) return false;
   // The weights live in PSRAM only for this call.
   PeSession session;
   if (!session.open(modelsDir)) return false;
   const PeEntities ents{subject ? subject : "", role ? role : "", echoTitle ? echoTitle : ""};
-  if (!session.writeCompact(cPage, cEcho, ents)) return false;
+  Evidence evidence;
+  bool grounded = false;
+  if (!writeCompact(session, cPage, cEcho, ents, pageContext, evidence, grounded, outRiff)) {
+    outRiff.clear();
+    return false;
+  }
   session.clauses.close();
   const PeWork& work = *session.work;
   if (outPlan) memcpy(outPlan, work.plan, sizeof(work.plan));
   if (outBuckets) memcpy(outBuckets, work.buckets, sizeof(work.buckets));
   if (outTokens) memcpy(outTokens, work.tokens, sizeof(work.tokens));
-  renderRiff(session.pe, ents, work, outRiff);
   return !outRiff.empty();
 }
 
 bool generateExtendedMarginRiff(const std::string& modelsDir, const int8_t cPage[DIM], const int8_t cEcho[DIM],
                                 const char* subject, const char* role, const char* echoTitle, std::string& outRiff,
-                                std::string* outCompactRiff, uint16_t outClauseIds[RIFF_EXTENDED_CLAUSES]) {
+                                std::string* outCompactRiff, uint16_t outClauseIds[RIFF_EXTENDED_CLAUSES],
+                                std::string_view pageContext) {
   outRiff.clear();
   if (outCompactRiff) outCompactRiff->clear();
   if (outClauseIds) std::fill(outClauseIds, outClauseIds + RIFF_EXTENDED_CLAUSES, 0xFFFF);
@@ -2400,75 +3023,99 @@ bool generateExtendedMarginRiff(const std::string& modelsDir, const int8_t cPage
   if (!session.open(modelsDir)) return false;
   PeWork& work = *session.work;
   const PeEntities ents{subject ? subject : "", role ? role : "", echoTitle ? echoTitle : ""};
+  Evidence evidence;
+  bool grounded = false;
   if (outCompactRiff) {
-    if (!session.writeCompact(cPage, cEcho, ents)) return false;
-    renderRiff(session.pe, ents, work, *outCompactRiff);
+    if (!writeCompact(session, cPage, cEcho, ents, pageContext, evidence, grounded, *outCompactRiff)) {
+      outCompactRiff->clear();
+      return false;
+    }
   } else {
     static const int8_t noEcho[DIM] = {};
     runPlanner(session.pe, cPage, cEcho ? cEcho : noEcho, work);
+    grounded = !pageContext.empty() && extractEvidence(session.pe, pageContext, ents, work.plan, evidence);
   }
 
-  constexpr size_t ROUTES = 2;
   constexpr size_t PER_STEP = 2;
-  // Enough per bucket that PER_STEP survive every earlier sentence's picks.
-  constexpr size_t CANDIDATES = PER_STEP * PE_PLAN_STEPS;
-  std::vector<RiffClause> used;
-  used.reserve(RIFF_EXTENDED_CLAUSES);
   std::string sentences[PE_PLAN_STEPS];
-  for (size_t s = 0; s < PE_PLAN_STEPS; ++s) {
-    // The two best-centroid buckets (lowest index on ties).
-    uint8_t routes[ROUTES] = {0, 0};
-    int32_t routeDots[ROUTES] = {INT32_MIN, INT32_MIN};
-    for (size_t b = 0; b < PEWR_BUCKETS; ++b) {
-      const int32_t score = dot(work.plan[s], session.pe.at(PEWR_OFF_CENTROIDS + b * DIM));
-      if (score > routeDots[0]) {
-        routes[1] = routes[0];
-        routeDots[1] = routeDots[0];
-        routes[0] = static_cast<uint8_t>(b);
-        routeDots[0] = score;
-      } else if (score > routeDots[1]) {
-        routes[1] = static_cast<uint8_t>(b);
-        routeDots[1] = score;
+  std::vector<uint16_t> ids;
+  if (grounded) {
+    // Evidence first in sentence 1, the second hop first in sentence 2; the
+    // clauses come from the role-partition anti-hub ranking.
+    int8_t hub[DIM];
+    hubVector(session.pe, hub);
+    std::vector<uint32_t> avoid = evidence.grams;
+    avoid.insert(avoid.end(), evidence.grams2.begin(), evidence.grams2.end());
+    std::vector<GroundedClause> taken, picks;
+    for (size_t s = 0; s < PE_PLAN_STEPS; ++s) {
+      const size_t k = s == 0 ? 1 : s == 1 ? (evidence.ev2.empty() ? PER_STEP : 1) : PER_STEP;
+      uint8_t topRoute;
+      if (!pickStep(session, hub, s, avoid, taken, k, topRoute, picks)) return false;
+      std::string joined = s == 0 ? evidence.ev : s == 1 ? evidence.ev2 : std::string();
+      for (const GroundedClause& c : picks) {
+        if (!joined.empty()) joined += "; ";
+        joined += c.text;
+        ids.push_back(c.id);
       }
+      if (!joined.empty()) sentences[s] = endSentence(extendedLead(s, ents), joined);
     }
-    std::vector<RiffClause> ranked;
-    for (const uint8_t bucket : routes) {
-      std::vector<RiffClause> fromBucket;
-      if (!rankClauses(session.clauses, bucket, work.plan[s], work, fromBucket, CANDIDATES)) {
-        LOG_ERR("PEW", "writer-clauses.bin read failed");
-        return false;
+  } else {
+    constexpr size_t ROUTES = 2;
+    // Enough per bucket that PER_STEP survive every earlier sentence's picks.
+    constexpr size_t CANDIDATES = PER_STEP * PE_PLAN_STEPS;
+    std::vector<RiffClause> used;
+    used.reserve(RIFF_EXTENDED_CLAUSES);
+    for (size_t s = 0; s < PE_PLAN_STEPS; ++s) {
+      // The two best-centroid buckets (lowest index on ties).
+      uint8_t routes[ROUTES] = {0, 0};
+      int32_t routeDots[ROUTES] = {INT32_MIN, INT32_MIN};
+      for (size_t b = 0; b < PEWR_BUCKETS; ++b) {
+        const int32_t score = dot(work.plan[s], session.pe.at(PEWR_OFF_CENTROIDS + b * DIM));
+        if (score > routeDots[0]) {
+          routes[1] = routes[0];
+          routeDots[1] = routeDots[0];
+          routes[0] = static_cast<uint8_t>(b);
+          routeDots[0] = score;
+        } else if (score > routeDots[1]) {
+          routes[1] = static_cast<uint8_t>(b);
+          routeDots[1] = score;
+        }
       }
-      for (RiffClause& clause : fromBucket) {
-        auto at = std::find_if(ranked.begin(), ranked.end(), [&](const RiffClause& c) { return clause.dot > c.dot; });
-        ranked.insert(at, std::move(clause));
+      std::vector<RiffClause> ranked;
+      for (const uint8_t bucket : routes) {
+        std::vector<RiffClause> fromBucket;
+        if (!rankClauses(session.clauses, bucket, work.plan[s], work, fromBucket, CANDIDATES)) {
+          LOG_ERR("PEW", "writer-clauses.bin read failed");
+          return false;
+        }
+        for (RiffClause& clause : fromBucket) {
+          auto at =
+              std::find_if(ranked.begin(), ranked.end(), [&](const RiffClause& c) { return clause.dot > c.dot; });
+          ranked.insert(at, std::move(clause));
+        }
       }
+      std::string joined;
+      size_t picked = 0;
+      for (RiffClause& clause : ranked) {
+        if (picked == PER_STEP) break;
+        const bool repeat = std::any_of(used.begin(), used.end(), [&](const RiffClause& u) {
+          return u.id == clause.id || u.text == clause.text;
+        });
+        if (repeat) continue;
+        if (!joined.empty()) joined += "; ";
+        joined += clause.text;
+        ids.push_back(clause.id);
+        used.push_back(std::move(clause));
+        ++picked;
+      }
+      if (!joined.empty()) sentences[s] = endSentence(extendedLead(s, ents), joined);
     }
-    std::string joined;
-    size_t picked = 0;
-    for (RiffClause& clause : ranked) {
-      if (picked == PER_STEP) break;
-      const bool repeat = std::any_of(used.begin(), used.end(),
-                                      [&](const RiffClause& u) { return u.id == clause.id || u.text == clause.text; });
-      if (repeat) continue;
-      if (!joined.empty()) joined += "; ";
-      joined += clause.text;
-      used.push_back(std::move(clause));
-      ++picked;
+    if (used.empty()) {
+      session.clauses.close();
+      return false;
     }
-    if (joined.empty()) continue;
-    std::string lead;
-    if (s == 0) {
-      lead = ents.subject.empty() ? std::string("This passage") : std::string(ents.subject);
-      if (!ents.role.empty() && ents.role != ents.subject) lead.append(", ").append(ents.role);
-    } else if (s == 1) {
-      lead = ents.echo.empty() ? std::string("In context") : "Beside " + std::string(ents.echo);
-    } else {
-      lead = "The tension";
-    }
-    sentences[s] = lead + ": " + joined + (endsCjk(joined) ? "\xE3\x80\x82" : ".");
   }
   session.clauses.close();
-  if (used.empty()) return false;
 
   for (const std::string& sentence : sentences) {
     if (sentence.empty()) continue;
@@ -2477,7 +3124,7 @@ bool generateExtendedMarginRiff(const std::string& modelsDir, const int8_t cPage
     outRiff += sentence;
   }
   if (outClauseIds) {
-    for (size_t i = 0; i < used.size() && i < RIFF_EXTENDED_CLAUSES; ++i) outClauseIds[i] = used[i].id;
+    for (size_t i = 0; i < ids.size() && i < RIFF_EXTENDED_CLAUSES; ++i) outClauseIds[i] = ids[i];
   }
   return !outRiff.empty();
 }

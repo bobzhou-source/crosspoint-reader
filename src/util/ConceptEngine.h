@@ -334,10 +334,26 @@ constexpr size_t MARGIN_NOTES_MAX = 64;
 // concept" when empty) and <BOOK_ECHO> tokens. The optional outputs get the
 // thought vectors, bucket ids and token ids (0 after the end). False when a
 // file is missing or malformed, memory runs out, or the riff is empty.
+//
+// PE-Reasoner v3: with `pageContext` (the page text around the word; the first
+// PE_PAGE_CONTEXT_MAX bytes are read) the writer first points into the page.
+// The context splits into at most 16 clause segments (. ! ? ; : and their CJK
+// forms); every window of 4-12 words (or up to 24 CJK characters) is scored by
+// subject / role overlap, nearness to the subject, content words and its
+// span-lexicon vector against thought 0, and the best window's page words
+// (quotes and brackets dropped) become the evidence clause. Each step then
+// reads the two best-centroid buckets of its role partition and takes the slot
+// with the best dot(slot, plan) - dot(slot, hub) / 2 (hub = the normalised sum
+// of the centroids), penalising a word 2-gram shared with the evidence or an
+// earlier clause. The riff is "<subject> (<role>): <evidence>; <in | while in |
+// much as in> <echoTitle>, <clause 0>, <clause 1>." (clauses, then the echo,
+// dropped to fit RIFF_MAX_BYTES), the connector from the decoder's relation
+// token. Without context, or without a window, the riff is the v2 one above.
+constexpr size_t PE_PAGE_CONTEXT_MAX = 1024;
 bool generateMarginRiff(const std::string& modelsDir, const int8_t cPage[DIM], const int8_t cEcho[DIM],
                         const char* subject, const char* role, const char* echoTitle, std::string& outRiff,
                         int8_t outPlan[PE_PLAN_STEPS][DIM] = nullptr, uint8_t outBuckets[PE_PLAN_STEPS] = nullptr,
-                        uint16_t outTokens[PE_MAX_TOKENS] = nullptr);
+                        uint16_t outTokens[PE_MAX_TOKENS] = nullptr, std::string_view pageContext = {});
 
 // The longer riff: three complete sentences, one per thought step s = 0..2,
 // at most RIFF_EXTENDED_MAX_BYTES. Step s routes to its two best-centroid
@@ -351,13 +367,18 @@ bool generateMarginRiff(const std::string& modelsDir, const int8_t cPage[DIM], c
 // call also writes exactly what generateMarginRiff would (one model load for
 // both). `outClauseIds` gets bucket * 64 + slot per used clause, in order,
 // 0xFFFF for unused entries. False when a file is missing or malformed,
-// memory runs out, or no clause is available.
+// memory runs out, or no clause is available. With an evidence clause from
+// `pageContext` (see generateMarginRiff) sentence 1 is "<lead>: <evidence>;
+// <clause>.", sentence 2 opens with a second hop (the best window of another
+// segment sharing a word with the subject or the evidence) when there is one,
+// and the clauses come from the role-partition anti-hub ranking.
 constexpr size_t RIFF_EXTENDED_MAX_BYTES = 640;
 constexpr size_t RIFF_EXTENDED_CLAUSES = 2 * PE_PLAN_STEPS;
 bool generateExtendedMarginRiff(const std::string& modelsDir, const int8_t cPage[DIM], const int8_t cEcho[DIM],
                                 const char* subject, const char* role, const char* echoTitle, std::string& outRiff,
                                 std::string* outCompactRiff = nullptr,
-                                uint16_t outClauseIds[RIFF_EXTENDED_CLAUSES] = nullptr);
+                                uint16_t outClauseIds[RIFF_EXTENDED_CLAUSES] = nullptr,
+                                std::string_view pageContext = {});
 
 // Appends `note` (newlines flattened, cut at 480 bytes) as the newest line of
 // `path`, dropping the oldest lines past MARGIN_NOTES_MAX. The file is
